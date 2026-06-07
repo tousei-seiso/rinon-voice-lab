@@ -13,6 +13,24 @@ Rinon Voice Lab connects:
 - Optional lightweight Web-search notes for LLM prompts
 - Optional 2P remote TTS on a second PC
 
+## Screenshots / 画面モード
+
+### 1P Mode / 1Pモード
+
+1Pモードは、1人のキャラクターと会話しながら、LM Studio の応答を
+Irodori-TTS で読み上げる基本モードです。キャラ設定、TTS Caption、
+Web検索、話速、感情スタイルを同じ画面で調整できます。
+
+![Rinon Voice Lab 1P mode](docs/images/rinon-1p-mode.png)
+
+### 2P Mode / 2Pキャラモード
+
+2Pキャラモードでは、1Pと2Pのキャラクターを同じ画面に表示し、
+二人の会話を交互に進められます。2人だけで話すモード、2P音声の別PC生成、
+キャラクターごとの設定やTTS Captionにも対応しています。
+
+![Rinon Voice Lab 2P mode](docs/images/rinon-2p-mode.png)
+
 The app is designed to run from any install folder. It does not require a fixed
 drive such as `H:`. By default, Irodori-TTS is installed next to this app:
 
