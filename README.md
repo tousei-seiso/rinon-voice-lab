@@ -31,6 +31,16 @@ Web検索、話速、感情スタイルを同じ画面で調整できます。
 
 ![Rinon Voice Lab 2P mode](docs/images/rinon-2p-mode.png)
 
+## Support / サポートについて
+
+This is a personal experimental release. Please do not expect support,
+maintenance, compatibility guarantees, or help with individual environments.
+Use it as a reference implementation or a local experiment.
+
+個人の実験的な公開物です。サポート、継続メンテナンス、環境ごとの動作保証、
+個別の導入支援は期待しないでください。参考実装またはローカル実験用として
+利用してください。
+
 The app is designed to run from any install folder. It does not require a fixed
 drive such as `H:`. By default, Irodori-TTS is installed next to this app:
 

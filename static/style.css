@@ -52,6 +52,18 @@ body {
   text-decoration: underline;
 }
 
+.support-notice {
+  position: fixed;
+  z-index: 10;
+  top: 12px;
+  right: 14px;
+  padding: 5px 9px;
+  border: 1px solid rgba(244, 208, 111, 0.45);
+  background: rgba(11, 14, 18, 0.82);
+  color: #f4d06f;
+  font-size: 12px;
+}
+
 .shell {
   height: 100vh;
   display: grid;
