@@ -1072,7 +1072,19 @@ function handleExternalSpeakEvent(event) {
   const sourceSpeaker = event.speaker ? ` from ${event.speaker}` : "";
   const meta = `external speak${sourceSpeaker}${style} / pose ${event.expression || "neutral"} / tts ${timing}`;
   addMessage("assistant", event.text || audios.map((item) => item.text).join(""), meta);
-  playQueue(audios, speaker, { append: true });
+  // 結合済み音声があれば、再生ボタン（▶）や保存ボタンがその1ファイルを対象にできるよう
+  // 分割音声の代わりに結合ファイル1つだけをキューへ流す。
+  const combined = event.combined && event.combined.url ? event.combined : null;
+  const playItems = combined
+    ? [
+        {
+          ...combined,
+          text: combined.text || event.text || audios.map((item) => item.text).join(""),
+          expression: combined.expression || event.expression || "neutral",
+        },
+      ]
+    : audios;
+  playQueue(playItems, speaker, { append: true });
 }
 
 async function primeExternalSpeakEvents() {

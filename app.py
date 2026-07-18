@@ -11,10 +11,12 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import uuid
 import urllib.error
 import urllib.request
 import warnings
+import wave
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import unescape as html_unescape
@@ -1964,6 +1966,50 @@ def external_speak_events_after(after_id: int) -> list[dict]:
         return [event for event in External_speak_events if int(event.get("id") or 0) > after_id]
 
 
+def combine_wav_files(source_paths: list, output_path: Path) -> Path | None:
+    """時系列順に並んだ複数の WAV ファイルを 1 つに結合する。
+
+    各パスは ``wave.open(str(path), 'rb')`` のように必ず 1 つずつ個別に開き、
+    バイナリのフレームデータを読み込んで結合する。リストオブジェクトを
+    そのまま ``wave.open`` へ渡さないことで TypeError / FileNotFoundError を防ぐ。
+    結合に成功した場合は出力パスを、対象ファイルが 1 つも無い場合は None を返す。
+    """
+    valid_sources: list[Path] = []
+    for raw in source_paths:
+        if not raw:
+            continue
+        candidate = Path(str(raw))
+        if not candidate.exists():
+            print(f"[combine_wav_files] skip missing source: {candidate}")
+            continue
+        valid_sources.append(candidate)
+    if not valid_sources:
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    writer: wave.Wave_write | None = None
+    written = 0
+    try:
+        for src in valid_sources:
+            # リストではなく個々のパス文字列を安全に開く
+            with wave.open(str(src), "rb") as reader:
+                params = reader.getparams()
+                frames = reader.readframes(reader.getnframes())
+            if writer is None:
+                writer = wave.open(str(output_path), "wb")
+                writer.setnchannels(params.nchannels)
+                writer.setsampwidth(params.sampwidth)
+                writer.setframerate(params.framerate)
+            writer.writeframes(frames)
+            written += 1
+    finally:
+        if writer is not None:
+            writer.close()
+    if written == 0:
+        return None
+    return output_path
+
+
 def handle_external_speak(payload: dict) -> dict:
     text = str(payload.get("text") or payload.get("message") or "").strip()
     if not text:
@@ -1994,6 +2040,34 @@ def handle_external_speak(payload: dict) -> dict:
         )
         for index, chunk in enumerate(chunks, start=1)
     ]
+
+    # 分割音声（各 item の source パス）を時系列順に 1 つの WAV へ結合する。
+    combined_audio: dict | None = None
+    try:
+        source_paths = [item.get("source") for item in audios]
+        combined_name = f"reply_{int(time.time() * 1000)}_combined.wav"
+        combined_output = STATIC_ROOT / "generated" / combined_name
+        combined_path = combine_wav_files(source_paths, combined_output)
+        if combined_path is not None:
+            combined_audio = {
+                "text": text,
+                "ttsText": text,
+                "caption": caption,
+                "emojiStyle": emoji_style,
+                "expression": expression_for_emoji(emoji_style),
+                "url": f"/generated/{combined_name}",
+                "name": combined_name,
+                "elapsed": round(
+                    sum(float(item.get("elapsed") or 0) for item in audios), 3
+                ),
+                "source": str(combined_path),
+            }
+    except Exception:
+        # 結合に失敗しても分割音声の再生は継続できるよう、原因のみ出力して握りつぶす。
+        print("[handle_external_speak] failed to combine wav files")
+        traceback.print_exc()
+        combined_audio = None
+
     event = publish_external_speak_event(
         {
             "source": "external",
@@ -2002,6 +2076,7 @@ def handle_external_speak(payload: dict) -> dict:
             "text": text,
             "chunks": chunks,
             "audios": audios,
+            "combined": combined_audio,
             "emojiStyle": emoji_style,
             "expression": expression_for_emoji(emoji_style),
             "caption": caption,
@@ -2022,6 +2097,7 @@ def handle_external_speak(payload: dict) -> dict:
             "ttsCaption": caption,
             "reference": str(reference_path),
             "chunkCount": len(chunks),
+            "combinedUrl": (combined_audio or {}).get("url"),
             "audios": [
                 {
                     "text": item.get("text"),
