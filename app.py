@@ -16,7 +16,6 @@ import uuid
 import urllib.error
 import urllib.request
 import warnings
-import wave
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import unescape as html_unescape
@@ -1993,15 +1992,72 @@ def _resolve_local_wav(item: dict) -> Path | None:
     return None
 
 
+def _read_wav_chunks(path: Path) -> tuple[bytes, bytes]:
+    """WAV(RIFF) ファイルから fmt チャンク本体と data チャンクのペイロードを取り出す。
+
+    Python 標準の ``wave`` モジュールは PCM(フォーマット 1) しか扱えず、Irodori-TTS が
+    出力する IEEE float(フォーマット 3) の WAV では ``wave.Error: unknown format: 3`` に
+    なる。ここでは RIFF を直接パースすることで、PCM/float いずれのフォーマットでも
+    フレームデータを取り出せるようにする。
+    """
+    raw = path.read_bytes()
+    if len(raw) < 12 or raw[0:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise ValueError(f"not a RIFF/WAVE file: {path}")
+    fmt_body: bytes | None = None
+    data_payload = bytearray()
+    pos = 12
+    total = len(raw)
+    while pos + 8 <= total:
+        chunk_id = raw[pos : pos + 4]
+        chunk_size = int.from_bytes(raw[pos + 4 : pos + 8], "little")
+        body_start = pos + 8
+        body_end = min(body_start + chunk_size, total)
+        body = raw[body_start:body_end]
+        if chunk_id == b"fmt " and fmt_body is None:
+            fmt_body = body
+        elif chunk_id == b"data":
+            data_payload += body
+        # チャンクは 2 バイト境界にパディングされる（宣言サイズが奇数なら +1）
+        pos = body_start + chunk_size + (chunk_size & 1)
+    if fmt_body is None:
+        raise ValueError(f"no fmt chunk in {path}")
+    if not data_payload:
+        raise ValueError(f"no data chunk in {path}")
+    return fmt_body, bytes(data_payload)
+
+
+def _write_wav(output_path: Path, fmt_body: bytes, data_payload: bytes) -> None:
+    """fmt チャンク本体と結合済み data ペイロードから 1 つの WAV(RIFF) を書き出す。"""
+    fmt_chunk = b"fmt " + len(fmt_body).to_bytes(4, "little") + fmt_body
+    if len(fmt_body) & 1:
+        fmt_chunk += b"\x00"
+
+    chunks = fmt_chunk
+    # 非 PCM(float 等) では fact チャンク(サンプル数)の付与が推奨される
+    audio_format = int.from_bytes(fmt_body[0:2], "little") if len(fmt_body) >= 2 else 1
+    block_align = int.from_bytes(fmt_body[12:14], "little") if len(fmt_body) >= 14 else 0
+    if audio_format != 1 and block_align:
+        sample_length = len(data_payload) // block_align
+        chunks += b"fact" + (4).to_bytes(4, "little") + sample_length.to_bytes(4, "little")
+
+    data_chunk = b"data" + len(data_payload).to_bytes(4, "little") + data_payload
+    if len(data_payload) & 1:
+        data_chunk += b"\x00"
+    chunks += data_chunk
+
+    riff = b"RIFF" + (4 + len(chunks)).to_bytes(4, "little") + b"WAVE" + chunks
+    output_path.write_bytes(riff)
+
+
 def combine_wav_files(source_paths: list, output_path: Path) -> Path | None:
     """時系列順に並んだ複数の WAV ファイルを 1 つに結合する。
 
-    各パスは ``wave.open(str(path), 'rb')`` のように必ず 1 つずつ個別に開き、
-    バイナリのフレームデータを読み込んで結合する。リストオブジェクトを
-    そのまま ``wave.open`` へ渡さないことで TypeError / FileNotFoundError を防ぐ。
-    結合に成功した場合は出力パスを、対象ファイルが 1 つも無い場合は None を返す。
+    各パスを必ず 1 つずつ個別に安全に開き（リストオブジェクトをそのまま渡さない）、
+    RIFF を直接パースして data チャンクを時系列順に連結する。PCM(1)・IEEE float(3)
+    いずれのフォーマットにも対応する。結合に成功した場合は出力パスを、対象ファイルが
+    1 つも無い場合は None を返す。
     """
-    valid_sources: list[Path] = []
+    parsed: list[tuple[bytes, bytes]] = []
     for raw in source_paths:
         if not raw:
             continue
@@ -2009,31 +2065,28 @@ def combine_wav_files(source_paths: list, output_path: Path) -> Path | None:
         if not candidate.exists():
             print(f"[combine_wav_files] skip missing source: {candidate}")
             continue
-        valid_sources.append(candidate)
-    if not valid_sources:
+        try:
+            parsed.append(_read_wav_chunks(candidate))
+        except Exception:
+            print(f"[combine_wav_files] skip unreadable wav: {candidate}")
+            traceback.print_exc()
+            continue
+    if not parsed:
+        return None
+
+    base_fmt = parsed[0][0]
+    combined = bytearray()
+    for fmt_body, data_payload in parsed:
+        # フォーマットが異なるものを連結すると音声が壊れるためスキップする
+        if fmt_body != base_fmt:
+            print("[combine_wav_files] skip chunk with mismatched fmt")
+            continue
+        combined += data_payload
+    if not combined:
         return None
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    writer: wave.Wave_write | None = None
-    written = 0
-    try:
-        for src in valid_sources:
-            # リストではなく個々のパス文字列を安全に開く
-            with wave.open(str(src), "rb") as reader:
-                params = reader.getparams()
-                frames = reader.readframes(reader.getnframes())
-            if writer is None:
-                writer = wave.open(str(output_path), "wb")
-                writer.setnchannels(params.nchannels)
-                writer.setsampwidth(params.sampwidth)
-                writer.setframerate(params.framerate)
-            writer.writeframes(frames)
-            written += 1
-    finally:
-        if writer is not None:
-            writer.close()
-    if written == 0:
-        return None
+    _write_wav(output_path, base_fmt, bytes(combined))
     return output_path
 
 
