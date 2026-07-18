@@ -1966,6 +1966,31 @@ def external_speak_events_after(after_id: int) -> list[dict]:
         return [event for event in External_speak_events if int(event.get("id") or 0) > after_id]
 
 
+def _resolve_local_wav(item: dict) -> Path | None:
+    """1 つの分割音声 item から、結合に使うローカル WAV ファイルのパスを解決する。
+
+    優先度: 我々が一意な名前で ``static/generated`` に複製した公開ファイル（url 由来）。
+    これが無い場合のみ、元の ``source`` パスにフォールバックする。source は Irodori の
+    出力パス（ファイル名が再利用され上書きされる恐れがある）やリモートパスのことがあるため、
+    一意名で管理している公開コピーを優先することで結合の正確性を担保する。
+    """
+    if not isinstance(item, dict):
+        return None
+    url = str(item.get("url") or "")
+    if url:
+        name = Path(unquote(urlparse(url).path or url)).name
+        if name:
+            candidate = STATIC_ROOT / "generated" / name
+            if candidate.exists():
+                return candidate
+    raw = item.get("source")
+    if raw:
+        candidate = Path(str(raw))
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def combine_wav_files(source_paths: list, output_path: Path) -> Path | None:
     """時系列順に並んだ複数の WAV ファイルを 1 つに結合する。
 
@@ -2010,6 +2035,47 @@ def combine_wav_files(source_paths: list, output_path: Path) -> Path | None:
     return output_path
 
 
+def build_combined_audio(
+    audios: list,
+    text: str = "",
+    emoji_style: str = "",
+    caption: str = "",
+) -> dict | None:
+    """分割音声（各 item の source）を 1 つの WAV へ結合し、結合済み音声の dict を返す。
+
+    出力は ``static/generated/reply_<timestamp>_combined.wav``。結合対象となる
+    ローカル WAV が無い（例: リモート TTS で source がリモートパス）場合や、
+    結合中に例外が発生した場合は None を返し、呼び出し側は分割音声にフォールバックできる。
+    """
+    if not audios:
+        return None
+    try:
+        source_paths = [_resolve_local_wav(item) for item in audios]
+        combined_name = f"reply_{int(time.time() * 1000)}_combined.wav"
+        combined_output = STATIC_ROOT / "generated" / combined_name
+        combined_path = combine_wav_files(source_paths, combined_output)
+        if combined_path is None:
+            return None
+        return {
+            "text": text or "".join(str(item.get("text") or "") for item in audios),
+            "ttsText": text,
+            "caption": caption,
+            "emojiStyle": emoji_style,
+            "expression": expression_for_emoji(emoji_style),
+            "url": f"/generated/{combined_name}",
+            "name": combined_name,
+            "elapsed": round(
+                sum(float(item.get("elapsed") or 0) for item in audios), 3
+            ),
+            "source": str(combined_path),
+        }
+    except Exception:
+        # 結合に失敗しても分割音声の再生は継続できるよう、原因のみ出力して握りつぶす。
+        print("[build_combined_audio] failed to combine wav files")
+        traceback.print_exc()
+        return None
+
+
 def handle_external_speak(payload: dict) -> dict:
     text = str(payload.get("text") or payload.get("message") or "").strip()
     if not text:
@@ -2042,31 +2108,9 @@ def handle_external_speak(payload: dict) -> dict:
     ]
 
     # 分割音声（各 item の source パス）を時系列順に 1 つの WAV へ結合する。
-    combined_audio: dict | None = None
-    try:
-        source_paths = [item.get("source") for item in audios]
-        combined_name = f"reply_{int(time.time() * 1000)}_combined.wav"
-        combined_output = STATIC_ROOT / "generated" / combined_name
-        combined_path = combine_wav_files(source_paths, combined_output)
-        if combined_path is not None:
-            combined_audio = {
-                "text": text,
-                "ttsText": text,
-                "caption": caption,
-                "emojiStyle": emoji_style,
-                "expression": expression_for_emoji(emoji_style),
-                "url": f"/generated/{combined_name}",
-                "name": combined_name,
-                "elapsed": round(
-                    sum(float(item.get("elapsed") or 0) for item in audios), 3
-                ),
-                "source": str(combined_path),
-            }
-    except Exception:
-        # 結合に失敗しても分割音声の再生は継続できるよう、原因のみ出力して握りつぶす。
-        print("[handle_external_speak] failed to combine wav files")
-        traceback.print_exc()
-        combined_audio = None
+    combined_audio = build_combined_audio(
+        audios, text=text, emoji_style=emoji_style, caption=caption
+    )
 
     event = publish_external_speak_event(
         {
@@ -2513,6 +2557,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 for i, chunk in enumerate(chunks, start=1)
             ]
+            # 分割音声を時系列順に 1 つの WAV へ結合する（ローカル TTS のみ対象）。
+            combined_audio = build_combined_audio(
+                audios, text=reply, emoji_style=effective_emoji, caption=tts_caption
+            )
             append_chat_log(
                 {
                     "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -2542,6 +2590,7 @@ class Handler(BaseHTTPRequestHandler):
                     "expression": expression_for_emoji(effective_emoji),
                     "chunkCount": len(chunks),
                     "chunks": chunks,
+                    "combinedUrl": (combined_audio or {}).get("url"),
                     "audios": [
                         {
                             "text": item.get("text"),
@@ -2573,6 +2622,7 @@ class Handler(BaseHTTPRequestHandler):
                     "speechRate": speech_rate,
                     "durationScale": duration_scale,
                     "audios": audios,
+                    "combined": combined_audio,
                     "contextStats": context_stats,
                     "webSearch": use_web_search,
                     "twoOnlyMode": two_only_mode,

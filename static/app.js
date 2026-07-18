@@ -1280,21 +1280,31 @@ async function sendChatTurn({
     const assistantMeta = `${data.speaker || mainCharacterName} / ${data.model} / ${data.replyLength}${style}${webMeta}${paceMeta} / pose ${data.expression} / tts ${timing}`;
     if (!backgroundAuto) {
       addMessage("assistant", data.reply, assistantMeta);
-    } else if (data.audios.length) {
-      data.audios[0] = {
-        ...data.audios[0],
-        deferredMessage: {
-          reply: data.reply,
-          meta: assistantMeta,
-        },
-      };
     }
     history.push({ role: "assistant", content: `${data.speaker || speaker}: ${data.reply}` });
     lastAssistantSpeaker = data.speaker || speaker;
     lastAssistantText = data.reply;
     updateContextUsage();
     if (Array.isArray(data.audios) && data.audios.length) {
-      playQueue(data.audios, data.speaker || speaker, { append: backgroundAuto });
+      // 結合済み音声があれば ▶ 再生・保存が1ファイルを対象にできるよう、結合ファイルだけを流す。
+      const combined = data.combined && data.combined.url ? data.combined : null;
+      let playItems = combined
+        ? [
+            {
+              ...combined,
+              text: combined.text || data.reply,
+              expression: combined.expression || data.expression || "neutral",
+            },
+          ]
+        : data.audios;
+      if (backgroundAuto && playItems.length) {
+        playItems = [...playItems];
+        playItems[0] = {
+          ...playItems[0],
+          deferredMessage: { reply: data.reply, meta: assistantMeta },
+        };
+      }
+      playQueue(playItems, data.speaker || speaker, { append: backgroundAuto });
     } else {
       setStageStatus(data.codexQueued ? "codex queued" : "ready", data.speaker || speaker);
       setSpeakingState(false, data.speaker || speaker);
