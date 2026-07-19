@@ -324,6 +324,30 @@ function addMessage(role, text, meta = "") {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
+// meta 行の「style」部分を組み立てる。
+// 感情セグメントが複数、または感情ラベル付きなら「絵文字+短い日本語タグ」を→で並べる（案1）。
+// セグメント情報が無い/単一で無感情なら、従来どおり絵文字1つを表示する。
+function buildStyleMeta(data) {
+  const label = data.autoEmoji && data.llmEmojiStyle ? "auto style" : "style";
+  const segments = Array.isArray(data.segments) ? data.segments : [];
+  const shorten = (value) => {
+    const text = String(value || "").trim();
+    return text.length > 8 ? `${text.slice(0, 8)}…` : text;
+  };
+  const hasEmotion = segments.some((seg) => (seg.style || "").trim());
+  if (segments.length > 1 || (segments.length === 1 && hasEmotion)) {
+    const maxShown = 6;
+    const parts = segments
+      .map((seg) => `${(seg.emoji || "").trim()}${shorten(seg.style)}`.trim())
+      .filter(Boolean);
+    if (!parts.length) return "";
+    const shown = parts.slice(0, maxShown);
+    const suffix = parts.length > maxShown ? "…" : "";
+    return ` / ${label} ${shown.join("→")}${suffix}`;
+  }
+  return data.emojiStyle ? ` / ${label} ${data.emojiStyle}` : "";
+}
+
 function contextCost(items) {
   return items.reduce((total, item) => total + String(item.content || "").length + 32, 0);
 }
@@ -1268,9 +1292,7 @@ async function sendChatTurn({
       autoWebResults = data.webResults || [];
     }
     const timing = data.audios.map((item) => `${item.elapsed}s`).join(", ");
-    const style = data.emojiStyle
-      ? ` / ${data.autoEmoji && data.llmEmojiStyle ? "auto style" : "style"} ${data.emojiStyle}`
-      : "";
+    const style = buildStyleMeta(data);
     const webQuery = String(data.webQuery || "");
     const webQueryLabel = webQuery.length > 32 ? `${webQuery.slice(0, 31)}…` : webQuery;
     const webMeta = data.webSearch || data.webContext

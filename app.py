@@ -1205,6 +1205,56 @@ def parse_lmstudio_reply(raw: str, allowed_emojis: set[str]) -> tuple[str, str]:
     return raw.strip(), ""
 
 
+def compose_caption(base_caption: str, style: str) -> str:
+    """基底 TTS Caption（キャラの基本的なしゃべり方）を先頭に、感情/口調を末尾に連結する。
+
+    感情指示（``style``）が空なら基底 caption だけを返し、現状と同じ挙動になる。
+    """
+    base = str(base_caption or "").strip()
+    emotion = str(style or "").strip()
+    if not emotion:
+        return base
+    if not base:
+        return emotion
+    separator = "" if base[-1] in "。.．!?！？…、,，・ " else " "
+    return f"{base}{separator} {emotion}".replace("  ", " ").strip()
+
+
+def parse_lmstudio_segments(raw: str, allowed_emojis: set[str]) -> list[dict[str, str]]:
+    """LM 返答から ``{"segments":[{text, style, emoji}...]}`` を取り出す。
+
+    セグメント配列を取得できなければ空リストを返し、呼び出し側は従来の
+    「返答全体で1感情・1caption」の経路にフォールバックする。``emoji`` は
+    irodori パレット（``allowed_emojis``）に含まれるものだけを採用する。
+    """
+    text = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw_segments = data.get("segments")
+    if not isinstance(raw_segments, list):
+        return []
+    segments: list[dict[str, str]] = []
+    for item in raw_segments:
+        if not isinstance(item, dict):
+            continue
+        seg_text = strip_irodori_style_marks(str(item.get("text") or item.get("reply") or ""))
+        if not seg_text:
+            continue
+        style = str(item.get("style") or item.get("caption") or "").strip()
+        emoji = str(item.get("emoji") or "").strip()
+        if emoji not in allowed_emojis:
+            emoji = ""
+        segments.append({"text": seg_text, "style": style, "emoji": emoji})
+    return segments
+
+
 def strip_irodori_style_marks(text: str) -> str:
     cleaned = str(text or "")
     emojis = sorted((item["emoji"] for item in load_emoji_items()), key=len, reverse=True)
@@ -1543,7 +1593,7 @@ def request_lmstudio(
     no_dialogue: bool = False,
     speaker: str = "リノン",
     two_only_mode: bool = False,
-) -> tuple[str, str, str, int]:
+) -> tuple[str, str, str, int, list[dict[str, str]]]:
     length_instruction, max_tokens, chunk_limit = reply_style_for_length(reply_length)
     address = str(user_address or "").strip() or "あなた"
     address_instruction = (
@@ -1566,8 +1616,22 @@ def request_lmstudio(
         if two_only_mode
         else ""
     )
+    # 感情の変化ごとにセグメント分割させる新モード。台詞禁止モード時は挙動維持のため
+    # 従来の「返答全体で絵文字1つ」を使う。
+    segmented_mode = auto_emoji and not no_dialogue
     emoji_instruction = ""
-    if auto_emoji:
+    if segmented_mode:
+        emoji_instruction = (
+            "\n返答は感情や口調が変わるところで区切り、各セグメントに感情情報を付けてください。"
+            "必ず次のJSONだけで返してください:\n"
+            '{"segments":[{"text":"発話本文","style":"日本語での感情や口調の指示","emoji":"該当する発声効果の絵文字1つ、なければ空文字"}]}\n'
+            "・textはそのまま読み上げる本文です。styleは声の感情・話し方を短い日本語で書いてください"
+            "（例:「楽しげにはしゃいで」「声を落として切なげに」「怒って責めるように」）。\n"
+            "・感情の変化が無ければsegmentsは1つでも構いません。返答全体を無理に細切れにしないでください。\n"
+            "・emojiは次のリストのいずれかだけ使用可。該当する発声効果が無ければ空文字にしてください:\n"
+            f"{build_emoji_choice_prompt()}"
+        )
+    elif auto_emoji:
         emoji_instruction = (
             "\nIrodori-TTSの感情/発声スタイル絵文字を1つだけ選んでください。"
             "自然な通常発話ならemojiは空文字にしてください。"
@@ -1624,14 +1688,21 @@ def request_lmstudio(
             "or add /no_think to the prompt/model preset."
         )
     allowed_emojis = {item["emoji"] for item in load_emoji_items()}
-    message, emoji = parse_lmstudio_reply(content, allowed_emojis) if auto_emoji else (content, "")
-    message = strip_irodori_style_marks(message)
-    if no_dialogue:
-        message = sanitize_no_dialogue_reply(message)
+    segments: list[dict[str, str]] = []
+    if segmented_mode:
+        segments = parse_lmstudio_segments(content, allowed_emojis)
+    if segments:
+        message = "".join(seg["text"] for seg in segments).strip()
+        emoji = next((seg["emoji"] for seg in segments if seg["emoji"]), "")
+    else:
+        message, emoji = parse_lmstudio_reply(content, allowed_emojis) if auto_emoji else (content, "")
+        message = strip_irodori_style_marks(message)
+        if no_dialogue:
+            message = sanitize_no_dialogue_reply(message)
     if not message:
         raise RuntimeError("LM Studio returned only style marks and no speakable text.")
     model_used = data.get("model") or payload["model"]
-    return message, model_used, emoji, chunk_limit
+    return message, model_used, emoji, chunk_limit, segments
 
 
 def ensure_irodori_module():
@@ -2569,7 +2640,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             raw_messages.append({"role": "user", "content": user_text})
             messages, context_stats = compact_messages_for_context(raw_messages, context_limit)
-            reply, model_used, llm_emoji, chunk_limit = request_lmstudio(
+            reply, model_used, llm_emoji, chunk_limit, segments = request_lmstudio(
                 messages,
                 model,
                 auto_emoji=auto_emoji,
@@ -2581,7 +2652,6 @@ class Handler(BaseHTTPRequestHandler):
                 two_only_mode=two_only_mode,
             )
             effective_emoji = emoji_style or llm_emoji
-            chunks = split_sentences(reply, limit=chunk_limit)
             reference_wav = second_reference_path if use_second_speaker else reference_path
             use_remote_tts = (
                 use_second_speaker
@@ -2594,25 +2664,56 @@ class Handler(BaseHTTPRequestHandler):
                 else (LUVIA_REMOTE_REF_WAV if use_remote_tts else "")
             )
             synthesize = synthesize_sentence_remote_luvia if use_remote_tts else synthesize_sentence
-            audios = [
-                synthesize(
-                    chunk,
-                    i,
-                    steps=max(1, min(120, steps)),
-                    emoji_style=effective_emoji,
-                    caption=tts_caption,
-                    duration_scale=duration_scale,
-                    **(
-                        {"remote_ref_wav": remote_reference_wav, "remote_tts_url": second_tts_url}
-                        if use_remote_tts
-                        else {"ref_wav": reference_wav}
-                    ),
-                )
-                for i, chunk in enumerate(chunks, start=1)
-            ]
+            synth_kwargs = (
+                {"remote_ref_wav": remote_reference_wav, "remote_tts_url": second_tts_url}
+                if use_remote_tts
+                else {"ref_wav": reference_wav}
+            )
+            # 感情セグメント単位に (感情style, 絵文字, 本文) を組み立てる。
+            # segments が空（=分割なし/機能オフ）なら返答全体を 1 セグメントとして扱う。
+            if segments:
+                seg_units = [
+                    (
+                        str(seg.get("style") or ""),
+                        str(emoji_style or seg.get("emoji") or ""),
+                        str(seg.get("text") or ""),
+                    )
+                    for seg in segments
+                ]
+            else:
+                seg_units = [("", effective_emoji, reply)]
+            seg_chunk_limit = max(1, min(20, chunk_limit))
+            audios: list[dict] = []
+            chunks: list[str] = []
+            seg_meta: list[dict[str, str]] = []
+            for seg_style, seg_emoji, seg_text in seg_units:
+                seg_chunks = split_sentences(seg_text, limit=seg_chunk_limit)
+                if not seg_chunks:
+                    continue
+                # 各セグメントの caption は「基底 TTS Caption + 感情style」を必ず連結する。
+                seg_caption = compose_caption(tts_caption, seg_style)
+                seg_meta.append({"style": seg_style, "emoji": seg_emoji})
+                for chunk in seg_chunks:
+                    audios.append(
+                        synthesize(
+                            chunk,
+                            len(audios) + 1,
+                            steps=max(1, min(120, steps)),
+                            emoji_style=seg_emoji,
+                            caption=seg_caption,
+                            duration_scale=duration_scale,
+                            **synth_kwargs,
+                        )
+                    )
+                    chunks.append(chunk)
+            # 代表となる感情絵文字（立ち絵 pose 用）: 最初の非空セグメント絵文字、無ければ従来値。
+            representative_emoji = (
+                next((meta["emoji"] for meta in seg_meta if meta["emoji"]), "")
+                or effective_emoji
+            )
             # 分割音声を時系列順に 1 つの WAV へ結合する（ローカル TTS のみ対象）。
             combined_audio = build_combined_audio(
-                audios, text=reply, emoji_style=effective_emoji, caption=tts_caption
+                audios, text=reply, emoji_style=representative_emoji, caption=tts_caption
             )
             append_chat_log(
                 {
@@ -2640,7 +2741,8 @@ class Handler(BaseHTTPRequestHandler):
                     "userAddress": user_address,
                     "reference": str(reference_wav),
                     "characterPrompt": character_prompt,
-                    "expression": expression_for_emoji(effective_emoji),
+                    "expression": expression_for_emoji(representative_emoji),
+                    "segments": seg_meta,
                     "chunkCount": len(chunks),
                     "chunks": chunks,
                     "combinedUrl": (combined_audio or {}).get("url"),
@@ -2667,8 +2769,9 @@ class Handler(BaseHTTPRequestHandler):
                     "speaker": speaker,
                     "model": model_used,
                     "chunks": chunks,
-                    "emojiStyle": effective_emoji,
-                    "expression": expression_for_emoji(effective_emoji),
+                    "emojiStyle": representative_emoji,
+                    "expression": expression_for_emoji(representative_emoji),
+                    "segments": seg_meta,
                     "llmEmojiStyle": llm_emoji,
                     "autoEmoji": auto_emoji,
                     "replyLength": reply_length,
