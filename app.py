@@ -27,6 +27,8 @@ APP_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = APP_ROOT / "static"
 LOG_ROOT = APP_ROOT / "logs"
 CHAT_LOG_PATH = LOG_ROOT / "chat.jsonl"
+# 感情キャプション付きの返答テキストを記録する専用履歴（どの区間をどの感情で話したか確認用）。
+EMOTION_LOG_PATH = LOG_ROOT / "chat_emotion.jsonl"
 PROFILE_ROOT = APP_ROOT / "profiles"
 SESSION_PROFILE_PATH = PROFILE_ROOT / "latest_session.json"
 CHARACTER_PROFILE_PATH = PROFILE_ROOT / "characters.json"
@@ -709,6 +711,33 @@ def save_character_image(payload: dict) -> dict:
 def append_chat_log(record: dict) -> None:
     LOG_ROOT.mkdir(parents=True, exist_ok=True)
     with CHAT_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def build_annotated_reply(reply: str, segments: list[dict]) -> str:
+    """返答テキストの各セグメント先頭へ「（絵文字＋感情キャプション全文）」を挿入する。
+
+    フロント表示 (buildAnnotatedReply) と同じ整形をサーバ側でも行い、感情キャプション付き
+    履歴に記録するために使う。感情情報が無ければ元の ``reply`` をそのまま返す。
+    """
+    have_texts = bool(segments) and all(isinstance(seg.get("text"), str) for seg in segments)
+    has_marker = any(
+        (str(seg.get("style") or "").strip() or str(seg.get("emoji") or "").strip())
+        for seg in segments
+    )
+    if not have_texts or not has_marker:
+        return reply
+    parts: list[str] = []
+    for seg in segments:
+        marker = f"{str(seg.get('emoji') or '').strip()}{str(seg.get('style') or '').strip()}"
+        text = str(seg.get("text") or "")
+        parts.append(f"（{marker}）{text}" if marker else text)
+    return "".join(parts)
+
+
+def append_emotion_log(record: dict) -> None:
+    LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    with EMOTION_LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -2692,7 +2721,7 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 # 各セグメントの caption は「基底 TTS Caption + 感情style」を必ず連結する。
                 seg_caption = compose_caption(tts_caption, seg_style)
-                seg_meta.append({"style": seg_style, "emoji": seg_emoji})
+                seg_meta.append({"style": seg_style, "emoji": seg_emoji, "text": seg_text})
                 for chunk in seg_chunks:
                     audios.append(
                         synthesize(
@@ -2760,6 +2789,19 @@ class Handler(BaseHTTPRequestHandler):
                         for item in audios
                     ],
                     "contextStats": context_stats,
+                }
+            )
+            # 感情キャプション付きの返答テキストを専用履歴に記録する。
+            append_emotion_log(
+                {
+                    "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "user": user_text,
+                    "speaker": speaker,
+                    "speakerSlot": speaker_slot,
+                    "model": model_used,
+                    "reply": reply,
+                    "annotatedReply": build_annotated_reply(reply, seg_meta),
+                    "segments": seg_meta,
                 }
             )
             self.send_json(
