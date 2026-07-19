@@ -348,6 +348,22 @@ function buildStyleMeta(data) {
   return data.emojiStyle ? ` / ${label} ${data.emojiStyle}` : "";
 }
 
+// 表示用の返答テキストに、各セグメント先頭へ「（絵文字＋感情キャプション全文）」を差し込む。
+// 感情キャプションは省略せずそのまま挿入する。履歴・音声用の data.reply は変更しない。
+function buildAnnotatedReply(data) {
+  const segments = Array.isArray(data.segments) ? data.segments : [];
+  const haveTexts = segments.length > 0 && segments.every((seg) => typeof seg.text === "string");
+  const hasMarker = segments.some((seg) => (seg.style || "").trim() || (seg.emoji || "").trim());
+  if (!haveTexts || !hasMarker) return data.reply;
+  return segments
+    .map((seg) => {
+      const marker = `${(seg.emoji || "").trim()}${(seg.style || "").trim()}`;
+      const text = seg.text || "";
+      return marker ? `（${marker}）${text}` : text;
+    })
+    .join("");
+}
+
 function contextCost(items) {
   return items.reduce((total, item) => total + String(item.content || "").length + 32, 0);
 }
@@ -1300,8 +1316,9 @@ async function sendChatTurn({
       : "";
     const paceMeta = data.speechRate === "fast" ? " / pace fast" : "";
     const assistantMeta = `${data.speaker || mainCharacterName} / ${data.model} / ${data.replyLength}${style}${webMeta}${paceMeta} / pose ${data.expression} / tts ${timing}`;
+    const annotatedReply = buildAnnotatedReply(data);
     if (!backgroundAuto) {
-      addMessage("assistant", data.reply, assistantMeta);
+      addMessage("assistant", annotatedReply, assistantMeta);
     }
     history.push({ role: "assistant", content: `${data.speaker || speaker}: ${data.reply}` });
     lastAssistantSpeaker = data.speaker || speaker;
@@ -1323,7 +1340,7 @@ async function sendChatTurn({
         playItems = [...playItems];
         playItems[0] = {
           ...playItems[0],
-          deferredMessage: { reply: data.reply, meta: assistantMeta },
+          deferredMessage: { reply: annotatedReply, meta: assistantMeta },
         };
       }
       playQueue(playItems, data.speaker || speaker, { append: backgroundAuto });
