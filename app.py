@@ -5,6 +5,7 @@ import contextlib
 import json
 import mimetypes
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -2107,6 +2108,31 @@ def ensure_irodori_module():
         os.chdir(old_cwd)
 
 
+def new_tts_seed() -> int:
+    """1 リプライ分の TTS 生成で共有する乱数 seed を作る。
+
+    返答を文（チャンク）ごとに独立生成すると、seed 未指定（ランダム）では
+    チャンクごとに音色の当たりがばらつき「一部の文だけ声が違う」原因になる。
+    リプライ単位で seed を固定し全チャンクへ渡すことで、感情（caption/emoji）は
+    変えつつ音色の実現を揃える。
+    """
+    return random.randint(1, 2_147_483_646)
+
+
+def _seed_raw_value(seed: object) -> str:
+    """seed を Irodori の ``seed_raw``（``infer.py --seed`` 相当）へ渡す文字列に整える。
+
+    空文字は「seed 未指定＝ランダム」を意味する（従来挙動）。数値化できない値も
+    ランダム扱いにフォールバックする。
+    """
+    if seed is None or seed == "":
+        return ""
+    try:
+        return str(int(seed))
+    except (TypeError, ValueError):
+        return ""
+
+
 def synthesize_sentence(
     text: str,
     index: int,
@@ -2118,6 +2144,7 @@ def synthesize_sentence(
     cfg_scale_text: float = IRODORI_CFG_SCALE_TEXT,
     cfg_scale_caption: float = IRODORI_CFG_SCALE_CAPTION,
     cfg_scale_speaker: float = IRODORI_CFG_SCALE_SPEAKER,
+    seed: object = "",
 ) -> dict:
     module = ensure_irodori_module()
     # TTS へ渡す本文のみ英字→カナ化（保存・表示は原文のまま、絵文字=発声効果は変換しない）。
@@ -2146,7 +2173,7 @@ def synthesize_sentence(
                 str(reference_wav) if reference_wav.exists() else None,
                 int(steps),
                 1,
-                "",
+                _seed_raw_value(seed),
                 "",
                 float(duration_scale),
                 "linear",
@@ -2212,6 +2239,7 @@ def synthesize_sentence_remote_luvia(
     cfg_scale_text: float = IRODORI_CFG_SCALE_TEXT,
     cfg_scale_caption: float = IRODORI_CFG_SCALE_CAPTION,
     cfg_scale_speaker: float = IRODORI_CFG_SCALE_SPEAKER,
+    seed: object = "",
 ) -> dict:
     cfg_scale_text = sanitize_cfg_scale(cfg_scale_text, IRODORI_CFG_SCALE_TEXT)
     cfg_scale_caption = sanitize_cfg_scale(cfg_scale_caption, IRODORI_CFG_SCALE_CAPTION)
@@ -2235,6 +2263,7 @@ def synthesize_sentence_remote_luvia(
         "cfgScaleText": cfg_scale_text,
         "cfgScaleCaption": cfg_scale_caption,
         "cfgScaleSpeaker": cfg_scale_speaker,
+        "seed": _seed_raw_value(seed),
     }
     request = urllib.request.Request(
         f"{target_url}/synthesize",
@@ -2252,7 +2281,7 @@ def synthesize_sentence_remote_luvia(
         if LUVIA_REMOTE_TTS_HOST and LUVIA_REMOTE_IRODORI_ROOT:
             fallback = synthesize_sentence_remote_luvia_cli(
                 text, index, steps, emoji_style, caption, remote_ref_wav, duration_scale,
-                cfg_scale_text, cfg_scale_caption, cfg_scale_speaker,
+                cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, seed,
             )
             fallback["remoteServerError"] = str(exc)
             fallback["engine"] = "4090-cli-fallback"
@@ -2291,10 +2320,12 @@ def synthesize_sentence_remote_luvia_cli(
     cfg_scale_text: float = IRODORI_CFG_SCALE_TEXT,
     cfg_scale_caption: float = IRODORI_CFG_SCALE_CAPTION,
     cfg_scale_speaker: float = IRODORI_CFG_SCALE_SPEAKER,
+    seed: object = "",
 ) -> dict:
     cfg_scale_text = sanitize_cfg_scale(cfg_scale_text, IRODORI_CFG_SCALE_TEXT)
     cfg_scale_caption = sanitize_cfg_scale(cfg_scale_caption, IRODORI_CFG_SCALE_CAPTION)
     cfg_scale_speaker = sanitize_cfg_scale(cfg_scale_speaker, IRODORI_CFG_SCALE_SPEAKER)
+    seed_value = _seed_raw_value(seed)
     if not (LUVIA_REMOTE_TTS_HOST and LUVIA_REMOTE_IRODORI_ROOT):
         raise RuntimeError("Remote Luvia TTS CLI fallback is not configured")
     # TTS へ渡す本文のみ英字→カナ化（保存・表示は原文のまま、絵文字=発声効果は変換しない）。
@@ -2319,6 +2350,7 @@ def synthesize_sentence_remote_luvia_cli(
         "cfg_scale_text": cfg_scale_text,
         "cfg_scale_caption": cfg_scale_caption,
         "cfg_scale_speaker": cfg_scale_speaker,
+        "seed": seed_value,
     }
     request_path.write_text(json.dumps(request_payload, ensure_ascii=False), encoding="utf-8")
 
@@ -2380,6 +2412,8 @@ def synthesize_sentence_remote_luvia_cli(
         "--cfg-scale-text $r.cfg_scale_text "
         "--cfg-scale-caption $r.cfg_scale_caption "
         "--cfg-scale-speaker $r.cfg_scale_speaker "
+        # seed は Python 側で整数へ検証済みのためスクリプトへ直接埋め込む（空ならランダム）。
+        f"{f'--seed {seed_value} ' if seed_value else ''}"
         "--model-precision bf16 "
         "--codec-precision bf16 "
         "--output-wav $r.output_wav"
@@ -3095,11 +3129,13 @@ class Handler(BaseHTTPRequestHandler):
                 else {"ref_wav": reference_wav}
             )
             # CFG Scale はキャラクターごとの値を全 TTS 経路へ共通で渡す。
+            # seed はリプライ単位で 1 つ生成し全チャンクへ共通で渡す（音色の当たりを揃える）。
             synth_kwargs.update(
                 {
                     "cfg_scale_text": cfg_scale_text,
                     "cfg_scale_caption": cfg_scale_caption,
                     "cfg_scale_speaker": cfg_scale_speaker,
+                    "seed": new_tts_seed(),
                 }
             )
             # 感情セグメント単位に (感情style, 絵文字, 本文) を組み立てる。

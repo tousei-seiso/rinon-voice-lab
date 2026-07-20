@@ -185,6 +185,16 @@ def _cfg_scale(value: object, default: float) -> float:
     return max(0.0, min(20.0, result))
 
 
+def _seed_raw_value(seed: object) -> str:
+    """seed を Irodori の ``seed_raw`` へ渡す文字列に整える（空=ランダム）。"""
+    if seed is None or seed == "":
+        return ""
+    try:
+        return str(int(seed))
+    except (TypeError, ValueError):
+        return ""
+
+
 def read_json_body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length) if length else b"{}"
@@ -202,6 +212,7 @@ def synthesize(payload: dict) -> dict:
     cfg_scale_text = _cfg_scale(payload.get("cfgScaleText"), 3.0)
     cfg_scale_caption = _cfg_scale(payload.get("cfgScaleCaption"), 4.0)
     cfg_scale_speaker = _cfg_scale(payload.get("cfgScaleSpeaker"), 5.0)
+    seed_raw = _seed_raw_value(payload.get("seed"))
     ref_wav = str(payload.get("refWav") or REF_WAV)
     old_cwd = Path.cwd()
     os.chdir(ROOT)
@@ -220,7 +231,7 @@ def synthesize(payload: dict) -> dict:
                 ref_wav if Path(ref_wav).exists() else None,
                 steps,
                 1,
-                "",
+                seed_raw,
                 "",
                 duration_scale,
                 "linear",
