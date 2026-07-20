@@ -43,6 +43,42 @@ DEFAULT_MODEL = os.environ.get("LM_STUDIO_MODEL", "gemma-4-12b-it")
 DEFAULT_CONTEXT_LIMIT = int(os.environ.get("LM_STUDIO_CONTEXT_LIMIT", "8200"))
 # キャラクター返答の生成待ち時間（秒）。返答が遅くて "timed out" になる場合はこの値を延ばす。
 LM_STUDIO_TIMEOUT = int(os.environ.get("LM_STUDIO_TIMEOUT", "300"))
+# 構造化出力（response_format=json_schema）でセグメントJSONを強制する制御。
+#   auto(既定): まずスキーマ付きで送り、サーバ/モデルが拒否(HTTP 4xx)したら自動で外して以後付けない。
+#   on        : 常にスキーマ付きで送る（拒否時のみ 1 リクエスト分だけ外して再送）。
+#   off       : 一切付けない（従来動作）。
+LM_STRUCTURED_OUTPUT = os.environ.get("LM_STRUCTURED_OUTPUT", "auto").strip().lower()
+# 実行中にサーバが response_format を拒否したら True にし、auto では以後付けない（プロセス内メモ）。
+_lm_structured_output_unsupported = False
+# セグメント返答用の JSON スキーマ（LM Studio の response_format=json_schema 用）。
+# parse_lmstudio_segments が期待する {"segments":[{text,style,emoji}...]} を強制する。
+LM_SEGMENT_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "irodori_segments",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "segments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "style": {"type": "string"},
+                            "emoji": {"type": "string"},
+                        },
+                        "required": ["text", "style", "emoji"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["segments"],
+            "additionalProperties": False,
+        },
+    },
+}
 LM_COMPACT_CONTEXT_LIMIT = int(os.environ.get("LM_COMPACT_CONTEXT_LIMIT", "4200"))
 LM_RECENT_MESSAGE_COUNT = int(os.environ.get("LM_RECENT_MESSAGE_COUNT", "12"))
 LM_SUMMARY_CHAR_LIMIT = int(os.environ.get("LM_SUMMARY_CHAR_LIMIT", "1400"))
@@ -1710,6 +1746,53 @@ def format_web_results(query: str, results: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _use_structured_output(segmented_mode: bool) -> bool:
+    """このリクエストで response_format(json_schema) を付けるか判定する。
+
+    構造化出力は segments スキーマを強制するため、segments を期待する segmented_mode の
+    ときだけ有効。auto では過去にサーバが拒否していなければ付ける。
+    """
+    if not segmented_mode or LM_STRUCTURED_OUTPUT == "off":
+        return False
+    if LM_STRUCTURED_OUTPUT == "on":
+        return True
+    return not _lm_structured_output_unsupported  # auto
+
+
+def _post_lmstudio_chat(payload: dict, use_structured: bool) -> dict:
+    """chat/completions に POST し、レスポンス JSON を返す。
+
+    ``use_structured`` が True のときだけ response_format(json_schema) を付ける。
+    サーバ/モデルが response_format を受け付けず HTTP 4xx を返したら、response_format を
+    外して 1 度だけ再送し、以後 auto では付けないようプロセス内に記録する（3層フォールバックの2層目）。
+    """
+    global _lm_structured_output_unsupported
+
+    def _send(body: dict) -> dict:
+        req = urllib.request.Request(
+            f"{LM_STUDIO_URL}/chat/completions",
+            data=json_bytes(body),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=LM_STUDIO_TIMEOUT) as res:
+            return json.loads(res.read().decode("utf-8"))
+
+    if not use_structured:
+        return _send(payload)
+
+    structured_body = dict(payload)
+    structured_body["response_format"] = LM_SEGMENT_RESPONSE_FORMAT
+    try:
+        return _send(structured_body)
+    except urllib.error.HTTPError as err:
+        # 非対応サーバ/モデルは 4xx で弾く。response_format 無しで再送し、以後は付けない。
+        if 400 <= err.code < 500:
+            _lm_structured_output_unsupported = True
+            return _send(payload)
+        raise
+
+
 def request_lmstudio(
     messages: list[dict[str, str]],
     model: str | None,
@@ -1800,14 +1883,7 @@ def request_lmstudio(
         "思考過程は出さず、最終回答だけを出してください。/no_think"
         f"{emoji_instruction}"
     )
-    req = urllib.request.Request(
-        f"{LM_STUDIO_URL}/chat/completions",
-        data=json_bytes(payload),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=LM_STUDIO_TIMEOUT) as res:
-        data = json.loads(res.read().decode("utf-8"))
+    data = _post_lmstudio_chat(payload, _use_structured_output(segmented_mode))
     choice_message = data["choices"][0]["message"]
     content = str(choice_message.get("content") or "").strip()
     if not content:
