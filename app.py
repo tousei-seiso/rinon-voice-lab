@@ -102,6 +102,12 @@ TTS_DICT_ROOT = APP_ROOT / "tts_dictionaries"
 TTS_KANA_DICT_FILE = os.environ.get("TTS_KANA_DICT_FILE", "tts_kana_dict.csv")
 _tts_kana_dict_cache: dict[str, str] | None = None
 
+# 発声効果の絵文字の挙動分類（グローバル設定＝キャラ非依存）。コード既定を土台に、
+# tts_emoji/emoji_behavior.json があれば絵文字単位で上書きする。
+TTS_EMOJI_ROOT = APP_ROOT / "tts_emoji"
+TTS_EMOJI_BEHAVIOR_FILE = os.environ.get("TTS_EMOJI_BEHAVIOR_FILE", "emoji_behavior.json")
+_emoji_behavior_cache: dict | None = None
+
 IRODORI_CHECKPOINT = os.environ.get(
     "IRODORI_CHECKPOINT", "Aratako/Irodori-TTS-600M-v3-VoiceDesign"
 )
@@ -254,6 +260,127 @@ def safe_load_emoji_items() -> list[dict[str, str]]:
         return load_emoji_items()
     except Exception:
         return []
+
+
+# コード既定はパレットの「ラベル」で分類を持つ（絵文字グリフの表記ゆれ＝異体字セレクタ等に
+# 影響されないため）。マップのキーは実行時にパレットの絵文字へ解決するので、LLM が返す
+# seg_emoji（パレット検証済み）と必ず同一表現で突き合わせできる。
+#   singleShot = 非言語の単発音（先頭チャンクのみに付与し、文ごとの繰り返し挿入を防ぐ）
+#   sustained  = 話し方・声色・音響効果（全チャンクに付与し、セグメント途中の表現ぶれを防ぐ）
+_EMOJI_SINGLE_SHOT_LABELS: frozenset[str] = frozenset({
+    "吐息", "間", "笑い", "喘ぎ", "息をのむ", "舐める音", "リップノイズ", "泣き声",
+    "悲鳴", "寝言", "飲み込む", "咳・鼻", "舌打ち", "驚き", "あくび", "相槌", "鼻歌", "嗅ぐ音",
+})
+_EMOJI_SUSTAINED_LABELS: frozenset[str] = frozenset({
+    "囁き", "エコー", "からかう", "震え声", "息切れ", "優しく", "眠そう", "早口", "電話越し",
+    "ゆっくり", "慌てる", "喜び", "勢いよく", "怒り", "苦しげ", "心配", "照れ", "呆れ",
+    "楽しげ", "得意げ", "懇願", "酔う", "口を塞ぐ", "安堵", "疑問", "力強く", "朗読",
+})
+_EMOJI_DEFAULT_FOR_UNKNOWN = "singleShot"
+
+
+def _emoji_log(msg: str) -> None:
+    """絵文字を含むログを、cp932 等の非 UTF-8 コンソールでも落ちないよう安全に出力する。
+
+    通常は絵文字をそのまま出す（UTF-8 コンソールで可読）。エンコードできない環境では
+    バックスラッシュエスケープへフォールバックし、UnicodeEncodeError で処理を止めない。
+    """
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(msg.encode(enc, "backslashreplace").decode(enc, "replace"), flush=True)
+
+
+def _resolve_emoji_behavior_file() -> Path:
+    """絵文字挙動ファイルのパスを解決する（tts_emoji/ → プロジェクト直下 → cwd の順）。"""
+    name = str(TTS_EMOJI_BEHAVIOR_FILE)
+    path = Path(name)
+    if path.is_absolute():
+        return path
+    return next(
+        (base / name for base in (TTS_EMOJI_ROOT, APP_ROOT, Path.cwd()) if (base / name).exists()),
+        TTS_EMOJI_ROOT / name,
+    )
+
+
+def _load_emoji_behavior() -> dict:
+    """絵文字→挙動（singleShot/sustained）の対応と未分類既定を読み込む（キャッシュ）。
+
+    コード既定（パレットのラベル分類）を土台に、``tts_emoji/emoji_behavior.json`` があれば
+    絵文字単位で上書き（マージ）する。両リストに重複した絵文字は singleShot を優先。
+    パレットに無い絵文字は無視してログする。未分類（新絵文字を含む）は defaultForUnknown。
+    """
+    global _emoji_behavior_cache
+    if _emoji_behavior_cache is not None:
+        return _emoji_behavior_cache
+
+    palette_items = safe_load_emoji_items()
+    palette = {item["emoji"] for item in palette_items if item.get("emoji")}
+
+    mapping: dict[str, str] = {}
+    unclassified: list[str] = []
+    for item in palette_items:
+        emoji = str(item.get("emoji") or "")
+        label = str(item.get("label") or "")
+        if not emoji:
+            continue
+        if label in _EMOJI_SUSTAINED_LABELS:
+            mapping[emoji] = "sustained"
+        elif label in _EMOJI_SINGLE_SHOT_LABELS:
+            mapping[emoji] = "singleShot"
+        else:
+            mapping[emoji] = _EMOJI_DEFAULT_FOR_UNKNOWN
+            unclassified.append(f"{emoji}({label})")
+
+    default_unknown = _EMOJI_DEFAULT_FOR_UNKNOWN
+    path = _resolve_emoji_behavior_file()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+
+            def _apply(key: str, behavior: str) -> None:
+                for emoji in data.get(key) or []:
+                    emoji = str(emoji).strip()
+                    if not emoji:
+                        continue
+                    if palette and emoji not in palette:
+                        _emoji_log(f"[emoji-behavior] '{emoji}' not in palette; ignored")
+                        continue
+                    mapping[emoji] = behavior
+
+            # sustained を先、singleShot を後に適用 → 重複時は singleShot が優先される。
+            _apply("sustained", "sustained")
+            _apply("singleShot", "singleShot")
+            du = str(data.get("defaultForUnknown") or "").strip()
+            if du in ("singleShot", "sustained"):
+                default_unknown = du
+            _emoji_log(f"[emoji-behavior] loaded overrides from {path}")
+        except Exception as exc:
+            _emoji_log(f"[emoji-behavior] load failed ({path}): {exc}")
+
+    if unclassified:
+        _emoji_log(
+            f"[emoji-behavior] unclassified (default={default_unknown}): {' '.join(unclassified)}"
+        )
+
+    result = {"map": mapping, "defaultForUnknown": default_unknown}
+    # パレット未取得（Irodori 未ロード等）ならキャッシュせず、次回に再構築させる。
+    if palette:
+        _emoji_behavior_cache = result
+    return result
+
+
+def emoji_is_sustained(emoji: str) -> bool:
+    """絵文字が「持続系（全チャンクに付与すべき話し方/声色/音響効果）」なら True。
+
+    単発の効果音（既定）と空文字は False。判定不能な未分類は defaultForUnknown に従う。
+    """
+    key = str(emoji or "").strip()
+    if not key:
+        return False
+    behavior = _load_emoji_behavior()
+    return behavior["map"].get(key, behavior["defaultForUnknown"]) == "sustained"
 
 
 def enqueue_codex_inbox(payload: dict) -> dict:
@@ -2248,7 +2375,7 @@ def synthesize_sentence_remote_luvia(
     if not target_url:
         return synthesize_sentence_remote_luvia_cli(
             text, index, steps, emoji_style, caption, remote_ref_wav, duration_scale,
-            cfg_scale_text, cfg_scale_caption, cfg_scale_speaker,
+            cfg_scale_text, cfg_scale_caption, cfg_scale_speaker, seed,
         )
     # TTS へ渡す本文のみ英字→カナ化（保存・表示は原文のまま、絵文字=発声効果は変換しない）。
     styled_text = apply_emoji_style(english_to_kana_for_tts(text), emoji_style)
@@ -2671,18 +2798,22 @@ def handle_external_speak(payload: dict) -> dict:
         LUVIA_REF_WAV if use_second_speaker else IRODORI_REF_WAV,
     )
     chunks = split_sentences(text, limit=chunk_limit)
+    # seed はこの発話全体で共通（音色の当たりをチャンク間で揃える）。
+    speak_seed = new_tts_seed()
+    # 発声効果の絵文字は種類で出し分け：単発音は先頭 1 文のみ、持続系は全チャンクに付与。
     audios = [
         synthesize_sentence(
             chunk,
             index,
             steps=steps,
-            emoji_style=emoji_style,
+            emoji_style=(emoji_style if (index == 1 or emoji_is_sustained(emoji_style)) else ""),
             caption=caption,
             ref_wav=reference_path,
             duration_scale=duration_scale,
             cfg_scale_text=cfg_scale_text,
             cfg_scale_caption=cfg_scale_caption,
             cfg_scale_speaker=cfg_scale_speaker,
+            seed=speak_seed,
         )
         for index, chunk in enumerate(chunks, start=1)
     ]
@@ -3162,13 +3293,18 @@ class Handler(BaseHTTPRequestHandler):
                 # 各セグメントの caption は「基底 TTS Caption + 感情style」を必ず連結する。
                 seg_caption = compose_caption(tts_caption, seg_style)
                 seg_meta.append({"style": seg_style, "emoji": seg_emoji, "text": seg_text})
-                for chunk in seg_chunks:
+                for chunk_pos, chunk in enumerate(seg_chunks):
+                    # 発声効果の絵文字は種類で出し分ける。単発音（吐息・喘ぎ・泣き声など）は
+                    # 先頭 1 文のみに付与し、文ごとの繰り返し挿入（＝文間の意味不明な発声）を防ぐ。
+                    # 持続系（話し方・声色・音響効果）は全チャンクに付与し、セグメント途中で
+                    # 表現がぶれないようにする。感情そのものは caption が全チャンクで担う。
+                    chunk_emoji = seg_emoji if (chunk_pos == 0 or emoji_is_sustained(seg_emoji)) else ""
                     audios.append(
                         synthesize(
                             chunk,
                             len(audios) + 1,
                             steps=max(1, min(120, steps)),
-                            emoji_style=seg_emoji,
+                            emoji_style=chunk_emoji,
                             caption=seg_caption,
                             duration_scale=duration_scale,
                             **synth_kwargs,
