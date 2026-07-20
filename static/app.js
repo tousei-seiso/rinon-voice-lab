@@ -983,11 +983,26 @@ function renderHistory(items) {
   history.length = 0;
   messagesEl.innerHTML = "";
   lastContextStats = null;
+  let lastAudioNode = null;
   for (const item of items || []) {
     if (!item || !["user", "assistant"].includes(item.role) || !item.content) continue;
-    history.push({ role: item.role, content: item.content });
-    addMessage(item.role, item.content);
+    const entry = { role: item.role, content: item.content };
+    const display = item.role === "assistant" && item.display && typeof item.display === "object"
+      ? item.display
+      : null;
+    if (display) {
+      entry.display = display;
+      const node = addMessage("assistant", display.text || item.content, display.meta || "", {
+        audioUrl: display.audioUrl || "",
+      });
+      if (display.audioUrl) lastAudioNode = node;
+    } else {
+      addMessage(item.role, item.content);
+    }
+    history.push(entry);
   }
+  // 復元直後は、最後の音声付き返答を選択状態（ハイライト＋再生対象）にする。
+  if (lastAudioNode) selectReplyMessage(lastAudioNode);
   updateContextUsage();
 }
 
@@ -1403,7 +1418,12 @@ async function sendChatTurn({
     if (!backgroundAuto) {
       addMessage("assistant", annotatedReply, assistantMeta, { audioUrl: primaryAudioUrl });
     }
-    history.push({ role: "assistant", content: `${data.speaker || speaker}: ${data.reply}` });
+    history.push({
+      role: "assistant",
+      content: `${data.speaker || speaker}: ${data.reply}`,
+      // リロード後も注釈・meta 行・再生対象を復元するための表示用メタ（LM context には非影響）。
+      display: { text: annotatedReply, meta: assistantMeta, audioUrl: primaryAudioUrl },
+    });
     lastAssistantSpeaker = data.speaker || speaker;
     lastAssistantText = data.reply;
     updateContextUsage();

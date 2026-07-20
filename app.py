@@ -796,17 +796,31 @@ def chat_log_summary(limit: int = 20) -> dict:
     }
 
 
-def sanitize_history(value: object) -> list[dict[str, str]]:
+def sanitize_history(value: object) -> list[dict]:
     if not isinstance(value, list):
         return []
-    history: list[dict[str, str]] = []
+    history: list[dict] = []
     for item in value:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "")
         content = str(item.get("content") or "").strip()
-        if role in {"user", "assistant"} and content:
-            history.append({"role": role, "content": content})
+        if role not in {"user", "assistant"} or not content:
+            continue
+        entry: dict = {"role": role, "content": content}
+        # アシスタント返答は、リロード後も注釈（感情キャプション）・meta 行・再生対象を
+        # 復元できるよう表示用メタを保持する。LM context（content）とは別物で、
+        # /api/chat の文脈生成では無視される。
+        display = item.get("display")
+        if role == "assistant" and isinstance(display, dict):
+            clean_display = {
+                "text": str(display.get("text") or ""),
+                "meta": str(display.get("meta") or ""),
+                "audioUrl": str(display.get("audioUrl") or ""),
+            }
+            if any(clean_display.values()):
+                entry["display"] = clean_display
+        history.append(entry)
     return history
 
 
