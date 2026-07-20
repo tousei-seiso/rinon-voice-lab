@@ -1263,39 +1263,87 @@ def compose_caption(base_caption: str, style: str) -> str:
     return f"{base}{separator} {emotion}".replace("  ", " ").strip()
 
 
+def _repair_segment_json(text: str) -> str:
+    """LM が出しがちな軽微な JSON 崩れを補修する。
+
+    典型例: ``emoji`` のキー名を落として ``,""`` になる／末尾カンマ。
+    """
+    repaired = text
+    # ,"" のようにキー名の無い空値メンバーを除去（オブジェクト末尾・中間の両方）。
+    repaired = re.sub(r',\s*""\s*(?=[}\]])', "", repaired)
+    repaired = re.sub(r',\s*""\s*,', ",", repaired)
+    # 末尾カンマ（, } / , ]）の除去。
+    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+    return repaired
+
+
+def _json_str_field(obj_text: str, key: str) -> str:
+    """オブジェクト断片から ``"key":"value"`` の文字列値を取り出す（エスケープ考慮）。"""
+    match = re.search(r'"' + re.escape(key) + r'"\s*:\s*"((?:\\.|[^"\\])*)"', obj_text)
+    if not match:
+        return ""
+    try:
+        return json.loads('"' + match.group(1) + '"')
+    except Exception:
+        return match.group(1)
+
+
+def _extract_segments_regex(text: str, allowed_emojis: set[str]) -> list[dict[str, str]]:
+    """壊れた JSON でも、キー名ベースの正規表現で segments を救済抽出する。"""
+    segments: list[dict[str, str]] = []
+    for obj in re.findall(r"\{[^{}]*\}", text):
+        if '"text"' not in obj:
+            continue
+        seg_text = strip_irodori_style_marks(_json_str_field(obj, "text") or _json_str_field(obj, "reply"))
+        if not seg_text:
+            continue
+        style = (_json_str_field(obj, "style") or _json_str_field(obj, "caption")).strip()
+        emoji = _json_str_field(obj, "emoji").strip()
+        if emoji not in allowed_emojis:
+            emoji = ""
+        segments.append({"text": seg_text, "style": style, "emoji": emoji})
+    return segments
+
+
 def parse_lmstudio_segments(raw: str, allowed_emojis: set[str]) -> list[dict[str, str]]:
     """LM 返答から ``{"segments":[{text, style, emoji}...]}`` を取り出す。
 
-    セグメント配列を取得できなければ空リストを返し、呼び出し側は従来の
-    「返答全体で1感情・1caption」の経路にフォールバックする。``emoji`` は
-    irodori パレット（``allowed_emojis``）に含まれるものだけを採用する。
+    LM は長め/複雑な返答でしばしば壊れた JSON（例: ``emoji`` キー名の欠落 ``,""``）を
+    返すため、厳密パース→軽微修復→キー名正規表現の順で頑健に抽出する。取得できなければ
+    空リストを返し、呼び出し側は従来の「返答全体で1感情・1caption」へフォールバックする。
+    ``emoji`` は irodori パレット（``allowed_emojis``）に含まれるものだけを採用する。
     """
     text = raw.strip()
     fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
     if fenced:
         text = fenced.group(1).strip()
-    try:
-        data = json.loads(text)
-    except Exception:
-        return []
-    if not isinstance(data, dict):
-        return []
-    raw_segments = data.get("segments")
-    if not isinstance(raw_segments, list):
-        return []
-    segments: list[dict[str, str]] = []
-    for item in raw_segments:
-        if not isinstance(item, dict):
-            continue
-        seg_text = strip_irodori_style_marks(str(item.get("text") or item.get("reply") or ""))
-        if not seg_text:
-            continue
-        style = str(item.get("style") or item.get("caption") or "").strip()
-        emoji = str(item.get("emoji") or "").strip()
-        if emoji not in allowed_emojis:
-            emoji = ""
-        segments.append({"text": seg_text, "style": style, "emoji": emoji})
-    return segments
+
+    data = None
+    for candidate in (text, _repair_segment_json(text)):
+        try:
+            data = json.loads(candidate)
+            break
+        except Exception:
+            data = None
+
+    if isinstance(data, dict) and isinstance(data.get("segments"), list):
+        segments: list[dict[str, str]] = []
+        for item in data["segments"]:
+            if not isinstance(item, dict):
+                continue
+            seg_text = strip_irodori_style_marks(str(item.get("text") or item.get("reply") or ""))
+            if not seg_text:
+                continue
+            style = str(item.get("style") or item.get("caption") or "").strip()
+            emoji = str(item.get("emoji") or "").strip()
+            if emoji not in allowed_emojis:
+                emoji = ""
+            segments.append({"text": seg_text, "style": style, "emoji": emoji})
+        if segments:
+            return segments
+
+    # 厳密/修復パースが失敗、または有効な segment が0件 → 正規表現で救済抽出する。
+    return _extract_segments_regex(text, allowed_emojis)
 
 
 def strip_irodori_style_marks(text: str) -> str:
@@ -1671,6 +1719,9 @@ def request_lmstudio(
             "・textはそのまま読み上げる本文です。styleは声の感情・話し方を短い日本語で書いてください"
             "（例:「楽しげにはしゃいで」「声を落として切なげに」「怒って責めるように」）。\n"
             "・感情の変化が無ければsegmentsは1つでも構いません。返答全体を無理に細切れにしないでください。\n"
+            "・各セグメントは必ず text / style / emoji の3キーをこの順で含めてください。"
+            "該当する発声効果が無くても emoji は必ず \"emoji\":\"\" と空文字で入れてください（キー名を省略しない）。\n"
+            "・出力は有効なJSONのみ。末尾カンマや説明文、コードフェンスは付けないでください。\n"
             "・emojiは次のリストのいずれかだけ使用可。該当する発声効果が無ければ空文字にしてください:\n"
             f"{build_emoji_choice_prompt()}"
         )
@@ -1740,6 +1791,15 @@ def request_lmstudio(
     else:
         message, emoji = parse_lmstudio_reply(content, allowed_emojis) if auto_emoji else (content, "")
         message = strip_irodori_style_marks(message)
+        # 保険: セグメント抽出をすり抜けた壊れJSONを、記号ごと読み上げないよう本文だけ救済。
+        if segmented_mode and ('"segments"' in message or re.search(r'"text"\s*:', message)):
+            recovered = " ".join(
+                strip_irodori_style_marks(_json_str_field(obj, "text"))
+                for obj in re.findall(r"\{[^{}]*\}", message)
+                if '"text"' in obj
+            ).strip()
+            if recovered:
+                message = recovered
         if no_dialogue:
             message = sanitize_no_dialogue_reply(message)
     if not message:
