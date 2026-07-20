@@ -88,8 +88,9 @@ WEB_SEARCH_TIMEOUT = int(os.environ.get("WEB_SEARCH_TIMEOUT", "12"))
 # まま残す。辞書は所定フォルダのファイルを使い、pip 依存(alkana 等)は増やさない方針。
 #   有効/無効: TTS_KANA_NORMALIZE = on(既定) / off
 #   辞書ファイル: TTS_KANA_DICT_FILE（tts_dictionaries/ 配下の相対名、または絶対パス）
+#                 ";" 区切りで複数指定可（後に書いたファイルが優先）。
 #   形式: 1行 "english,カタカナ"（カンマ or タブ区切り／# はコメント／英字は大小無視）。
-#         alkana の alkanadict.csv をそのまま置いて指定することもできる。
+#         alkana の外部データ CSV と同一形式（alkanadict.csv を置いて指定できる）。
 #   辞書が無くても、未知語はカナへフォールバックし、最終ガードでラテン文字を必ず除去する。
 TTS_KANA_NORMALIZE = os.environ.get("TTS_KANA_NORMALIZE", "on").strip().lower()
 TTS_DICT_ROOT = APP_ROOT / "tts_dictionaries"
@@ -343,36 +344,48 @@ def _romaji_to_kana(word: str) -> str:
     return "".join(out)
 
 
-def _load_tts_kana_dict() -> dict[str, str]:
-    """英字→カナ辞書を所定フォルダのファイルから読み込む（キャッシュ）。
+def _load_one_kana_dict_file(path: Path, mapping: dict[str, str]) -> None:
+    """1 つの辞書ファイルを ``mapping`` へ読み込む（同一キーは後勝ち）。"""
+    if not path.exists():
+        print(f"[tts-kana] dict not found ({path}); skipped", flush=True)
+        return
+    count = 0
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = re.split(r"[,\t]", line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        key, value = parts[0].strip().lower(), parts[1].strip()
+        if key and value:
+            mapping[key] = value
+            count += 1
+    print(f"[tts-kana] loaded {count} entries from {path}", flush=True)
 
-    形式: 1 行 ``english,カタカナ``（カンマ or タブ区切り、``#`` はコメント）。
-    alkana の ``alkanadict.csv`` もそのまま読める。ファイルが無ければ空辞書。
+
+def _load_tts_kana_dict() -> dict[str, str]:
+    """英字→カナ辞書をファイルから読み込む（キャッシュ）。
+
+    ``TTS_KANA_DICT_FILE`` は ``;`` 区切りで複数指定でき、**後に書いたファイルの内容が優先**
+    される（例 ``alkanadict.csv;tts_kana_dict.csv`` なら alkana を土台に、独自用語辞書で上書き）。
+    各ファイルは 1 行 ``english,カタカナ``（カンマ or タブ区切り、``#`` はコメント）。
+    alkana の外部データ CSV と同一形式。ファイルが無くても空辞書として続行する。
     """
     global _tts_kana_dict_cache
     if _tts_kana_dict_cache is not None:
         return _tts_kana_dict_cache
     mapping: dict[str, str] = {}
-    path = Path(TTS_KANA_DICT_FILE)
-    if not path.is_absolute():
-        path = TTS_DICT_ROOT / TTS_KANA_DICT_FILE
-    try:
-        if path.exists():
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = re.split(r"[,\t]", line, maxsplit=1)
-                if len(parts) != 2:
-                    continue
-                key, value = parts[0].strip().lower(), parts[1].strip()
-                if key and value:
-                    mapping[key] = value
-            print(f"[tts-kana] loaded {len(mapping)} entries from {path}", flush=True)
-        else:
-            print(f"[tts-kana] dict not found ({path}); using fallback only", flush=True)
-    except Exception as exc:  # 辞書が壊れていても TTS は止めない
-        print(f"[tts-kana] dict load failed ({path}): {exc}", flush=True)
+    names = [n.strip() for n in str(TTS_KANA_DICT_FILE).split(";") if n.strip()]
+    for name in names:
+        path = Path(name)
+        if not path.is_absolute():
+            path = TTS_DICT_ROOT / name
+        try:
+            _load_one_kana_dict_file(path, mapping)
+        except Exception as exc:  # 辞書が壊れていても TTS は止めない
+            print(f"[tts-kana] dict load failed ({path}): {exc}", flush=True)
+    print(f"[tts-kana] total {len(mapping)} entries", flush=True)
     _tts_kana_dict_cache = mapping
     return mapping
 
