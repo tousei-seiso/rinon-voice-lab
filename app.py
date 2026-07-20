@@ -129,11 +129,13 @@ IRODORI_CAPTION = os.environ.get(
         "soft breath, gentle emotional nuance, clear pronunciation, clean studio sound."
     ),
 )
-# CFG Scale の初期値（従来 rinon が Irodori へ渡していた固定値）。
-# キャラクターごとに上書き可能で、未指定時はこの値にフォールバックする。
+# CFG Scale の初期値。キャラクターごとに上書き可能で、未指定時はこの値にフォールバックする。
+# 感情セグメントごとに caption が変わる構成では、未設定キャラの音色がリファレンス話者から
+# 離れ「一部の文だけ別人の声」になりやすい。そのため speaker の既定値を高めにして音色を
+# リファレンスへ寄せる。caption は感情表現に効くため据え置き（キャラ別に上書き可）。
 IRODORI_CFG_SCALE_TEXT = float(os.environ.get("IRODORI_CFG_SCALE_TEXT", "3.0"))
 IRODORI_CFG_SCALE_CAPTION = float(os.environ.get("IRODORI_CFG_SCALE_CAPTION", "4.0"))
-IRODORI_CFG_SCALE_SPEAKER = float(os.environ.get("IRODORI_CFG_SCALE_SPEAKER", "5.0"))
+IRODORI_CFG_SCALE_SPEAKER = float(os.environ.get("IRODORI_CFG_SCALE_SPEAKER", "6.5"))
 IRODORI_REF_WAV = Path(
     os.environ.get(
         "IRODORI_REF_WAV",
