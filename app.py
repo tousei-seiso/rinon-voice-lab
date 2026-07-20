@@ -84,6 +84,20 @@ LM_RECENT_MESSAGE_COUNT = int(os.environ.get("LM_RECENT_MESSAGE_COUNT", "12"))
 LM_SUMMARY_CHAR_LIMIT = int(os.environ.get("LM_SUMMARY_CHAR_LIMIT", "1400"))
 WEB_SEARCH_TIMEOUT = int(os.environ.get("WEB_SEARCH_TIMEOUT", "12"))
 
+# --- TTS 読み仮名化（英字→カナ）設定 ---
+# Irodori-TTS は日本語音声モデルのため、ラテン文字（英単語）を読み上げると生成が暴走し、
+# 意味不明な音声になることがある。TTS へ渡す直前だけ英字をカナへ変換し、保存・表示は原文の
+# まま残す。辞書は所定フォルダのファイルを使い、pip 依存(alkana 等)は増やさない方針。
+#   有効/無効: TTS_KANA_NORMALIZE = on(既定) / off
+#   辞書ファイル: TTS_KANA_DICT_FILE（tts_dictionaries/ 配下の相対名、または絶対パス）
+#   形式: 1行 "english,カタカナ"（カンマ or タブ区切り／# はコメント／英字は大小無視）。
+#         alkana の alkanadict.csv をそのまま置いて指定することもできる。
+#   辞書が無くても、未知語はカナへフォールバックし、最終ガードでラテン文字を必ず除去する。
+TTS_KANA_NORMALIZE = os.environ.get("TTS_KANA_NORMALIZE", "on").strip().lower()
+TTS_DICT_ROOT = APP_ROOT / "tts_dictionaries"
+TTS_KANA_DICT_FILE = os.environ.get("TTS_KANA_DICT_FILE", "tts_kana_dict.csv")
+_tts_kana_dict_cache: dict[str, str] | None = None
+
 IRODORI_CHECKPOINT = os.environ.get(
     "IRODORI_CHECKPOINT", "Aratako/Irodori-TTS-600M-v3-VoiceDesign"
 )
@@ -260,6 +274,137 @@ def apply_emoji_style(text: str, emoji_style: str) -> str:
     if not emoji_style:
         return text
     return f"{emoji_style}{text}"
+
+
+# --- 英字→カナ変換（TTS 直前でのみ使用。保存・表示テキストは変換しない）------------------
+# 未知語フォールバック用のローマ字系カナ表（英語読みの近似。正確さより「暴走させない」が目的）。
+def _build_kana_syllable_table() -> dict[str, str]:
+    rows = {
+        "": "アイウエオ",
+        "k": "カキクケコ", "g": "ガギグゲゴ", "s": "サシスセソ", "z": "ザジズゼゾ",
+        "t": "タチツテト", "d": "ダヂヅデド", "n": "ナニヌネノ", "h": "ハヒフヘホ",
+        "b": "バビブベボ", "p": "パピプペポ", "m": "マミムメモ", "r": "ラリルレロ",
+        "y": "ヤ・ユ・ヨ", "w": "ワ・・・ヲ",
+    }
+    table: dict[str, str] = {}
+    for consonant, kana_row in rows.items():
+        for vowel, kana in zip("aiueo", kana_row):
+            if kana != "・":
+                table[consonant + vowel] = kana
+    # 英単語向けの追加読み（デジラフ・外来音）。
+    table.update({
+        "shi": "シ", "sha": "シャ", "shu": "シュ", "sho": "ショ", "she": "シェ",
+        "chi": "チ", "cha": "チャ", "chu": "チュ", "cho": "チョ", "che": "チェ",
+        "tsu": "ツ", "si": "シ", "ti": "ティ", "tu": "トゥ", "di": "ディ", "du": "ドゥ",
+        "fa": "ファ", "fi": "フィ", "fu": "フ", "fe": "フェ", "fo": "フォ",
+        "ja": "ジャ", "ji": "ジ", "ju": "ジュ", "je": "ジェ", "jo": "ジョ",
+        "va": "ヴァ", "vi": "ヴィ", "vu": "ヴ", "ve": "ヴェ", "vo": "ヴォ",
+        "la": "ラ", "li": "リ", "lu": "ル", "le": "レ", "lo": "ロ",
+        "wi": "ウィ", "we": "ウェ", "wo": "ウォ", "wu": "ウ", "ye": "イェ",
+        "the": "ザ", "tha": "サ", "thi": "シ", "tho": "ソ",
+    })
+    return table
+
+
+_KANA_SYLLABLES = _build_kana_syllable_table()
+# 子音単独（子音クラスタ/語末）→ 母音を補ったカナ。
+_KANA_CONSONANT_ONLY = {
+    "k": "ク", "g": "グ", "s": "ス", "z": "ズ", "t": "ト", "d": "ド", "n": "ン",
+    "h": "フ", "b": "ブ", "p": "プ", "m": "ム", "r": "ル", "l": "ル", "y": "イ",
+    "w": "ウ", "c": "ク", "f": "フ", "j": "ジュ", "v": "ヴ", "x": "クス", "q": "ク",
+}
+# 最終ガード用: 変換後に残ったラテン文字を 1 字ずつアルファベット読みのカナへ。
+_KANA_LETTER_NAMES = {
+    "a": "エー", "b": "ビー", "c": "シー", "d": "ディー", "e": "イー", "f": "エフ",
+    "g": "ジー", "h": "エイチ", "i": "アイ", "j": "ジェー", "k": "ケー", "l": "エル",
+    "m": "エム", "n": "エヌ", "o": "オー", "p": "ピー", "q": "キュー", "r": "アール",
+    "s": "エス", "t": "ティー", "u": "ユー", "v": "ブイ", "w": "ダブリュー",
+    "x": "エックス", "y": "ワイ", "z": "ゼット",
+}
+_VOWELS = frozenset("aiueo")
+
+
+def _romaji_to_kana(word: str) -> str:
+    """英字の並びをカナへ近似変換する（辞書に無い未知語のフォールバック）。"""
+    s = word.lower()
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        matched = False
+        for length in (3, 2):  # 長い綴り(shi, cha, the...) を優先
+            if s[i:i + length] in _KANA_SYLLABLES:
+                out.append(_KANA_SYLLABLES[s[i:i + length]])
+                i += length
+                matched = True
+                break
+        if matched:
+            continue
+        ch = s[i]
+        if ch in _VOWELS:
+            out.append(_KANA_SYLLABLES[ch])
+        elif ch in _KANA_CONSONANT_ONLY:
+            out.append(_KANA_CONSONANT_ONLY[ch])
+        else:
+            out.append(_KANA_LETTER_NAMES.get(ch, ""))
+        i += 1
+    return "".join(out)
+
+
+def _load_tts_kana_dict() -> dict[str, str]:
+    """英字→カナ辞書を所定フォルダのファイルから読み込む（キャッシュ）。
+
+    形式: 1 行 ``english,カタカナ``（カンマ or タブ区切り、``#`` はコメント）。
+    alkana の ``alkanadict.csv`` もそのまま読める。ファイルが無ければ空辞書。
+    """
+    global _tts_kana_dict_cache
+    if _tts_kana_dict_cache is not None:
+        return _tts_kana_dict_cache
+    mapping: dict[str, str] = {}
+    path = Path(TTS_KANA_DICT_FILE)
+    if not path.is_absolute():
+        path = TTS_DICT_ROOT / TTS_KANA_DICT_FILE
+    try:
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = re.split(r"[,\t]", line, maxsplit=1)
+                if len(parts) != 2:
+                    continue
+                key, value = parts[0].strip().lower(), parts[1].strip()
+                if key and value:
+                    mapping[key] = value
+            print(f"[tts-kana] loaded {len(mapping)} entries from {path}", flush=True)
+        else:
+            print(f"[tts-kana] dict not found ({path}); using fallback only", flush=True)
+    except Exception as exc:  # 辞書が壊れていても TTS は止めない
+        print(f"[tts-kana] dict load failed ({path}): {exc}", flush=True)
+    _tts_kana_dict_cache = mapping
+    return mapping
+
+
+def english_to_kana_for_tts(text: str) -> str:
+    """TTS へ渡す直前に、テキスト中のラテン文字だけをカナへ置き換える。
+
+    保存・表示テキストには使わないこと（原文を残す）。辞書→未知語フォールバックの順で
+    変換し、最後に残ったラテン文字を必ずカナへ落として Irodori に英字を渡さない。
+    """
+    if TTS_KANA_NORMALIZE == "off" or not text or not re.search(r"[A-Za-z]", text):
+        return text
+    dictionary = _load_tts_kana_dict()
+
+    def _replace_word(match: "re.Match[str]") -> str:
+        word = match.group(0)
+        return dictionary.get(word.lower()) or _romaji_to_kana(word)
+
+    converted = re.sub(r"[A-Za-z]+", _replace_word, text)
+    # 最終ガード: 何らかの理由で残ったラテン文字を 1 字ずつカナへ（暴走の構造的防止）。
+    return re.sub(
+        r"[A-Za-z]",
+        lambda m: _KANA_LETTER_NAMES.get(m.group(0).lower(), ""),
+        converted,
+    )
 
 
 def expression_for_emoji(emoji_style: str) -> str:
@@ -1952,7 +2097,8 @@ def synthesize_sentence(
     cfg_scale_speaker: float = IRODORI_CFG_SCALE_SPEAKER,
 ) -> dict:
     module = ensure_irodori_module()
-    styled_text = apply_emoji_style(text, emoji_style)
+    # TTS へ渡す本文のみ英字→カナ化（保存・表示は原文のまま、絵文字=発声効果は変換しない）。
+    styled_text = apply_emoji_style(english_to_kana_for_tts(text), emoji_style)
     voice_caption = str(caption or "").strip() or IRODORI_CAPTION
     reference_wav = ref_wav or IRODORI_REF_WAV
     cfg_text = sanitize_cfg_scale(cfg_scale_text, IRODORI_CFG_SCALE_TEXT)
@@ -2053,7 +2199,8 @@ def synthesize_sentence_remote_luvia(
             text, index, steps, emoji_style, caption, remote_ref_wav, duration_scale,
             cfg_scale_text, cfg_scale_caption, cfg_scale_speaker,
         )
-    styled_text = apply_emoji_style(text, emoji_style)
+    # TTS へ渡す本文のみ英字→カナ化（保存・表示は原文のまま、絵文字=発声効果は変換しない）。
+    styled_text = apply_emoji_style(english_to_kana_for_tts(text), emoji_style)
     voice_caption = str(caption or "").strip() or IRODORI_CAPTION
     payload = {
         "text": styled_text,
@@ -2127,7 +2274,8 @@ def synthesize_sentence_remote_luvia_cli(
     cfg_scale_speaker = sanitize_cfg_scale(cfg_scale_speaker, IRODORI_CFG_SCALE_SPEAKER)
     if not (LUVIA_REMOTE_TTS_HOST and LUVIA_REMOTE_IRODORI_ROOT):
         raise RuntimeError("Remote Luvia TTS CLI fallback is not configured")
-    styled_text = apply_emoji_style(text, emoji_style)
+    # TTS へ渡す本文のみ英字→カナ化（保存・表示は原文のまま、絵文字=発声効果は変換しない）。
+    styled_text = apply_emoji_style(english_to_kana_for_tts(text), emoji_style)
     voice_caption = str(caption or "").strip() or IRODORI_CAPTION
     request_id = f"luvia_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}_{index:02d}"
     remote_root = LUVIA_REMOTE_IRODORI_ROOT
