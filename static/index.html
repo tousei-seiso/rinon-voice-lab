@@ -190,6 +190,23 @@
             <span>TTS Caption</span>
             <textarea id="editTtsCaption" rows="4"></textarea>
           </label>
+          <div class="option-field">
+            <span>CFG Scale（text / caption / speaker）</span>
+            <div class="cfg-scale-row">
+              <label class="cfg-scale-field">
+                <small>text</small>
+                <input id="editCfgScaleText" type="number" min="0" max="20" step="0.1" value="3.0" />
+              </label>
+              <label class="cfg-scale-field">
+                <small>caption</small>
+                <input id="editCfgScaleCaption" type="number" min="0" max="20" step="0.1" value="4.0" />
+              </label>
+              <label class="cfg-scale-field">
+                <small>speaker</small>
+                <input id="editCfgScaleSpeaker" type="number" min="0" max="20" step="0.1" value="5.0" />
+              </label>
+            </div>
+          </div>
           <div class="reference-drop" id="editReferenceDrop">
             <input id="editReferenceFile" type="file" accept="audio/*,.wav,.mp3,.flac,.m4a,.ogg,.aac" hidden />
             <button id="editReferenceChoose" type="button">音声を選択</button>

@@ -76,6 +76,11 @@ IRODORI_CAPTION = os.environ.get(
         "soft breath, gentle emotional nuance, clear pronunciation, clean studio sound."
     ),
 )
+# CFG Scale の初期値（従来 rinon が Irodori へ渡していた固定値）。
+# キャラクターごとに上書き可能で、未指定時はこの値にフォールバックする。
+IRODORI_CFG_SCALE_TEXT = float(os.environ.get("IRODORI_CFG_SCALE_TEXT", "3.0"))
+IRODORI_CFG_SCALE_CAPTION = float(os.environ.get("IRODORI_CFG_SCALE_CAPTION", "4.0"))
+IRODORI_CFG_SCALE_SPEAKER = float(os.environ.get("IRODORI_CFG_SCALE_SPEAKER", "5.0"))
 IRODORI_REF_WAV = Path(
     os.environ.get(
         "IRODORI_REF_WAV",
@@ -354,6 +359,9 @@ def default_character_profiles() -> dict:
                     "声は明るくやわらかく、少し小悪魔っぽい余裕と、ふとした照れを混ぜる。"
                 ),
                 "ttsCaption": IRODORI_CAPTION,
+                "cfgScaleText": IRODORI_CFG_SCALE_TEXT,
+                "cfgScaleCaption": IRODORI_CFG_SCALE_CAPTION,
+                "cfgScaleSpeaker": IRODORI_CFG_SCALE_SPEAKER,
                 "referencePath": str(IRODORI_REF_WAV),
                 "portrait": "/expressions/neutral.png",
                 "expressions": rinon_expressions,
@@ -373,12 +381,29 @@ def default_character_profiles() -> dict:
                     "confident lively tone, polished adult speaking style, restrained teasing confidence, "
                     "clean studio sound."
                 ),
+                "cfgScaleText": IRODORI_CFG_SCALE_TEXT,
+                "cfgScaleCaption": IRODORI_CFG_SCALE_CAPTION,
+                "cfgScaleSpeaker": IRODORI_CFG_SCALE_SPEAKER,
                 "referencePath": str(LUVIA_REF_WAV),
                 "portrait": "/second_player/expressions/luvia_neutral.png",
                 "expressions": luvia_expressions,
             },
         ],
     }
+
+
+def sanitize_cfg_scale(value: object, default: float) -> float:
+    """CFG Scale 値を float に正規化し、0〜20 の範囲へクランプする。
+
+    数値化できない／NaN の場合は ``default`` を返す。
+    """
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if result != result:  # NaN
+        return float(default)
+    return max(0.0, min(20.0, result))
 
 
 def sanitize_character_id(value: object, fallback: str = "") -> str:
@@ -476,6 +501,9 @@ def character_text_profile(character: dict) -> str:
         f"name: {character.get('name', '')}",
         f"referencePath: {character.get('referencePath', '')}",
         f"portrait: {character.get('portrait', '')}",
+        f"cfgScaleText: {character.get('cfgScaleText', IRODORI_CFG_SCALE_TEXT)}",
+        f"cfgScaleCaption: {character.get('cfgScaleCaption', IRODORI_CFG_SCALE_CAPTION)}",
+        f"cfgScaleSpeaker: {character.get('cfgScaleSpeaker', IRODORI_CFG_SCALE_SPEAKER)}",
         "",
         "[systemPrompt]",
         str(character.get("systemPrompt") or ""),
@@ -527,6 +555,9 @@ def parse_character_text_profile(path: Path) -> dict:
         "name": values.get("name", path.parent.name),
         "referencePath": values.get("referencePath", ""),
         "portrait": values.get("portrait", ""),
+        "cfgScaleText": sanitize_cfg_scale(values.get("cfgScaleText"), IRODORI_CFG_SCALE_TEXT),
+        "cfgScaleCaption": sanitize_cfg_scale(values.get("cfgScaleCaption"), IRODORI_CFG_SCALE_CAPTION),
+        "cfgScaleSpeaker": sanitize_cfg_scale(values.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER),
         "systemPrompt": "\n".join(sections.get("systemPrompt", [])).strip(),
         "ttsCaption": "\n".join(sections.get("ttsCaption", [])).strip(),
         "expressions": expressions,
@@ -621,6 +652,9 @@ def sanitize_character_profiles(payload: dict, materialize: bool = True) -> dict
                 "name": str(item.get("name") or char_id).strip()[:80],
                 "systemPrompt": str(item.get("systemPrompt") or "").strip(),
                 "ttsCaption": str(item.get("ttsCaption") or IRODORI_CAPTION).strip(),
+                "cfgScaleText": sanitize_cfg_scale(item.get("cfgScaleText"), IRODORI_CFG_SCALE_TEXT),
+                "cfgScaleCaption": sanitize_cfg_scale(item.get("cfgScaleCaption"), IRODORI_CFG_SCALE_CAPTION),
+                "cfgScaleSpeaker": sanitize_cfg_scale(item.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER),
                 "referencePath": str(item.get("referencePath") or IRODORI_REF_WAV).strip(),
                 "portrait": portrait,
                 "expressions": clean_expressions,
@@ -1777,6 +1811,9 @@ def synthesize_sentence(
     caption: str = "",
     ref_wav: Path | None = None,
     duration_scale: float = 1.0,
+    cfg_scale_text: float = IRODORI_CFG_SCALE_TEXT,
+    cfg_scale_caption: float = IRODORI_CFG_SCALE_CAPTION,
+    cfg_scale_speaker: float = IRODORI_CFG_SCALE_SPEAKER,
 ) -> dict:
     module = ensure_irodori_module()
     styled_text = apply_emoji_style(text, emoji_style)
@@ -1805,9 +1842,9 @@ def synthesize_sentence(
                 "linear",
                 -1.0,
                 "independent",
-                3.0,
-                4.0,
-                5.0,
+                sanitize_cfg_scale(cfg_scale_text, IRODORI_CFG_SCALE_TEXT),
+                sanitize_cfg_scale(cfg_scale_caption, IRODORI_CFG_SCALE_CAPTION),
+                sanitize_cfg_scale(cfg_scale_speaker, IRODORI_CFG_SCALE_SPEAKER),
                 "",
                 0.0,
                 1.0,
@@ -1862,11 +1899,18 @@ def synthesize_sentence_remote_luvia(
     remote_ref_wav: str = "",
     duration_scale: float = 1.0,
     remote_tts_url: str = "",
+    cfg_scale_text: float = IRODORI_CFG_SCALE_TEXT,
+    cfg_scale_caption: float = IRODORI_CFG_SCALE_CAPTION,
+    cfg_scale_speaker: float = IRODORI_CFG_SCALE_SPEAKER,
 ) -> dict:
+    cfg_scale_text = sanitize_cfg_scale(cfg_scale_text, IRODORI_CFG_SCALE_TEXT)
+    cfg_scale_caption = sanitize_cfg_scale(cfg_scale_caption, IRODORI_CFG_SCALE_CAPTION)
+    cfg_scale_speaker = sanitize_cfg_scale(cfg_scale_speaker, IRODORI_CFG_SCALE_SPEAKER)
     target_url = normalize_remote_tts_url(remote_tts_url) or LUVIA_REMOTE_TTS_URL
     if not target_url:
         return synthesize_sentence_remote_luvia_cli(
-            text, index, steps, emoji_style, caption, remote_ref_wav, duration_scale
+            text, index, steps, emoji_style, caption, remote_ref_wav, duration_scale,
+            cfg_scale_text, cfg_scale_caption, cfg_scale_speaker,
         )
     styled_text = apply_emoji_style(text, emoji_style)
     voice_caption = str(caption or "").strip() or IRODORI_CAPTION
@@ -1877,6 +1921,9 @@ def synthesize_sentence_remote_luvia(
         "emojiStyle": emoji_style,
         "refWav": remote_ref_wav or LUVIA_REMOTE_REF_WAV,
         "durationScale": float(duration_scale),
+        "cfgScaleText": cfg_scale_text,
+        "cfgScaleCaption": cfg_scale_caption,
+        "cfgScaleSpeaker": cfg_scale_speaker,
     }
     request = urllib.request.Request(
         f"{target_url}/synthesize",
@@ -1892,7 +1939,10 @@ def synthesize_sentence_remote_luvia(
         elapsed = float(data.get("elapsed") or (time.perf_counter() - start))
     except Exception as exc:
         if LUVIA_REMOTE_TTS_HOST and LUVIA_REMOTE_IRODORI_ROOT:
-            fallback = synthesize_sentence_remote_luvia_cli(text, index, steps, emoji_style, caption, remote_ref_wav, duration_scale)
+            fallback = synthesize_sentence_remote_luvia_cli(
+                text, index, steps, emoji_style, caption, remote_ref_wav, duration_scale,
+                cfg_scale_text, cfg_scale_caption, cfg_scale_speaker,
+            )
             fallback["remoteServerError"] = str(exc)
             fallback["engine"] = "4090-cli-fallback"
             return fallback
@@ -1927,7 +1977,13 @@ def synthesize_sentence_remote_luvia_cli(
     caption: str = "",
     remote_ref_wav: str = "",
     duration_scale: float = 1.0,
+    cfg_scale_text: float = IRODORI_CFG_SCALE_TEXT,
+    cfg_scale_caption: float = IRODORI_CFG_SCALE_CAPTION,
+    cfg_scale_speaker: float = IRODORI_CFG_SCALE_SPEAKER,
 ) -> dict:
+    cfg_scale_text = sanitize_cfg_scale(cfg_scale_text, IRODORI_CFG_SCALE_TEXT)
+    cfg_scale_caption = sanitize_cfg_scale(cfg_scale_caption, IRODORI_CFG_SCALE_CAPTION)
+    cfg_scale_speaker = sanitize_cfg_scale(cfg_scale_speaker, IRODORI_CFG_SCALE_SPEAKER)
     if not (LUVIA_REMOTE_TTS_HOST and LUVIA_REMOTE_IRODORI_ROOT):
         raise RuntimeError("Remote Luvia TTS CLI fallback is not configured")
     styled_text = apply_emoji_style(text, emoji_style)
@@ -1948,6 +2004,9 @@ def synthesize_sentence_remote_luvia_cli(
         "ref_wav": remote_ref_wav or LUVIA_REMOTE_REF_WAV,
         "output_wav": remote_output_wav,
         "duration_scale": float(duration_scale),
+        "cfg_scale_text": cfg_scale_text,
+        "cfg_scale_caption": cfg_scale_caption,
+        "cfg_scale_speaker": cfg_scale_speaker,
     }
     request_path.write_text(json.dumps(request_payload, ensure_ascii=False), encoding="utf-8")
 
@@ -2006,9 +2065,9 @@ def synthesize_sentence_remote_luvia_cli(
         "--t-schedule-mode linear "
         "--sway-coeff -1 "
         "--cfg-guidance-mode independent "
-        "--cfg-scale-text 3 "
-        "--cfg-scale-caption 4 "
-        "--cfg-scale-speaker 5 "
+        "--cfg-scale-text $r.cfg_scale_text "
+        "--cfg-scale-caption $r.cfg_scale_caption "
+        "--cfg-scale-speaker $r.cfg_scale_speaker "
         "--model-precision bf16 "
         "--codec-precision bf16 "
         "--output-wav $r.output_wav"
@@ -2254,6 +2313,9 @@ def handle_external_speak(payload: dict) -> dict:
     speaker = str(payload.get("speaker") or ("ルヴィア" if use_second_speaker else "リノン")).strip()
     emoji_style = str(payload.get("emoji") or payload.get("emojiStyle") or "").strip()
     caption = str(payload.get("caption") or payload.get("ttsCaption") or IRODORI_CAPTION).strip()
+    cfg_scale_text = sanitize_cfg_scale(payload.get("cfgScaleText"), IRODORI_CFG_SCALE_TEXT)
+    cfg_scale_caption = sanitize_cfg_scale(payload.get("cfgScaleCaption"), IRODORI_CFG_SCALE_CAPTION)
+    cfg_scale_speaker = sanitize_cfg_scale(payload.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER)
     steps = max(1, min(120, int(payload.get("steps") or 12)))
     speech_rate = str(payload.get("speechRate") or "normal").strip().lower()
     duration_scale = float(payload.get("durationScale") or tts_duration_scale_for_rate(speech_rate))
@@ -2272,6 +2334,9 @@ def handle_external_speak(payload: dict) -> dict:
             caption=caption,
             ref_wav=reference_path,
             duration_scale=duration_scale,
+            cfg_scale_text=cfg_scale_text,
+            cfg_scale_caption=cfg_scale_caption,
+            cfg_scale_speaker=cfg_scale_speaker,
         )
         for index, chunk in enumerate(chunks, start=1)
     ]
@@ -2648,6 +2713,9 @@ class Handler(BaseHTTPRequestHandler):
             character_prompt = str(body.get("systemPrompt") or "").strip()
             user_address = str(body.get("userAddress") or "あなた").strip() or "あなた"
             tts_caption = str(body.get("ttsCaption") or IRODORI_CAPTION).strip()
+            cfg_scale_text = sanitize_cfg_scale(body.get("cfgScaleText"), IRODORI_CFG_SCALE_TEXT)
+            cfg_scale_caption = sanitize_cfg_scale(body.get("cfgScaleCaption"), IRODORI_CFG_SCALE_CAPTION)
+            cfg_scale_speaker = sanitize_cfg_scale(body.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER)
             reference_path = sanitize_reference_path(body.get("referencePath"), IRODORI_REF_WAV)
             second_reference_path = sanitize_reference_path(body.get("secondReferencePath"), LUVIA_REF_WAV)
             tts_backend_mode = str(body.get("ttsBackendMode") or "local").strip().lower()
@@ -2713,6 +2781,14 @@ class Handler(BaseHTTPRequestHandler):
                 {"remote_ref_wav": remote_reference_wav, "remote_tts_url": second_tts_url}
                 if use_remote_tts
                 else {"ref_wav": reference_wav}
+            )
+            # CFG Scale はキャラクターごとの値を全 TTS 経路へ共通で渡す。
+            synth_kwargs.update(
+                {
+                    "cfg_scale_text": cfg_scale_text,
+                    "cfg_scale_caption": cfg_scale_caption,
+                    "cfg_scale_speaker": cfg_scale_speaker,
+                }
             )
             # 感情セグメント単位に (感情style, 絵文字, 本文) を組み立てる。
             # segments が空（=分割なし/機能オフ）なら返答全体を 1 セグメントとして扱う。

@@ -174,6 +174,17 @@ def irodori_runtime_settings(payload: dict | None = None) -> dict[str, str]:
     }
 
 
+def _cfg_scale(value: object, default: float) -> float:
+    """CFG Scale をfloat化し 0〜20 にクランプ。数値化不可/NaN は default。"""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if result != result:  # NaN
+        return float(default)
+    return max(0.0, min(20.0, result))
+
+
 def read_json_body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", "0"))
     raw = handler.rfile.read(length) if length else b"{}"
@@ -188,6 +199,9 @@ def synthesize(payload: dict) -> dict:
         raise ValueError("text is required")
     steps = max(1, min(120, int(payload.get("steps") or 12)))
     duration_scale = float(payload.get("durationScale") or 1.0)
+    cfg_scale_text = _cfg_scale(payload.get("cfgScaleText"), 3.0)
+    cfg_scale_caption = _cfg_scale(payload.get("cfgScaleCaption"), 4.0)
+    cfg_scale_speaker = _cfg_scale(payload.get("cfgScaleSpeaker"), 5.0)
     ref_wav = str(payload.get("refWav") or REF_WAV)
     old_cwd = Path.cwd()
     os.chdir(ROOT)
@@ -212,9 +226,9 @@ def synthesize(payload: dict) -> dict:
                 "linear",
                 -1.0,
                 "independent",
-                3.0,
-                4.0,
-                5.0,
+                cfg_scale_text,
+                cfg_scale_caption,
+                cfg_scale_speaker,
                 "",
                 0.0,
                 1.0,

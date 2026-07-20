@@ -736,6 +736,24 @@ audio {
   min-width: 0;
 }
 
+.cfg-scale-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.cfg-scale-field {
+  display: grid;
+  gap: 4px;
+  color: #9a9384;
+  font-size: 11px;
+}
+
+.cfg-scale-field input {
+  width: 100%;
+  min-width: 0;
+}
+
 .library-actions,
 .expression-actions {
   display: flex;

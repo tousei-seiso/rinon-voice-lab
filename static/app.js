@@ -44,6 +44,9 @@ const saveCharactersButton = document.querySelector("#saveCharacters");
 const editCharacterName = document.querySelector("#editCharacterName");
 const editSystemPrompt = document.querySelector("#editSystemPrompt");
 const editTtsCaption = document.querySelector("#editTtsCaption");
+const editCfgScaleText = document.querySelector("#editCfgScaleText");
+const editCfgScaleCaption = document.querySelector("#editCfgScaleCaption");
+const editCfgScaleSpeaker = document.querySelector("#editCfgScaleSpeaker");
 const editReferenceFile = document.querySelector("#editReferenceFile");
 const editReferenceChoose = document.querySelector("#editReferenceChoose");
 const editReferenceDrop = document.querySelector("#editReferenceDrop");
@@ -69,6 +72,18 @@ const speaking = document.querySelector("#speaking");
 const secondSpeaking = document.querySelector("#secondSpeaking");
 const DEFAULT_MAIN_CHARACTER_NAME = "リノン";
 const DEFAULT_SECOND_CHARACTER_NAME = "ルヴィア";
+// CFG Scale の初期値（従来 rinon が Irodori へ渡していた固定値）。
+const DEFAULT_CFG_SCALE_TEXT = 3.0;
+const DEFAULT_CFG_SCALE_CAPTION = 4.0;
+const DEFAULT_CFG_SCALE_SPEAKER = 5.0;
+
+// CFG Scale を数値へ正規化し 0〜20 にクランプ。数値化不可/NaN は default。
+function cfgScaleOrDefault(value, fallback) {
+  if (value === "" || value === null || value === undefined) return fallback;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(0, Math.min(20, num));
+}
 let mainCharacterName = DEFAULT_MAIN_CHARACTER_NAME;
 let secondCharacterName = DEFAULT_SECOND_CHARACTER_NAME;
 let mainReferencePath = "";
@@ -287,6 +302,9 @@ function activeStage(speaker = "") {
     systemPrompt: character?.systemPrompt || (isSecond ? secondSystemPrompt.value : systemPrompt.value),
     ttsCaption: character?.ttsCaption || (isSecond ? secondTtsCaption.value : ttsCaption.value),
     referencePath: character?.referencePath || (isSecond ? secondReferencePath : mainReferencePath),
+    cfgScaleText: cfgScaleOrDefault(character?.cfgScaleText, DEFAULT_CFG_SCALE_TEXT),
+    cfgScaleCaption: cfgScaleOrDefault(character?.cfgScaleCaption, DEFAULT_CFG_SCALE_CAPTION),
+    cfgScaleSpeaker: cfgScaleOrDefault(character?.cfgScaleSpeaker, DEFAULT_CFG_SCALE_SPEAKER),
   };
 }
 
@@ -708,6 +726,9 @@ function renderCharacterEditor() {
   editCharacterName.value = character.name || "";
   editSystemPrompt.value = character.systemPrompt || "";
   editTtsCaption.value = character.ttsCaption || "";
+  editCfgScaleText.value = cfgScaleOrDefault(character.cfgScaleText, DEFAULT_CFG_SCALE_TEXT);
+  editCfgScaleCaption.value = cfgScaleOrDefault(character.cfgScaleCaption, DEFAULT_CFG_SCALE_CAPTION);
+  editCfgScaleSpeaker.value = cfgScaleOrDefault(character.cfgScaleSpeaker, DEFAULT_CFG_SCALE_SPEAKER);
   editReferenceStatus.textContent = shortPathLabel(character.referencePath);
   renderExpressionEditor();
 }
@@ -799,6 +820,9 @@ function makeNewCharacter() {
     name: "New Character",
     systemPrompt: "",
     ttsCaption: ttsCaption.value || "",
+    cfgScaleText: DEFAULT_CFG_SCALE_TEXT,
+    cfgScaleCaption: DEFAULT_CFG_SCALE_CAPTION,
+    cfgScaleSpeaker: DEFAULT_CFG_SCALE_SPEAKER,
     referencePath: mainReferencePath || "",
     portrait: "/expressions/neutral.png",
     expressions: {
@@ -816,6 +840,9 @@ function updateEditingCharacter() {
   character.name = editCharacterName.value.trim() || character.id;
   character.systemPrompt = editSystemPrompt.value;
   character.ttsCaption = editTtsCaption.value;
+  character.cfgScaleText = cfgScaleOrDefault(editCfgScaleText.value, DEFAULT_CFG_SCALE_TEXT);
+  character.cfgScaleCaption = cfgScaleOrDefault(editCfgScaleCaption.value, DEFAULT_CFG_SCALE_CAPTION);
+  character.cfgScaleSpeaker = cfgScaleOrDefault(editCfgScaleSpeaker.value, DEFAULT_CFG_SCALE_SPEAKER);
   refreshCharacterSelectors();
   syncActiveCharacterState();
 }
@@ -1376,6 +1403,9 @@ async function sendChatTurn({
         systemPrompt: stage.systemPrompt,
         userAddress: userAddress.value,
         ttsCaption: stage.ttsCaption,
+        cfgScaleText: stage.cfgScaleText,
+        cfgScaleCaption: stage.cfgScaleCaption,
+        cfgScaleSpeaker: stage.cfgScaleSpeaker,
         secondSystemPrompt: secondSystemPrompt.value,
         secondTtsCaption: secondTtsCaption.value,
         referencePath: stage.slot === "main" ? stage.referencePath : mainReferencePath,
@@ -1623,7 +1653,14 @@ saveCharactersButton.addEventListener("click", async () => {
     sessionStatus.textContent = `character save error: ${error.message}`;
   }
 });
-for (const input of [editCharacterName, editSystemPrompt, editTtsCaption]) {
+for (const input of [
+  editCharacterName,
+  editSystemPrompt,
+  editTtsCaption,
+  editCfgScaleText,
+  editCfgScaleCaption,
+  editCfgScaleSpeaker,
+]) {
   input.addEventListener("input", updateEditingCharacter);
 }
 for (const button of speechRateButtons) {
