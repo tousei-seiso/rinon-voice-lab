@@ -87,7 +87,9 @@ WEB_SEARCH_TIMEOUT = int(os.environ.get("WEB_SEARCH_TIMEOUT", "12"))
 # 意味不明な音声になることがある。TTS へ渡す直前だけ英字をカナへ変換し、保存・表示は原文の
 # まま残す。辞書は所定フォルダのファイルを使い、pip 依存(alkana 等)は増やさない方針。
 #   有効/無効: TTS_KANA_NORMALIZE = on(既定) / off
-#   辞書ファイル: TTS_KANA_DICT_FILE（tts_dictionaries/ 配下の相対名、または絶対パス）
+#   辞書ファイル: TTS_KANA_DICT_FILE
+#                 "alkanadict.csv"(tts_dictionaries/ 配下) / "tts_dictionaries/alkanadict.csv"
+#                 (プロジェクト相対) / 絶対パス のいずれも可。
 #                 ";" 区切りで複数指定可（後に書いたファイルが優先）。
 #   形式: 1行 "english,カタカナ"（カンマ or タブ区切り／# はコメント／英字は大小無視）。
 #         alkana の外部データ CSV と同一形式（alkanadict.csv を置いて指定できる）。
@@ -380,7 +382,13 @@ def _load_tts_kana_dict() -> dict[str, str]:
     for name in names:
         path = Path(name)
         if not path.is_absolute():
-            path = TTS_DICT_ROOT / name
+            # 「alkanadict.csv」(tts_dictionaries 配下) も
+            # 「tts_dictionaries/alkanadict.csv」(プロジェクト相対) も受け付ける。
+            path = next(
+                (base / name for base in (TTS_DICT_ROOT, APP_ROOT, Path.cwd())
+                 if (base / name).exists()),
+                TTS_DICT_ROOT / name,
+            )
         try:
             _load_one_kana_dict_file(path, mapping)
         except Exception as exc:  # 辞書が壊れていても TTS は止めない
