@@ -87,6 +87,9 @@ let autoNextSpeaker = mainCharacterName;
 let playbackSpeaker = mainCharacterName;
 let lastAssistantSpeaker = "";
 let lastAssistantText = "";
+// 現在選択中の返答テキストの音声 URL と、全再生に適用する再生速度。
+let selectedAudioUrl = "";
+let preferredPlaybackRate = 1;
 let autoTopic = "";
 let autoTopicQueue = [];
 let autoWebContext = "";
@@ -310,7 +313,7 @@ function setSpeakingState(active, speaker = "") {
   secondPortraitWrap.classList.toggle("is-speaking", active && stage.slot === "second");
 }
 
-function addMessage(role, text, meta = "") {
+function addMessage(role, text, meta = "", options = {}) {
   const node = document.createElement("div");
   node.className = `msg ${role}`;
   node.textContent = text;
@@ -320,8 +323,65 @@ function addMessage(role, text, meta = "") {
     metaNode.textContent = meta;
     node.appendChild(metaNode);
   }
+  const audioUrl = options.audioUrl || "";
+  if (role === "assistant" && audioUrl) {
+    node.classList.add("has-audio");
+    node.dataset.audioUrl = audioUrl;
+    node.addEventListener("click", () => selectReplyMessage(node));
+  }
   messagesEl.appendChild(node);
   messagesEl.scrollTop = messagesEl.scrollHeight;
+  return node;
+}
+
+// 現在選択中の返答テキスト枠をハイライトする（他の枠の選択は解除）。
+function highlightSelectedMessage(node) {
+  messagesEl
+    .querySelectorAll(".msg.assistant.selected")
+    .forEach((el) => el.classList.remove("selected"));
+  if (node) node.classList.add("selected");
+}
+
+// 全再生に適用する再生速度を #player に反映する。新しい音源を読み込んでも維持されるよう
+// defaultPlaybackRate と playbackRate の両方を設定する。
+function applyPreferredPlaybackRate() {
+  try {
+    player.defaultPlaybackRate = preferredPlaybackRate;
+    player.playbackRate = preferredPlaybackRate;
+  } catch (_) {
+    /* 一部ブラウザで読み込み前に設定すると例外になることがあるため握りつぶす。 */
+  }
+}
+
+// 指定した音声を #player に読み込む。▶再生・ダウンロード・保存はすべて #player を対象に
+// するため、「選択中の返答」を切り替える＝player.src を差し替えること。
+function loadAudioIntoPlayer(url, { autoplay = false } = {}) {
+  if (!url) return;
+  selectedAudioUrl = url;
+  player.src = url;
+  applyPreferredPlaybackRate();
+  audioSaveStatus.textContent = "save ready";
+  if (autoplay) {
+    player.play().catch(() => {});
+  }
+}
+
+// 返答枠クリック時の選択。読み込みのみ行い、再生はユーザー操作の▶に任せる。
+function selectReplyMessage(node) {
+  const url = node && node.dataset ? node.dataset.audioUrl : "";
+  if (!url) return;
+  highlightSelectedMessage(node);
+  loadAudioIntoPlayer(url, { autoplay: false });
+}
+
+// 音声 URL から対応する返答枠を探す（自動再生時のハイライト同期用）。
+function findMessageByAudioUrl(url) {
+  if (!url) return null;
+  const nodes = messagesEl.querySelectorAll(".msg.assistant.has-audio");
+  for (const el of nodes) {
+    if (el.dataset.audioUrl === url) return el;
+  }
+  return null;
 }
 
 // meta 行の「style」部分を組み立てる。
@@ -946,6 +1006,7 @@ function clearContext() {
   player.pause();
   player.removeAttribute("src");
   player.load();
+  selectedAudioUrl = "";
   audioSaveStatus.textContent = "no audio";
   speaking.textContent = "ready";
   secondSpeaking.textContent = "standby";
@@ -1066,8 +1127,14 @@ function playNext() {
   }
   playbackSpeaker = next.speaker || playbackSpeaker;
   updateAudioPan(playbackSpeaker);
+  let deferredNode = null;
   if (next.deferredMessage) {
-    addMessage("assistant", next.deferredMessage.reply, next.deferredMessage.meta);
+    deferredNode = addMessage(
+      "assistant",
+      next.deferredMessage.reply,
+      next.deferredMessage.meta,
+      { audioUrl: next.deferredMessage.audioUrl || next.url || "" },
+    );
   }
   if (playbackSpeaker === mainCharacterName) {
     setExpression(next.expression || "neutral");
@@ -1076,8 +1143,11 @@ function playNext() {
   }
   setStageStatus("speaking", playbackSpeaker);
   setSpeakingState(true, playbackSpeaker);
-  player.src = next.url;
-  audioSaveStatus.textContent = "save ready";
+  // 再生する返答を「現在選択中」にしてハイライトを同期する。
+  // 分割音声（結合なし）で後続チャンク再生中は一致枠が無いので、現在の選択を維持する。
+  loadAudioIntoPlayer(next.url, { autoplay: false });
+  const playedNode = deferredNode || findMessageByAudioUrl(next.url);
+  if (playedNode) highlightSelectedMessage(playedNode);
   player.play().catch(() => {
     setStageStatus("tap play", playbackSpeaker);
     setSpeakingState(false);
@@ -1088,6 +1158,11 @@ function playNext() {
 }
 
 player.addEventListener("ended", playNext);
+// 「…」＞再生速度で速度を変えたら記憶し、以後のすべての再生に適用する。
+player.addEventListener("ratechange", () => {
+  if (player.playbackRate) preferredPlaybackRate = player.playbackRate;
+});
+player.addEventListener("loadeddata", applyPreferredPlaybackRate);
 document.addEventListener("pointerdown", unlockAudioPlayback, { passive: true, once: true });
 document.addEventListener("keydown", unlockAudioPlayback, { passive: true, once: true });
 document.addEventListener("touchstart", unlockAudioPlayback, { passive: true, once: true });
@@ -1111,7 +1186,11 @@ function handleExternalSpeakEvent(event) {
   const style = event.emojiStyle ? ` / style ${event.emojiStyle}` : "";
   const sourceSpeaker = event.speaker ? ` from ${event.speaker}` : "";
   const meta = `external speak${sourceSpeaker}${style} / pose ${event.expression || "neutral"} / tts ${timing}`;
-  addMessage("assistant", event.text || audios.map((item) => item.text).join(""), meta);
+  const primaryAudioUrl =
+    (event.combined && event.combined.url) || (audios[0] && audios[0].url) || "";
+  addMessage("assistant", event.text || audios.map((item) => item.text).join(""), meta, {
+    audioUrl: primaryAudioUrl,
+  });
   // 結合済み音声があれば、再生ボタン（▶）や保存ボタンがその1ファイルを対象にできるよう
   // 分割音声の代わりに結合ファイル1つだけをキューへ流す。
   const combined = event.combined && event.combined.url ? event.combined : null;
@@ -1317,8 +1396,12 @@ async function sendChatTurn({
     const paceMeta = data.speechRate === "fast" ? " / pace fast" : "";
     const assistantMeta = `${data.speaker || mainCharacterName} / ${data.model} / ${data.replyLength}${style}${webMeta}${paceMeta} / pose ${data.expression} / tts ${timing}`;
     const annotatedReply = buildAnnotatedReply(data);
+    const primaryAudioUrl =
+      (data.combined && data.combined.url) ||
+      (Array.isArray(data.audios) && data.audios[0] && data.audios[0].url) ||
+      "";
     if (!backgroundAuto) {
-      addMessage("assistant", annotatedReply, assistantMeta);
+      addMessage("assistant", annotatedReply, assistantMeta, { audioUrl: primaryAudioUrl });
     }
     history.push({ role: "assistant", content: `${data.speaker || speaker}: ${data.reply}` });
     lastAssistantSpeaker = data.speaker || speaker;
@@ -1340,7 +1423,7 @@ async function sendChatTurn({
         playItems = [...playItems];
         playItems[0] = {
           ...playItems[0],
-          deferredMessage: { reply: annotatedReply, meta: assistantMeta },
+          deferredMessage: { reply: annotatedReply, meta: assistantMeta, audioUrl: primaryAudioUrl },
         };
       }
       playQueue(playItems, data.speaker || speaker, { append: backgroundAuto });
