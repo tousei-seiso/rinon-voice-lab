@@ -1819,6 +1819,11 @@ def synthesize_sentence(
     styled_text = apply_emoji_style(text, emoji_style)
     voice_caption = str(caption or "").strip() or IRODORI_CAPTION
     reference_wav = ref_wav or IRODORI_REF_WAV
+    cfg_text = sanitize_cfg_scale(cfg_scale_text, IRODORI_CFG_SCALE_TEXT)
+    cfg_caption = sanitize_cfg_scale(cfg_scale_caption, IRODORI_CFG_SCALE_CAPTION)
+    cfg_speaker = sanitize_cfg_scale(cfg_scale_speaker, IRODORI_CFG_SCALE_SPEAKER)
+    # Irodori へ実際に渡す CFG Scale をコンソールへ出力（キャラ別設定の反映確認用）。
+    print(f"[cfg] text={cfg_text} caption={cfg_caption} speaker={cfg_speaker}")
     old_cwd = Path.cwd()
     os.chdir(IRODORI_ROOT)
     try:
@@ -1842,9 +1847,9 @@ def synthesize_sentence(
                 "linear",
                 -1.0,
                 "independent",
-                sanitize_cfg_scale(cfg_scale_text, IRODORI_CFG_SCALE_TEXT),
-                sanitize_cfg_scale(cfg_scale_caption, IRODORI_CFG_SCALE_CAPTION),
-                sanitize_cfg_scale(cfg_scale_speaker, IRODORI_CFG_SCALE_SPEAKER),
+                cfg_text,
+                cfg_caption,
+                cfg_speaker,
                 "",
                 0.0,
                 1.0,
