@@ -536,6 +536,17 @@ select {
   background: #20262a;
 }
 
+/* 音声付きの返答枠はクリックで「現在選択中の返答テキスト」にできる。 */
+.msg.assistant.has-audio {
+  cursor: pointer;
+}
+
+/* 現在選択中の返答テキスト（▶再生・ダウンロード・保存の対象）をハイライトする。 */
+.msg.assistant.selected {
+  background: #2a3230;
+  box-shadow: inset 0 0 0 2px #d8a657;
+}
+
 .meta {
   margin-top: 8px;
   color: #9ca7ad;
