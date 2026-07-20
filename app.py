@@ -108,6 +108,13 @@ TTS_EMOJI_ROOT = APP_ROOT / "tts_emoji"
 TTS_EMOJI_BEHAVIOR_FILE = os.environ.get("TTS_EMOJI_BEHAVIOR_FILE", "emoji_behavior.json")
 _emoji_behavior_cache: dict | None = None
 
+# 感情セグメントを 1 発話でまとめて生成する際の、1 チャンクあたり最大文字数。
+# 「はい。」のような極端に短い単独チャンクは TTS が末尾で暴走（言い直し・意味不明音）
+# しやすいため、セグメント内の文をこの文字数以内で連結して 1 発話にする。超過する長い
+# セグメントだけ複数チャンクへ分割する。Irodori の max_text_len(=256 token) 超過による
+# テキスト切り捨てを避ける安全上限も兼ねるので、これより大幅に大きくしないこと。
+TTS_SEGMENT_MAX_CHARS = int(os.environ.get("TTS_SEGMENT_MAX_CHARS", "120"))
+
 IRODORI_CHECKPOINT = os.environ.get(
     "IRODORI_CHECKPOINT", "Aratako/Irodori-TTS-600M-v3-VoiceDesign"
 )
@@ -235,6 +242,39 @@ def split_sentences(text: str, limit: int = 8) -> list[str]:
     if len(chunks) <= limit:
         return chunks
     return chunks[: limit - 1] + ["".join(chunks[limit - 1 :])]
+
+
+def group_sentences(text: str, max_chars: int, limit: int = 20) -> list[str]:
+    """文を「1 グループ ≦ max_chars 文字」になるよう貪欲に連結する。
+
+    感情セグメントを 1 発話でまとめて生成するための分割。短いセグメントは 1 グループ
+    （＝1 発話）にまとまり、TTS が短文で起こす末尾の暴走（言い直し・意味不明音）を避ける。
+    1 文だけで max_chars を超える場合はその文を単独グループにする。グループ数が limit を
+    超えたら末尾をまとめて limit 個に収める。空文字なら空リストを返す。
+    """
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+    parts = re.split(r"(?<=[。！？!?])\s*", text)
+    sentences = [part.strip() for part in parts if part.strip()]
+    if not sentences:
+        return []
+    cap = max(1, int(max_chars))
+    groups: list[str] = []
+    current = ""
+    for sentence in sentences:
+        if not current:
+            current = sentence
+        elif len(current) + len(sentence) <= cap:
+            current += sentence
+        else:
+            groups.append(current)
+            current = sentence
+    if current:
+        groups.append(current)
+    if len(groups) > limit:
+        groups = groups[: limit - 1] + ["".join(groups[limit - 1 :])]
+    return groups
 
 
 def load_emoji_items() -> list[dict[str, str]]:
@@ -2797,7 +2837,8 @@ def handle_external_speak(payload: dict) -> dict:
         payload.get("referencePath"),
         LUVIA_REF_WAV if use_second_speaker else IRODORI_REF_WAV,
     )
-    chunks = split_sentences(text, limit=chunk_limit)
+    # 発話は原則 1 発話でまとめて生成（短文暴走の回避）。長すぎる場合のみ複数へ分割。
+    chunks = group_sentences(text, max_chars=TTS_SEGMENT_MAX_CHARS, limit=chunk_limit)
     # seed はこの発話全体で共通（音色の当たりをチャンク間で揃える）。
     speak_seed = new_tts_seed()
     # 発声効果の絵文字は種類で出し分け：単発音は先頭 1 文のみ、持続系は全チャンクに付与。
@@ -3287,7 +3328,11 @@ class Handler(BaseHTTPRequestHandler):
             chunks: list[str] = []
             seg_meta: list[dict[str, str]] = []
             for seg_style, seg_emoji, seg_text in seg_units:
-                seg_chunks = split_sentences(seg_text, limit=seg_chunk_limit)
+                # セグメント（感情の単位）は原則 1 発話でまとめて生成する。短い単独チャンクを
+                # 作らないことで TTS の末尾暴走を防ぐ。長すぎるセグメントのみ複数チャンクへ分割。
+                seg_chunks = group_sentences(
+                    seg_text, max_chars=TTS_SEGMENT_MAX_CHARS, limit=seg_chunk_limit
+                )
                 if not seg_chunks:
                     continue
                 # 各セグメントの caption は「基底 TTS Caption + 感情style」を必ず連結する。
@@ -3295,9 +3340,9 @@ class Handler(BaseHTTPRequestHandler):
                 seg_meta.append({"style": seg_style, "emoji": seg_emoji, "text": seg_text})
                 for chunk_pos, chunk in enumerate(seg_chunks):
                     # 発声効果の絵文字は種類で出し分ける。単発音（吐息・喘ぎ・泣き声など）は
-                    # 先頭 1 文のみに付与し、文ごとの繰り返し挿入（＝文間の意味不明な発声）を防ぐ。
-                    # 持続系（話し方・声色・音響効果）は全チャンクに付与し、セグメント途中で
-                    # 表現がぶれないようにする。感情そのものは caption が全チャンクで担う。
+                    # 先頭チャンクのみに付与し、繰り返し挿入（＝意味不明な発声）を防ぐ。持続系
+                    # （話し方・声色・音響効果）は全チャンクに付与し表現のぶれを防ぐ。通常はセグメント
+                    # ＝1 チャンクなのでどちらも先頭に 1 回。分割された長いセグメントで差が出る。
                     chunk_emoji = seg_emoji if (chunk_pos == 0 or emoji_is_sustained(seg_emoji)) else ""
                     audios.append(
                         synthesize(
