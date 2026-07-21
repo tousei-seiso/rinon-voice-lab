@@ -529,7 +529,9 @@ def _load_one_kana_dict_file(path: Path, mapping: dict[str, str]) -> None:
         print(f"[tts-kana] dict not found ({path}); skipped", flush=True)
         return
     count = 0
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig で読むと、Excel 等が付ける BOM を自動除去する（BOM なしファイルも同じ結果）。
+    # これにより「BOM付き UTF-8」で保存された辞書でも 1 行目が壊れず読み込める。
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
