@@ -45,6 +45,7 @@ const editCharacterName = document.querySelector("#editCharacterName");
 const editSystemPrompt = document.querySelector("#editSystemPrompt");
 const editTtsCaption = document.querySelector("#editTtsCaption");
 const editStyleGuide = document.querySelector("#editStyleGuide");
+const editSteps = document.querySelector("#editSteps");
 const editCfgScaleText = document.querySelector("#editCfgScaleText");
 const editCfgScaleCaption = document.querySelector("#editCfgScaleCaption");
 const editCfgScaleSpeaker = document.querySelector("#editCfgScaleSpeaker");
@@ -84,6 +85,17 @@ function cfgScaleOrDefault(value, fallback) {
   const num = Number(value);
   if (!Number.isFinite(num)) return fallback;
   return Math.max(0, Math.min(20, num));
+}
+
+// Num Steps のキャラ別既定（低ステップだと音色がリファレンスへ寄り切らないため 40）。
+const DEFAULT_CHARACTER_STEPS = 40;
+
+// Num Steps を整数へ正規化し 1〜120 にクランプ。数値化不可は fallback。
+function stepsOrDefault(value, fallback) {
+  if (value === "" || value === null || value === undefined) return fallback;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(1, Math.min(120, Math.round(num)));
 }
 let mainCharacterName = DEFAULT_MAIN_CHARACTER_NAME;
 let secondCharacterName = DEFAULT_SECOND_CHARACTER_NAME;
@@ -303,6 +315,7 @@ function activeStage(speaker = "") {
     systemPrompt: character?.systemPrompt || (isSecond ? secondSystemPrompt.value : systemPrompt.value),
     ttsCaption: character?.ttsCaption || (isSecond ? secondTtsCaption.value : ttsCaption.value),
     styleGuide: character?.styleGuide || "",
+    steps: stepsOrDefault(character?.steps, stepsOrDefault(stepsInput.value, DEFAULT_CHARACTER_STEPS)),
     referencePath: character?.referencePath || (isSecond ? secondReferencePath : mainReferencePath),
     cfgScaleText: cfgScaleOrDefault(character?.cfgScaleText, DEFAULT_CFG_SCALE_TEXT),
     cfgScaleCaption: cfgScaleOrDefault(character?.cfgScaleCaption, DEFAULT_CFG_SCALE_CAPTION),
@@ -729,6 +742,7 @@ function renderCharacterEditor() {
   editSystemPrompt.value = character.systemPrompt || "";
   editTtsCaption.value = character.ttsCaption || "";
   editStyleGuide.value = character.styleGuide || "";
+  editSteps.value = stepsOrDefault(character.steps, DEFAULT_CHARACTER_STEPS);
   editCfgScaleText.value = cfgScaleOrDefault(character.cfgScaleText, DEFAULT_CFG_SCALE_TEXT);
   editCfgScaleCaption.value = cfgScaleOrDefault(character.cfgScaleCaption, DEFAULT_CFG_SCALE_CAPTION);
   editCfgScaleSpeaker.value = cfgScaleOrDefault(character.cfgScaleSpeaker, DEFAULT_CFG_SCALE_SPEAKER);
@@ -824,6 +838,7 @@ function makeNewCharacter() {
     systemPrompt: "",
     ttsCaption: ttsCaption.value || "",
     styleGuide: "",
+    steps: DEFAULT_CHARACTER_STEPS,
     cfgScaleText: DEFAULT_CFG_SCALE_TEXT,
     cfgScaleCaption: DEFAULT_CFG_SCALE_CAPTION,
     cfgScaleSpeaker: DEFAULT_CFG_SCALE_SPEAKER,
@@ -845,6 +860,7 @@ function updateEditingCharacter() {
   character.systemPrompt = editSystemPrompt.value;
   character.ttsCaption = editTtsCaption.value;
   character.styleGuide = editStyleGuide.value;
+  character.steps = stepsOrDefault(editSteps.value, DEFAULT_CHARACTER_STEPS);
   character.cfgScaleText = cfgScaleOrDefault(editCfgScaleText.value, DEFAULT_CFG_SCALE_TEXT);
   character.cfgScaleCaption = cfgScaleOrDefault(editCfgScaleCaption.value, DEFAULT_CFG_SCALE_CAPTION);
   character.cfgScaleSpeaker = cfgScaleOrDefault(editCfgScaleSpeaker.value, DEFAULT_CFG_SCALE_SPEAKER);
@@ -1400,7 +1416,7 @@ async function sendChatTurn({
         message: text,
         history: historyBeforeSend,
         model: modelSelect.value,
-        steps: Number(stepsInput.value || 12),
+        steps: stage.steps,
         speechRate: speechRate.value,
         replyLength: replyLength.value,
         speaker: stage.speaker,
@@ -1664,6 +1680,7 @@ for (const input of [
   editSystemPrompt,
   editTtsCaption,
   editStyleGuide,
+  editSteps,
   editCfgScaleText,
   editCfgScaleCaption,
   editCfgScaleSpeaker,

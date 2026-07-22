@@ -734,6 +734,7 @@ def default_character_profiles() -> dict:
                 ),
                 "ttsCaption": IRODORI_CAPTION,
                 "styleGuide": "",
+                "steps": DEFAULT_CHARACTER_STEPS,
                 "cfgScaleText": IRODORI_CFG_SCALE_TEXT,
                 "cfgScaleCaption": IRODORI_CFG_SCALE_CAPTION,
                 "cfgScaleSpeaker": IRODORI_CFG_SCALE_SPEAKER,
@@ -757,6 +758,7 @@ def default_character_profiles() -> dict:
                     "clean studio sound."
                 ),
                 "styleGuide": "",
+                "steps": DEFAULT_CHARACTER_STEPS,
                 "cfgScaleText": IRODORI_CFG_SCALE_TEXT,
                 "cfgScaleCaption": IRODORI_CFG_SCALE_CAPTION,
                 "cfgScaleSpeaker": IRODORI_CFG_SCALE_SPEAKER,
@@ -780,6 +782,24 @@ def sanitize_cfg_scale(value: object, default: float) -> float:
     if result != result:  # NaN
         return float(default)
     return max(0.0, min(20.0, result))
+
+
+# キャラ別 Num Steps の既定。UI のグローバル steps 欄より、キャラ設定があればそちらを優先する。
+# 低ステップ（従来の 12）だとリファレンス話者の条件付けが解像しきれず音色が寄り切らないため、
+# キャラ別既定は 40 とする。
+DEFAULT_CHARACTER_STEPS = 40
+
+
+def sanitize_steps(value: object, default: int = DEFAULT_CHARACTER_STEPS) -> int:
+    """Num Steps を int に正規化し、1〜120 の範囲へクランプする。
+
+    数値化できない場合は ``default`` を返す。
+    """
+    try:
+        result = int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
+    return max(1, min(120, result))
 
 
 def sanitize_character_id(value: object, fallback: str = "") -> str:
@@ -880,6 +900,7 @@ def character_text_profile(character: dict) -> str:
         f"cfgScaleText: {character.get('cfgScaleText', IRODORI_CFG_SCALE_TEXT)}",
         f"cfgScaleCaption: {character.get('cfgScaleCaption', IRODORI_CFG_SCALE_CAPTION)}",
         f"cfgScaleSpeaker: {character.get('cfgScaleSpeaker', IRODORI_CFG_SCALE_SPEAKER)}",
+        f"steps: {character.get('steps', DEFAULT_CHARACTER_STEPS)}",
         "",
         "[systemPrompt]",
         str(character.get("systemPrompt") or ""),
@@ -937,6 +958,7 @@ def parse_character_text_profile(path: Path) -> dict:
         "cfgScaleText": sanitize_cfg_scale(values.get("cfgScaleText"), IRODORI_CFG_SCALE_TEXT),
         "cfgScaleCaption": sanitize_cfg_scale(values.get("cfgScaleCaption"), IRODORI_CFG_SCALE_CAPTION),
         "cfgScaleSpeaker": sanitize_cfg_scale(values.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER),
+        "steps": sanitize_steps(values.get("steps"), DEFAULT_CHARACTER_STEPS),
         "systemPrompt": "\n".join(sections.get("systemPrompt", [])).strip(),
         "ttsCaption": "\n".join(sections.get("ttsCaption", [])).strip(),
         "styleGuide": "\n".join(sections.get("styleGuide", [])).strip(),
@@ -1036,6 +1058,7 @@ def sanitize_character_profiles(payload: dict, materialize: bool = True) -> dict
                 "cfgScaleText": sanitize_cfg_scale(item.get("cfgScaleText"), IRODORI_CFG_SCALE_TEXT),
                 "cfgScaleCaption": sanitize_cfg_scale(item.get("cfgScaleCaption"), IRODORI_CFG_SCALE_CAPTION),
                 "cfgScaleSpeaker": sanitize_cfg_scale(item.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER),
+                "steps": sanitize_steps(item.get("steps"), DEFAULT_CHARACTER_STEPS),
                 "referencePath": str(item.get("referencePath") or IRODORI_REF_WAV).strip(),
                 "portrait": portrait,
                 "expressions": clean_expressions,
@@ -3196,7 +3219,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             history = body.get("history") if isinstance(body.get("history"), list) else []
             model = str(body.get("model") or "").strip() or None
-            steps = int(body.get("steps") or 12)
+            # steps は body（フロントがキャラ別値を解決して送る）を優先。未指定はキャラ別既定へ。
+            steps = sanitize_steps(body.get("steps"), DEFAULT_CHARACTER_STEPS)
             speech_rate = str(body.get("speechRate") or "normal").strip().lower()
             duration_scale = tts_duration_scale_for_rate(speech_rate)
             emoji_style = str(body.get("emojiStyle") or "").strip()
