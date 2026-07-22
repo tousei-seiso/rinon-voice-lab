@@ -733,6 +733,7 @@ def default_character_profiles() -> dict:
                     "声は明るくやわらかく、少し小悪魔っぽい余裕と、ふとした照れを混ぜる。"
                 ),
                 "ttsCaption": IRODORI_CAPTION,
+                "styleGuide": "",
                 "cfgScaleText": IRODORI_CFG_SCALE_TEXT,
                 "cfgScaleCaption": IRODORI_CFG_SCALE_CAPTION,
                 "cfgScaleSpeaker": IRODORI_CFG_SCALE_SPEAKER,
@@ -755,6 +756,7 @@ def default_character_profiles() -> dict:
                     "confident lively tone, polished adult speaking style, restrained teasing confidence, "
                     "clean studio sound."
                 ),
+                "styleGuide": "",
                 "cfgScaleText": IRODORI_CFG_SCALE_TEXT,
                 "cfgScaleCaption": IRODORI_CFG_SCALE_CAPTION,
                 "cfgScaleSpeaker": IRODORI_CFG_SCALE_SPEAKER,
@@ -885,6 +887,9 @@ def character_text_profile(character: dict) -> str:
         "[ttsCaption]",
         str(character.get("ttsCaption") or ""),
         "",
+        "[styleGuide]",
+        str(character.get("styleGuide") or ""),
+        "",
         "[expressions]",
     ]
     for key in sorted(expressions):
@@ -897,7 +902,7 @@ def character_text_profile(character: dict) -> str:
 
 def parse_character_text_profile(path: Path) -> dict:
     values: dict[str, str] = {}
-    sections: dict[str, list[str]] = {"systemPrompt": [], "ttsCaption": [], "expressions": []}
+    sections: dict[str, list[str]] = {"systemPrompt": [], "ttsCaption": [], "styleGuide": [], "expressions": []}
     section = ""
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.rstrip()
@@ -908,7 +913,7 @@ def parse_character_text_profile(path: Path) -> dict:
             section = stripped[1:-1]
             sections.setdefault(section, [])
             continue
-        if section in {"systemPrompt", "ttsCaption"}:
+        if section in {"systemPrompt", "ttsCaption", "styleGuide"}:
             sections[section].append(line)
             continue
         if section == "expressions":
@@ -934,6 +939,7 @@ def parse_character_text_profile(path: Path) -> dict:
         "cfgScaleSpeaker": sanitize_cfg_scale(values.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER),
         "systemPrompt": "\n".join(sections.get("systemPrompt", [])).strip(),
         "ttsCaption": "\n".join(sections.get("ttsCaption", [])).strip(),
+        "styleGuide": "\n".join(sections.get("styleGuide", [])).strip(),
         "expressions": expressions,
     }
 
@@ -1026,6 +1032,7 @@ def sanitize_character_profiles(payload: dict, materialize: bool = True) -> dict
                 "name": str(item.get("name") or char_id).strip()[:80],
                 "systemPrompt": str(item.get("systemPrompt") or "").strip(),
                 "ttsCaption": str(item.get("ttsCaption") or IRODORI_CAPTION).strip(),
+                "styleGuide": str(item.get("styleGuide") or "").strip(),
                 "cfgScaleText": sanitize_cfg_scale(item.get("cfgScaleText"), IRODORI_CFG_SCALE_TEXT),
                 "cfgScaleCaption": sanitize_cfg_scale(item.get("cfgScaleCaption"), IRODORI_CFG_SCALE_CAPTION),
                 "cfgScaleSpeaker": sanitize_cfg_scale(item.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER),
@@ -2141,6 +2148,7 @@ def request_lmstudio(
     no_dialogue: bool = False,
     speaker: str = "リノン",
     two_only_mode: bool = False,
+    style_guide: str = "",
 ) -> tuple[str, str, str, int, list[dict[str, str]]]:
     length_instruction, max_tokens, chunk_limit = reply_style_for_length(reply_length)
     address = str(user_address or "").strip() or "あなた"
@@ -2167,14 +2175,30 @@ def request_lmstudio(
     # 感情の変化ごとにセグメント分割させる新モード。台詞禁止モード時は挙動維持のため
     # 従来の「返答全体で絵文字1つ」を使う。
     segmented_mode = auto_emoji and not no_dialogue
+    # style は最終的に TTS caption へ連結され、リファレンス話者の音色と競合しうる。
+    # 既定では声色/音程/年齢/声質を指す語を style に書かせない（音色ドリフト対策）。
+    # キャラ別の styleGuide があれば、その指針を追加で強制する。
+    style_rule = (
+        "・styleは声の「感情・話し方」だけを短い日本語で書いてください"
+        "（例:「楽しげにはしゃいで」「静かに真剣な調子で」「怒って責めるように」）。\n"
+        "・styleに声色・音程・声質・年齢を指す語（低い声・高い声・かすれ声・幼い声・大人っぽい声・"
+        "ハスキー・ささやき声など）は書かないでください。音色はリファレンス音声に任せます。\n"
+    )
+    style_guide_rule = ""
+    if str(style_guide or "").strip():
+        style_guide_rule = (
+            "・このキャラクター固有の感情表現の指針に必ず従ってください:\n"
+            f"{str(style_guide).strip()}\n"
+        )
     emoji_instruction = ""
     if segmented_mode:
         emoji_instruction = (
             "\n返答は感情や口調が変わるところで区切り、各セグメントに感情情報を付けてください。"
             "必ず次のJSONだけで返してください:\n"
             '{"segments":[{"text":"発話本文","style":"日本語での感情や口調の指示","emoji":"該当する発声効果の絵文字1つ、なければ空文字"}]}\n'
-            "・textはそのまま読み上げる本文です。styleは声の感情・話し方を短い日本語で書いてください"
-            "（例:「楽しげにはしゃいで」「声を落として切なげに」「怒って責めるように」）。\n"
+            "・textはそのまま読み上げる本文です。\n"
+            f"{style_rule}"
+            f"{style_guide_rule}"
             "・感情の変化が無ければsegmentsは1つでも構いません。返答全体を無理に細切れにしないでください。\n"
             "・各セグメントは必ず text / style / emoji の3キーをこの順で含めてください。"
             "該当する発声効果が無くても emoji は必ず \"emoji\":\"\" と空文字で入れてください（キー名を省略しない）。\n"
@@ -3233,6 +3257,7 @@ class Handler(BaseHTTPRequestHandler):
             character_prompt = str(body.get("systemPrompt") or "").strip()
             user_address = str(body.get("userAddress") or "あなた").strip() or "あなた"
             tts_caption = str(body.get("ttsCaption") or IRODORI_CAPTION).strip()
+            style_guide = str(body.get("styleGuide") or "").strip()
             cfg_scale_text = sanitize_cfg_scale(body.get("cfgScaleText"), IRODORI_CFG_SCALE_TEXT)
             cfg_scale_caption = sanitize_cfg_scale(body.get("cfgScaleCaption"), IRODORI_CFG_SCALE_CAPTION)
             cfg_scale_speaker = sanitize_cfg_scale(body.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER)
@@ -3283,6 +3308,7 @@ class Handler(BaseHTTPRequestHandler):
                 no_dialogue=no_dialogue,
                 speaker=speaker,
                 two_only_mode=two_only_mode,
+                style_guide=style_guide,
             )
             effective_emoji = emoji_style or llm_emoji
             reference_wav = second_reference_path if use_second_speaker else reference_path

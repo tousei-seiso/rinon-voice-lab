@@ -44,6 +44,7 @@ const saveCharactersButton = document.querySelector("#saveCharacters");
 const editCharacterName = document.querySelector("#editCharacterName");
 const editSystemPrompt = document.querySelector("#editSystemPrompt");
 const editTtsCaption = document.querySelector("#editTtsCaption");
+const editStyleGuide = document.querySelector("#editStyleGuide");
 const editCfgScaleText = document.querySelector("#editCfgScaleText");
 const editCfgScaleCaption = document.querySelector("#editCfgScaleCaption");
 const editCfgScaleSpeaker = document.querySelector("#editCfgScaleSpeaker");
@@ -301,6 +302,7 @@ function activeStage(speaker = "") {
     slot: isSecond ? "second" : "main",
     systemPrompt: character?.systemPrompt || (isSecond ? secondSystemPrompt.value : systemPrompt.value),
     ttsCaption: character?.ttsCaption || (isSecond ? secondTtsCaption.value : ttsCaption.value),
+    styleGuide: character?.styleGuide || "",
     referencePath: character?.referencePath || (isSecond ? secondReferencePath : mainReferencePath),
     cfgScaleText: cfgScaleOrDefault(character?.cfgScaleText, DEFAULT_CFG_SCALE_TEXT),
     cfgScaleCaption: cfgScaleOrDefault(character?.cfgScaleCaption, DEFAULT_CFG_SCALE_CAPTION),
@@ -726,6 +728,7 @@ function renderCharacterEditor() {
   editCharacterName.value = character.name || "";
   editSystemPrompt.value = character.systemPrompt || "";
   editTtsCaption.value = character.ttsCaption || "";
+  editStyleGuide.value = character.styleGuide || "";
   editCfgScaleText.value = cfgScaleOrDefault(character.cfgScaleText, DEFAULT_CFG_SCALE_TEXT);
   editCfgScaleCaption.value = cfgScaleOrDefault(character.cfgScaleCaption, DEFAULT_CFG_SCALE_CAPTION);
   editCfgScaleSpeaker.value = cfgScaleOrDefault(character.cfgScaleSpeaker, DEFAULT_CFG_SCALE_SPEAKER);
@@ -820,6 +823,7 @@ function makeNewCharacter() {
     name: "New Character",
     systemPrompt: "",
     ttsCaption: ttsCaption.value || "",
+    styleGuide: "",
     cfgScaleText: DEFAULT_CFG_SCALE_TEXT,
     cfgScaleCaption: DEFAULT_CFG_SCALE_CAPTION,
     cfgScaleSpeaker: DEFAULT_CFG_SCALE_SPEAKER,
@@ -840,6 +844,7 @@ function updateEditingCharacter() {
   character.name = editCharacterName.value.trim() || character.id;
   character.systemPrompt = editSystemPrompt.value;
   character.ttsCaption = editTtsCaption.value;
+  character.styleGuide = editStyleGuide.value;
   character.cfgScaleText = cfgScaleOrDefault(editCfgScaleText.value, DEFAULT_CFG_SCALE_TEXT);
   character.cfgScaleCaption = cfgScaleOrDefault(editCfgScaleCaption.value, DEFAULT_CFG_SCALE_CAPTION);
   character.cfgScaleSpeaker = cfgScaleOrDefault(editCfgScaleSpeaker.value, DEFAULT_CFG_SCALE_SPEAKER);
@@ -1403,6 +1408,7 @@ async function sendChatTurn({
         systemPrompt: stage.systemPrompt,
         userAddress: userAddress.value,
         ttsCaption: stage.ttsCaption,
+        styleGuide: stage.styleGuide,
         cfgScaleText: stage.cfgScaleText,
         cfgScaleCaption: stage.cfgScaleCaption,
         cfgScaleSpeaker: stage.cfgScaleSpeaker,
@@ -1657,6 +1663,7 @@ for (const input of [
   editCharacterName,
   editSystemPrompt,
   editTtsCaption,
+  editStyleGuide,
   editCfgScaleText,
   editCfgScaleCaption,
   editCfgScaleSpeaker,
