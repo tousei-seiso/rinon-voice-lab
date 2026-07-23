@@ -2161,6 +2161,75 @@ def _post_lmstudio_chat(payload: dict, use_structured: bool) -> dict:
         raise
 
 
+def _thinking_prefill(segmented_mode: bool, auto_emoji: bool) -> tuple[str, str]:
+    """思考(reasoning)を抑止するためのアシスタント・プリフィルを返す。
+
+    reasoning モデルは assistant 発話の冒頭で思考を吐き始めるため、その冒頭を
+    こちらが先に埋めておくと思考フェーズをスキップして本文から書き始める。
+    戻り値は (prefill_content, reattach_prefix)。
+    ・JSON モードでは書き出しを与え、後で本文へ前置きし直して有効な JSON に戻す。
+    ・通常モードは空白1文字だけを与える（応答には echo されないので本文は汚れない）。
+    プリフィルは非思考モデルには無害（続きを書くだけ）で、モデル横断で使える。
+    """
+    if segmented_mode:
+        prefix = '{"segments":[{"text":"'
+        return prefix, prefix
+    if auto_emoji:
+        prefix = '{"text":"'
+        return prefix, prefix
+    return " ", ""
+
+
+def _request_lmstudio_content(
+    payload: dict, segmented_mode: bool, auto_emoji: bool, base_max_tokens: int
+) -> dict:
+    """思考モデル・非思考モデルのどちらでも本文が取れるよう頑健にチャットする。
+
+    経路1: プリフィルで思考を抑止して1回試す（gemma 系の“止められない思考”対策）。
+           非思考/thinking-off モデルには無害。
+    経路2: プリフィルが空を返す/テンプレートが末尾 assistant を拒否した場合は、
+           プリフィル無しで max_tokens を段階的に増やして再送（思考ぶんの枠を確保）。
+    どの経路でも choices[0].message.content に完全な本文が入った data を返す。
+    """
+    prefill_content, reattach = _thinking_prefill(segmented_mode, auto_emoji)
+
+    # --- 経路1: プリフィル（構造化出力は役割が重複し競合しうるので付けない） ---
+    try:
+        prefilled = dict(payload)
+        prefilled["messages"] = list(payload["messages"]) + [
+            {"role": "assistant", "content": prefill_content}
+        ]
+        data = _post_lmstudio_chat(prefilled, use_structured=False)
+        msg = data["choices"][0]["message"]
+        content = str(msg.get("content") or "")
+        if content.strip():
+            if reattach:
+                stripped = content.lstrip()
+                # モデルがプリフィルを継続せず、自前で完全な JSON を出した場合は
+                # 前置きすると壊れるので、そのまま採用する。
+                msg["content"] = stripped if stripped.startswith("{") else reattach + content
+            else:
+                msg["content"] = content.lstrip()
+            return data
+    except urllib.error.HTTPError:
+        # テンプレートが末尾 assistant を受け付けないモデル → 経路2へフォールバック。
+        pass
+
+    # --- 経路2: プリフィル無し + max_tokens を段階的に拡大 ---
+    last_data = None
+    for factor in (1, 3, 6):
+        body = dict(payload)
+        body["max_tokens"] = base_max_tokens * factor
+        last_data = _post_lmstudio_chat(body, _use_structured_output(segmented_mode))
+        msg = last_data["choices"][0]["message"]
+        if str(msg.get("content") or "").strip():
+            return last_data
+        finish = (last_data.get("choices") or [{}])[0].get("finish_reason")
+        if finish != "length":
+            break  # 長さ以外の理由で空 → 枠を増やしても無駄
+    return last_data
+
+
 def request_lmstudio(
     messages: list[dict[str, str]],
     model: str | None,
@@ -2268,12 +2337,12 @@ def request_lmstudio(
         "思考過程は出さず、最終回答だけを出してください。/no_think"
         f"{emoji_instruction}"
     )
-    data = _post_lmstudio_chat(payload, _use_structured_output(segmented_mode))
+    data = _request_lmstudio_content(payload, segmented_mode, auto_emoji, max_tokens)
     choice_message = data["choices"][0]["message"]
     content = str(choice_message.get("content") or "").strip()
     if not content:
-        # Some local reasoning models can spend the whole budget in reasoning_content.
-        # Return a visible explanation instead of silently handing an empty string to TTS.
+        # プリフィルでも枠拡大でも本文が取れなかった稀なケース。空文字を TTS へ渡さず、
+        # 見えるエラーで知らせる。
         raise RuntimeError(
             "LM Studio returned empty assistant content. Try a non-reasoning model, "
             "or add /no_think to the prompt/model preset."
