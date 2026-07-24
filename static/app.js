@@ -18,6 +18,7 @@ const stepsInput = document.querySelector("#steps");
 const speechRate = document.querySelector("#speechRate");
 const speechRateButtons = Array.from(document.querySelectorAll("[data-rate]"));
 const replyLength = document.querySelector("#replyLength");
+const llmGenerationMode = document.querySelector("#llmGenerationMode");
 const systemPrompt = document.querySelector("#systemPrompt");
 const userAddress = document.querySelector("#userAddress");
 const ttsCaption = document.querySelector("#ttsCaption");
@@ -1013,6 +1014,7 @@ function sessionPayload() {
       steps: Number(stepsInput.value || 12),
       speechRate: speechRate.value,
       replyLength: replyLength.value,
+      llmGenerationMode: llmGenerationMode.value,
       sendShortcut: normalizeSendShortcut(sendShortcut.value),
       ttsBackendMode: ttsBackendMode.value,
       secondTtsHost: secondTtsHost.value.trim(),
@@ -1110,6 +1112,7 @@ function applySession(profile) {
   if (settings.steps) stepsInput.value = settings.steps;
   setSpeechRate(settings.speechRate);
   if (settings.replyLength) replyLength.value = settings.replyLength;
+  if (settings.llmGenerationMode) llmGenerationMode.value = settings.llmGenerationMode;
   sendShortcut.value = normalizeSendShortcut(settings.sendShortcut);
   ttsBackendMode.value = settings.ttsBackendMode === "remote" ? "remote" : "local";
   if (Object.prototype.hasOwnProperty.call(settings, "secondTtsHost")) {
@@ -1419,6 +1422,7 @@ async function sendChatTurn({
         steps: stage.steps,
         speechRate: speechRate.value,
         replyLength: replyLength.value,
+        llmGenerationMode: llmGenerationMode.value,
         speaker: stage.speaker,
         speakerSlot: stage.slot,
         systemPrompt: stage.systemPrompt,

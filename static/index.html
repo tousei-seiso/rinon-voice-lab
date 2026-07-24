@@ -80,6 +80,12 @@
           <option value="short">short</option>
           <option value="long">long</option>
         </select>
+        <select id="llmGenerationMode" title="LLM生成モード（思考モデルの空返答対策と品質/速度）">
+          <option value="prefill">高速(思考抑止)</option>
+          <option value="original">通常(上限あり)</option>
+          <option value="quality_guard" selected>品質優先(暴走対策)</option>
+          <option value="unlimited">品質最優先(無制限)</option>
+        </select>
         <label class="auto-style">
           <input id="autoEmoji" type="checkbox" checked />
           <span>auto style</span>

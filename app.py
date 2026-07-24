@@ -51,6 +51,17 @@ LM_STUDIO_TIMEOUT = int(os.environ.get("LM_STUDIO_TIMEOUT", "300"))
 LM_STRUCTURED_OUTPUT = os.environ.get("LM_STRUCTURED_OUTPUT", "auto").strip().lower()
 # 実行中にサーバが response_format を拒否したら True にし、auto では以後付けない（プロセス内メモ）。
 _lm_structured_output_unsupported = False
+# LLM 生成モード（思考モデルでの空返答対策と品質/速度のトレードオフを切り替える）。
+#   prefill       : アシスタント・プリフィルで思考を抑止（高速・低品質）。
+#   original      : 従来仕様。reply_length 由来の max_tokens をそのまま使う（思考モデルでは空になり得る）。
+#   quality_guard : プリフィル無し＋大きな max_tokens 上限（品質重視、暴走はここで打ち切り）。
+#   unlimited     : プリフィル無し＋max_tokens=-1（完全品質重視・上限なし）。
+LM_GENERATION_MODES = ("prefill", "original", "quality_guard", "unlimited")
+DEFAULT_LM_GENERATION_MODE = os.environ.get("LM_GENERATION_MODE", "quality_guard").strip().lower()
+if DEFAULT_LM_GENERATION_MODE not in LM_GENERATION_MODES:
+    DEFAULT_LM_GENERATION_MODE = "quality_guard"
+# quality_guard モードで使う「かなり大きな」出力上限。暴走時のみここで打ち切る安全弁。
+LM_QUALITY_GUARD_MAX_TOKENS = int(os.environ.get("LM_QUALITY_GUARD_MAX_TOKENS", "8192"))
 # セグメント返答用の JSON スキーマ（LM Studio の response_format=json_schema 用）。
 # parse_lmstudio_segments が期待する {"segments":[{text,style,emoji}...]} を強制する。
 LM_SEGMENT_RESPONSE_FORMAT = {
@@ -1287,6 +1298,7 @@ def save_session_profile(payload: dict) -> dict:
             "steps": int(settings.get("steps") or 12),
             "speechRate": str(settings.get("speechRate") or "normal"),
             "replyLength": str(settings.get("replyLength") or "normal"),
+            "llmGenerationMode": str(settings.get("llmGenerationMode") or DEFAULT_LM_GENERATION_MODE),
             "sendShortcut": str(settings.get("sendShortcut") or "enter"),
             "ttsBackendMode": str(settings.get("ttsBackendMode") or "local"),
             "secondTtsHost": str(settings.get("secondTtsHost") or ""),
@@ -2181,53 +2193,53 @@ def _thinking_prefill(segmented_mode: bool, auto_emoji: bool) -> tuple[str, str]
 
 
 def _request_lmstudio_content(
-    payload: dict, segmented_mode: bool, auto_emoji: bool, base_max_tokens: int
+    payload: dict, segmented_mode: bool, auto_emoji: bool, base_max_tokens: int, mode: str
 ) -> dict:
-    """思考モデル・非思考モデルのどちらでも本文が取れるよう頑健にチャットする。
+    """生成モードに応じて LM Studio へチャットし、本文入りの data を返す。
 
-    経路1: プリフィルで思考を抑止して1回試す（gemma 系の“止められない思考”対策）。
-           非思考/thinking-off モデルには無害。
-    経路2: プリフィルが空を返す/テンプレートが末尾 assistant を拒否した場合は、
-           プリフィル無しで max_tokens を段階的に増やして再送（思考ぶんの枠を確保）。
-    どの経路でも choices[0].message.content に完全な本文が入った data を返す。
+    mode（LM_GENERATION_MODES のいずれか）:
+      prefill       : プリフィルで思考を抑止（高速・低品質）。空/テンプレート拒否時は
+                      従来仕様（プリフィル無し・base_max_tokens）へフォールバック。
+      original      : 従来仕様。base_max_tokens をそのまま使う（思考モデルでは空になり得る）。
+      quality_guard : プリフィル無し＋大きな上限 LM_QUALITY_GUARD_MAX_TOKENS（暴走はここで打ち切り）。
+      unlimited     : プリフィル無し＋max_tokens=-1（上限なし。思考を必ず完走させる）。
+    どのモードでも choices[0].message.content に本文が入った data を返す。
     """
-    prefill_content, reattach = _thinking_prefill(segmented_mode, auto_emoji)
-
-    # --- 経路1: プリフィル（構造化出力は役割が重複し競合しうるので付けない） ---
-    try:
-        prefilled = dict(payload)
-        prefilled["messages"] = list(payload["messages"]) + [
-            {"role": "assistant", "content": prefill_content}
-        ]
-        data = _post_lmstudio_chat(prefilled, use_structured=False)
-        msg = data["choices"][0]["message"]
-        content = str(msg.get("content") or "")
-        if content.strip():
-            if reattach:
-                stripped = content.lstrip()
-                # モデルがプリフィルを継続せず、自前で完全な JSON を出した場合は
-                # 前置きすると壊れるので、そのまま採用する。
-                msg["content"] = stripped if stripped.startswith("{") else reattach + content
-            else:
-                msg["content"] = content.lstrip()
-            return data
-    except urllib.error.HTTPError:
-        # テンプレートが末尾 assistant を受け付けないモデル → 経路2へフォールバック。
-        pass
-
-    # --- 経路2: プリフィル無し + max_tokens を段階的に拡大 ---
-    last_data = None
-    for factor in (1, 3, 6):
+    if mode == "prefill":
+        prefill_content, reattach = _thinking_prefill(segmented_mode, auto_emoji)
+        # プリフィル（構造化出力は役割が重複し競合しうるので付けない）。
+        try:
+            prefilled = dict(payload)
+            prefilled["messages"] = list(payload["messages"]) + [
+                {"role": "assistant", "content": prefill_content}
+            ]
+            data = _post_lmstudio_chat(prefilled, use_structured=False)
+            msg = data["choices"][0]["message"]
+            content = str(msg.get("content") or "")
+            if content.strip():
+                if reattach:
+                    stripped = content.lstrip()
+                    # モデルがプリフィルを継続せず、自前で完全な JSON を出した場合は
+                    # 前置きすると壊れるので、そのまま採用する。
+                    msg["content"] = stripped if stripped.startswith("{") else reattach + content
+                else:
+                    msg["content"] = content.lstrip()
+                return data
+        except urllib.error.HTTPError:
+            # テンプレートが末尾 assistant を受け付けないモデル → 従来仕様へフォールバック。
+            pass
         body = dict(payload)
-        body["max_tokens"] = base_max_tokens * factor
-        last_data = _post_lmstudio_chat(body, _use_structured_output(segmented_mode))
-        msg = last_data["choices"][0]["message"]
-        if str(msg.get("content") or "").strip():
-            return last_data
-        finish = (last_data.get("choices") or [{}])[0].get("finish_reason")
-        if finish != "length":
-            break  # 長さ以外の理由で空 → 枠を増やしても無駄
-    return last_data
+        body["max_tokens"] = base_max_tokens
+        return _post_lmstudio_chat(body, _use_structured_output(segmented_mode))
+
+    body = dict(payload)
+    if mode == "unlimited":
+        body["max_tokens"] = -1
+    elif mode == "quality_guard":
+        body["max_tokens"] = LM_QUALITY_GUARD_MAX_TOKENS
+    else:  # "original"
+        body["max_tokens"] = base_max_tokens
+    return _post_lmstudio_chat(body, _use_structured_output(segmented_mode))
 
 
 def request_lmstudio(
@@ -2241,7 +2253,10 @@ def request_lmstudio(
     speaker: str = "リノン",
     two_only_mode: bool = False,
     style_guide: str = "",
+    generation_mode: str = DEFAULT_LM_GENERATION_MODE,
 ) -> tuple[str, str, str, int, list[dict[str, str]]]:
+    if generation_mode not in LM_GENERATION_MODES:
+        generation_mode = DEFAULT_LM_GENERATION_MODE
     length_instruction, max_tokens, chunk_limit = reply_style_for_length(reply_length)
     address = str(user_address or "").strip() or "あなた"
     address_instruction = (
@@ -2337,7 +2352,7 @@ def request_lmstudio(
         "思考過程は出さず、最終回答だけを出してください。/no_think"
         f"{emoji_instruction}"
     )
-    data = _request_lmstudio_content(payload, segmented_mode, auto_emoji, max_tokens)
+    data = _request_lmstudio_content(payload, segmented_mode, auto_emoji, max_tokens, generation_mode)
     choice_message = data["choices"][0]["message"]
     content = str(choice_message.get("content") or "").strip()
     if not content:
@@ -3296,6 +3311,9 @@ class Handler(BaseHTTPRequestHandler):
             auto_emoji = bool(body.get("autoEmoji", True))
             no_dialogue = bool(body.get("noDialogue", False))
             reply_length = str(body.get("replyLength") or "normal").strip()
+            generation_mode = str(body.get("llmGenerationMode") or "").strip().lower()
+            if generation_mode not in LM_GENERATION_MODES:
+                generation_mode = DEFAULT_LM_GENERATION_MODE
             speaker_slot = "second" if str(body.get("speakerSlot") or "") == "second" else "main"
             speaker = str(body.get("speaker") or ("ルヴィア" if body.get("twoPlayerMode") else "リノン")).strip()
             if model == "__codex_queue__":
@@ -3315,6 +3333,7 @@ class Handler(BaseHTTPRequestHandler):
                         "replyLength": reply_length,
                         "speechRate": speech_rate,
                         "emojiStyle": emoji_style,
+                        "llmGenerationMode": generation_mode,
                     }
                 )
                 self.send_json(
@@ -3402,6 +3421,7 @@ class Handler(BaseHTTPRequestHandler):
                 speaker=speaker,
                 two_only_mode=two_only_mode,
                 style_guide=style_guide,
+                generation_mode=generation_mode,
             )
             effective_emoji = emoji_style or llm_emoji
             reference_wav = second_reference_path if use_second_speaker else reference_path
