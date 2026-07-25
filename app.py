@@ -1295,6 +1295,23 @@ def safe_character_id(value: object, fallback: str = "rinon") -> str:
     return cleaned[:64] or fallback
 
 
+def sanitize_context_limits(value: object) -> dict[str, int]:
+    """キャラクター ID をキーにした context 上限値のマップを検証・整形する。"""
+    result: dict[str, int] = {}
+    if isinstance(value, dict):
+        for key, raw in value.items():
+            char_id = str(key or "").strip()
+            if not char_id:
+                continue
+            try:
+                num = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if num > 0:
+                result[char_id] = num
+    return result
+
+
 def normalize_session_settings(settings: dict) -> dict:
     settings = settings if isinstance(settings, dict) else {}
     return {
@@ -1310,6 +1327,7 @@ def normalize_session_settings(settings: dict) -> dict:
         "referencePath": str(settings.get("referencePath") or IRODORI_REF_WAV),
         "secondReferencePath": str(settings.get("secondReferencePath") or LUVIA_REF_WAV),
         "contextLimit": int(settings.get("contextLimit") or DEFAULT_CONTEXT_LIMIT),
+        "characterContextLimits": sanitize_context_limits(settings.get("characterContextLimits")),
         "model": str(settings.get("model") or DEFAULT_MODEL),
         "steps": int(settings.get("steps") or 12),
         "speechRate": str(settings.get("speechRate") or "normal"),

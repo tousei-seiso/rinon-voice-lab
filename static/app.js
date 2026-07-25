@@ -113,6 +113,10 @@ let editingCharacterId = "rinon";
 const history = [];
 // メインキャラ ID をキーにしたキャラ別会話ログの退避先。
 const characterHistories = {};
+// メインキャラ ID をキーにしたキャラ別 context 上限値（context 欄）の退避先。
+const characterContextLimits = {};
+// キャラ別値が未設定のときに使う context 上限の既定値（環境/旧設定から更新）。
+let defaultContextLimit = 8200;
 let queue = [];
 let interactionLocked = false;
 let autoMode = false;
@@ -1058,10 +1062,29 @@ function commitActiveHistory() {
   characterHistories[activeMainCharacterId] = history.map(cloneHistoryEntry);
 }
 
-// メインキャラ切替時に、直前キャラのログを退避し、新キャラのログを画面へ復元する。
+// context 欄の現在値（数値）。空/不正時は既定値。
+function currentContextLimitValue() {
+  return Number(contextLimit.value) || defaultContextLimit;
+}
+
+// 現在の context 欄の値を、アクティブなメインキャラの値として退避する。
+function commitActiveContextLimit() {
+  characterContextLimits[activeMainCharacterId] = currentContextLimitValue();
+}
+
+// 指定キャラの context 上限値を context 欄へ反映する（未設定なら既定値）。
+function applyContextLimitForCharacter(charId) {
+  contextLimit.value = characterContextLimits[charId] || defaultContextLimit;
+  // 環境デフォルトで上書きされないよう touched を立てる（キャラ別管理下に置く）。
+  contextLimit.dataset.touched = "1";
+  updateContextUsage();
+}
+
+// メインキャラ切替時に、直前キャラのログ・context 値を退避し、新キャラの内容を画面へ復元する。
 function switchCharacterHistory(previousId, nextId) {
   if (previousId) {
     characterHistories[previousId] = history.map(cloneHistoryEntry);
+    characterContextLimits[previousId] = currentContextLimitValue();
   }
   // 再生中の音声とキューは会話単位でリセットする。
   autoMode = false;
@@ -1073,13 +1096,15 @@ function switchCharacterHistory(previousId, nextId) {
   selectedAudioUrl = "";
   selectedMessageNode = null;
   renderHistory(characterHistories[nextId] || []);
+  applyContextLimitForCharacter(nextId);
   updateSelectionActions();
   updateAutoControls();
 }
 
 function sessionPayload() {
-  // 保存前に現在の会話ログをアクティブキャラのログとして確定させる。
+  // 保存前に現在の会話ログと context 値をアクティブキャラの値として確定させる。
   commitActiveHistory();
+  commitActiveContextLimit();
   return {
     settings: {
       systemPrompt: systemPrompt.value,
@@ -1094,6 +1119,7 @@ function sessionPayload() {
       referencePath: mainReferencePath,
       secondReferencePath,
       contextLimit: Number(contextLimit.value || 8200),
+      characterContextLimits,
       model: modelSelect.value,
       steps: Number(stepsInput.value || 12),
       speechRate: speechRate.value,
@@ -1172,30 +1198,32 @@ function clearContext() {
   updateContextUsage();
 }
 
-function applySession(profile) {
+// preserveActiveCharacter=true のとき、選択中のキャラ（メイン/2P）と、そのキャラ固有の
+// 設定（名前・プロンプト・参照音声）は保存内容で上書きせず現状を維持する。手動 Load 用。
+function applySession(profile, preserveActiveCharacter = false) {
   const settings = profile.settings || {};
-  if (settings.activeMainCharacterId && characters[settings.activeMainCharacterId]) {
-    activeMainCharacterId = settings.activeMainCharacterId;
+  if (!preserveActiveCharacter) {
+    if (settings.activeMainCharacterId && characters[settings.activeMainCharacterId]) {
+      activeMainCharacterId = settings.activeMainCharacterId;
+    }
+    if (settings.activeSecondCharacterId && characters[settings.activeSecondCharacterId]) {
+      activeSecondCharacterId = settings.activeSecondCharacterId;
+    }
+    mainCharacterName = settings.mainCharacterName || mainCharacterName || DEFAULT_MAIN_CHARACTER_NAME;
+    secondCharacterName = settings.secondCharacterName || secondCharacterName || DEFAULT_SECOND_CHARACTER_NAME;
+    mainReferencePath = settings.referencePath || mainReferencePath;
+    secondReferencePath = settings.secondReferencePath || secondReferencePath;
+    if (settings.systemPrompt) systemPrompt.value = settings.systemPrompt;
+    if (settings.ttsCaption) ttsCaption.value = settings.ttsCaption;
+    if (settings.secondSystemPrompt) secondSystemPrompt.value = settings.secondSystemPrompt;
+    if (settings.secondTtsCaption) secondTtsCaption.value = settings.secondTtsCaption;
+    if (secondSystemPrompt.value.startsWith("2Pは")) {
+      secondSystemPrompt.value = secondSystemPrompt.value.replace(/^2Pは/, `${secondCharacterName}は`);
+    }
   }
-  if (settings.activeSecondCharacterId && characters[settings.activeSecondCharacterId]) {
-    activeSecondCharacterId = settings.activeSecondCharacterId;
-  }
-  mainCharacterName = settings.mainCharacterName || mainCharacterName || DEFAULT_MAIN_CHARACTER_NAME;
-  secondCharacterName = settings.secondCharacterName || secondCharacterName || DEFAULT_SECOND_CHARACTER_NAME;
-  mainReferencePath = settings.referencePath || mainReferencePath;
-  secondReferencePath = settings.secondReferencePath || secondReferencePath;
-  if (settings.systemPrompt) systemPrompt.value = settings.systemPrompt;
   userAddress.value = settings.userAddress || userAddress.value || "あなた";
-  if (settings.ttsCaption) ttsCaption.value = settings.ttsCaption;
-  if (settings.secondSystemPrompt) secondSystemPrompt.value = settings.secondSystemPrompt;
-  if (settings.secondTtsCaption) secondTtsCaption.value = settings.secondTtsCaption;
-  if (secondSystemPrompt.value.startsWith("2Pは")) {
-    secondSystemPrompt.value = secondSystemPrompt.value.replace(/^2Pは/, `${secondCharacterName}は`);
-  }
-  if (settings.contextLimit) {
-    contextLimit.value = settings.contextLimit;
-    contextLimit.dataset.touched = "1";
-  }
+  // 旧グローバル context 値は、キャラ別値の既定値（フォールバック）として取り込む。
+  if (settings.contextLimit) defaultContextLimit = Number(settings.contextLimit) || defaultContextLimit;
   updateContextUsage();
   setSelectValue(modelSelect, settings.model);
   if (settings.steps) stepsInput.value = settings.steps;
@@ -1229,6 +1257,23 @@ function applySession(profile) {
     characterHistories[activeMainCharacterId] = profile.history.map(cloneHistoryEntry);
   }
   renderHistory(characterHistories[activeMainCharacterId] || []);
+  // キャラ別 context 上限値を復元。旧フォーマット（キャラ別マップ無し）は旧グローバル値を
+  // 全既知キャラの初期値として展開する（読込時の自動振り分け）。
+  for (const key of Object.keys(characterContextLimits)) delete characterContextLimits[key];
+  const ctxMap = settings.characterContextLimits && typeof settings.characterContextLimits === "object"
+    ? settings.characterContextLimits
+    : null;
+  if (ctxMap) {
+    for (const [id, value] of Object.entries(ctxMap)) {
+      const n = Number(value);
+      if (n > 0) characterContextLimits[id] = n;
+    }
+  }
+  if (!Object.keys(characterContextLimits).length && settings.contextLimit) {
+    const base = Number(settings.contextLimit) || defaultContextLimit;
+    for (const id of Object.keys(characters)) characterContextLimits[id] = base;
+  }
+  applyContextLimitForCharacter(activeMainCharacterId);
   const activeCount = (characterHistories[activeMainCharacterId] || []).length;
   sessionStatus.textContent = profile.savedAt ? `loaded ${activeCount} turns` : "loaded";
 }
@@ -1244,7 +1289,7 @@ async function saveSession() {
   sessionStatus.textContent = `saved ${data.historyCount} turns`;
 }
 
-async function loadSession(silent = false) {
+async function loadSession(silent = false, preserveActiveCharacter = false) {
   const res = await fetch("/api/session");
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || res.statusText);
@@ -1252,7 +1297,7 @@ async function loadSession(silent = false) {
     if (!silent) sessionStatus.textContent = "no save";
     return;
   }
-  applySession(data);
+  applySession(data, preserveActiveCharacter);
 }
 
 function playQueue(items, speaker = activeStage().speaker, options = {}) {
@@ -1410,8 +1455,10 @@ async function refreshStatus() {
     lmStatus.textContent = data.models.length
       ? `${data.models.length} models`
       : `not detected: ${data.lmStudioUrl}`;
-    if (data.contextLimit && !contextLimit.dataset.touched) {
-      contextLimit.value = data.contextLimit;
+    if (data.contextLimit) {
+      // 環境デフォルトはキャラ別値のフォールバックとして保持。未編集時のみ欄へ反映。
+      defaultContextLimit = Number(data.contextLimit) || defaultContextLimit;
+      if (!contextLimit.dataset.touched) contextLimit.value = data.contextLimit;
     }
     updateContextUsage();
     if (data.ttsCaption && !ttsCaption.dataset.touched) {
@@ -1827,6 +1874,8 @@ autoStartButton.addEventListener("click", () => {
 });
 contextLimit.addEventListener("input", () => {
   contextLimit.dataset.touched = "1";
+  // 編集値を即アクティブキャラの値として保持（切替/保存前に失わないように）。
+  characterContextLimits[activeMainCharacterId] = currentContextLimitValue();
   updateContextUsage();
 });
 
@@ -1850,7 +1899,8 @@ saveSessionButton.addEventListener("click", async () => {
 loadSessionButton.addEventListener("click", async () => {
   try {
     sessionStatus.textContent = "loading...";
-    await loadSession();
+    // 手動 Load では選択中のキャラを維持し、そのキャラのログを表示する。
+    await loadSession(false, true);
   } catch (error) {
     sessionStatus.textContent = `load error: ${error.message}`;
   }
