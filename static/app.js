@@ -380,11 +380,13 @@ function addMessage(role, text, meta = "", options = {}) {
 }
 
 // 選択状態に応じて再生成・削除ボタンの活性/非活性を切り替える。
-// 再生成は生成時パラメータ（node._regen）を持つ枠でのみ有効。削除は音声付き枠なら常に有効。
+// 再生成は音声付きの選択枠なら有効（生成時パラメータが無い過去の会話でも、履歴テキストと
+// 現在のキャラ設定からフォールバックで組み立てて再生成できる）。削除は選択枠なら常に有効。
 function updateSelectionActions() {
   const hasSelection = Boolean(selectedMessageNode);
-  const canRegen = hasSelection && Boolean(selectedMessageNode._regen);
-  if (regenAudioButton) regenAudioButton.disabled = !canRegen || regenBusy;
+  const hasAudio =
+    hasSelection && Boolean(selectedMessageNode.dataset && selectedMessageNode.dataset.audioUrl);
+  if (regenAudioButton) regenAudioButton.disabled = !hasAudio || regenBusy;
   if (deleteMessageButton) deleteMessageButton.disabled = !hasSelection;
 }
 
@@ -1835,11 +1837,53 @@ function findHistoryEntryByAudioUrl(url) {
   );
 }
 
+// 生成時パラメータ（_regen）が無い過去の返答向けに、履歴テキストと現在のキャラ設定から
+// 再生成データを組み立てる。感情セグメントは復元できないため空（＝返答全体を1発話で合成）とし、
+// 読み・表現のみを作り直す。話者は履歴の "話者名: 本文" 先頭から推定し、そのキャラ設定を使う。
+function buildFallbackRegen(node) {
+  const url = node && node.dataset ? node.dataset.audioUrl || "" : "";
+  const entry = findHistoryEntryByAudioUrl(url);
+  let reply = "";
+  let speakerName = "";
+  if (entry && entry.content) {
+    const match = entry.content.match(/^([^:：]+)[:：]\s*([\s\S]*)$/);
+    if (match) {
+      speakerName = match[1].trim();
+      reply = match[2].trim();
+    } else {
+      reply = entry.content.trim();
+    }
+  }
+  if (!reply) return null;
+  const stage = activeStage(speakerName);
+  return {
+    reply,
+    segments: [],
+    emojiStyle: "",
+    llmEmojiStyle: "",
+    speaker: stage.speaker,
+    speakerSlot: stage.slot,
+    ttsCaption: stage.ttsCaption,
+    cfgScaleText: stage.cfgScaleText,
+    cfgScaleCaption: stage.cfgScaleCaption,
+    cfgScaleSpeaker: stage.cfgScaleSpeaker,
+    steps: stage.steps,
+    referencePath: stage.slot === "main" ? stage.referencePath : mainReferencePath,
+    secondReferencePath: stage.slot === "second" ? stage.referencePath : secondReferencePath,
+    speechRate: "normal",
+  };
+}
+
 // irodori 再生成：選択中の返答テキストを LLM を介さず TTS のみで作り直し、音声を差し替える。
 // 辞書追加やコード修正の後に、同じ返答へ最新の読み・表現を反映させたいときに使う。
 regenAudioButton.addEventListener("click", async () => {
   const node = selectedMessageNode;
-  const regen = node && node._regen;
+  let regen = node && node._regen;
+  if (node && !regen) {
+    // 過去の会話（再生成パラメータ未保存）はフォールバックで組み立て、次回以降のため枠に保持する。
+    regen = buildFallbackRegen(node);
+    if (regen) node._regen = regen;
+  }
   if (!node || !regen) {
     audioSaveStatus.textContent = "no target";
     return;
