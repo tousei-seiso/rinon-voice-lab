@@ -5,7 +5,9 @@ const sendButton = document.querySelector("#send");
 const sendShortcut = document.querySelector("#sendShortcut");
 const autoStartButton = document.querySelector("#autoStart");
 const player = document.querySelector("#player");
+const regenAudioButton = document.querySelector("#regenAudio");
 const saveAudioButton = document.querySelector("#saveAudio");
+const deleteMessageButton = document.querySelector("#deleteMessage");
 const audioSaveStatus = document.querySelector("#audioSaveStatus");
 const portraitWrap = document.querySelector("#mainPortraitWrap");
 const secondPortraitWrap = document.querySelector("#secondPortraitWrap");
@@ -118,6 +120,10 @@ let lastAssistantSpeaker = "";
 let lastAssistantText = "";
 // 現在選択中の返答テキストの音声 URL と、全再生に適用する再生速度。
 let selectedAudioUrl = "";
+// 現在選択中の返答テキスト枠（再生成・削除の対象）。未選択時は null。
+let selectedMessageNode = null;
+// irodori 再生成の実行中フラグ（多重実行防止＆ボタン制御）。
+let regenBusy = false;
 let preferredPlaybackRate = 1;
 let autoTopic = "";
 let autoTopicQueue = [];
@@ -361,11 +367,25 @@ function addMessage(role, text, meta = "", options = {}) {
   if (role === "assistant" && audioUrl) {
     node.classList.add("has-audio");
     node.dataset.audioUrl = audioUrl;
+    // 再生成に必要な生成時パラメータ（感情セグメント・キャラ別CFG/steps/reference等）を枠に紐づける。
+    // リロード後も再生成できるよう history.display.regen へも保存する（renderHistory で復元）。
+    if (options.regen && typeof options.regen === "object") {
+      node._regen = options.regen;
+    }
     node.addEventListener("click", () => selectReplyMessage(node));
   }
   messagesEl.appendChild(node);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   return node;
+}
+
+// 選択状態に応じて再生成・削除ボタンの活性/非活性を切り替える。
+// 再生成は生成時パラメータ（node._regen）を持つ枠でのみ有効。削除は音声付き枠なら常に有効。
+function updateSelectionActions() {
+  const hasSelection = Boolean(selectedMessageNode);
+  const canRegen = hasSelection && Boolean(selectedMessageNode._regen);
+  if (regenAudioButton) regenAudioButton.disabled = !canRegen || regenBusy;
+  if (deleteMessageButton) deleteMessageButton.disabled = !hasSelection;
 }
 
 // 現在選択中の返答テキスト枠をハイライトする（他の枠の選択は解除）。
@@ -374,6 +394,8 @@ function highlightSelectedMessage(node) {
     .querySelectorAll(".msg.assistant.selected")
     .forEach((el) => el.classList.remove("selected"));
   if (node) node.classList.add("selected");
+  selectedMessageNode = node || null;
+  updateSelectionActions();
 }
 
 // 全再生に適用する再生速度を #player に反映する。新しい音源を読み込んでも維持されるよう
@@ -440,6 +462,28 @@ function buildStyleMeta(data) {
     return ` / ${label} ${shown.join("→")}${suffix}`;
   }
   return data.emojiStyle ? ` / ${label} ${data.emojiStyle}` : "";
+}
+
+// irodori 再生成に必要な「生成時パラメータ一式」を組み立てる。返答テキスト・感情セグメント・
+// キャラ別 CFG/steps/reference をそのまま保持し、辞書やコード修正のみを合成時に反映させて
+// 同じ返答を作り直せるようにする。リモート TTS 設定は再生成時に UI から都度読む。
+function buildRegenPayload(data, stage) {
+  return {
+    reply: data.reply || "",
+    segments: Array.isArray(data.segments) ? data.segments : [],
+    emojiStyle: data.emojiStyle || "",
+    llmEmojiStyle: data.llmEmojiStyle || "",
+    speaker: data.speaker || stage.speaker,
+    speakerSlot: stage.slot,
+    ttsCaption: stage.ttsCaption,
+    cfgScaleText: stage.cfgScaleText,
+    cfgScaleCaption: stage.cfgScaleCaption,
+    cfgScaleSpeaker: stage.cfgScaleSpeaker,
+    steps: stage.steps,
+    referencePath: stage.slot === "main" ? stage.referencePath : mainReferencePath,
+    secondReferencePath: stage.slot === "second" ? stage.referencePath : secondReferencePath,
+    speechRate: data.speechRate || "normal",
+  };
 }
 
 // 表示用の返答テキストに、各セグメント先頭へ「（絵文字＋感情キャプション全文）」を差し込む。
@@ -1044,6 +1088,7 @@ function renderHistory(items) {
       entry.display = display;
       const node = addMessage("assistant", display.text || item.content, display.meta || "", {
         audioUrl: display.audioUrl || "",
+        regen: display.regen,
       });
       if (display.audioUrl) lastAudioNode = node;
     } else {
@@ -1072,6 +1117,8 @@ function clearContext() {
   player.removeAttribute("src");
   player.load();
   selectedAudioUrl = "";
+  selectedMessageNode = null;
+  updateSelectionActions();
   audioSaveStatus.textContent = "no audio";
   speaking.textContent = "ready";
   secondSpeaking.textContent = "standby";
@@ -1199,7 +1246,7 @@ function playNext() {
       "assistant",
       next.deferredMessage.reply,
       next.deferredMessage.meta,
-      { audioUrl: next.deferredMessage.audioUrl || next.url || "" },
+      { audioUrl: next.deferredMessage.audioUrl || next.url || "", regen: next.deferredMessage.regen },
     );
   }
   if (playbackSpeaker === mainCharacterName) {
@@ -1471,14 +1518,15 @@ async function sendChatTurn({
       (data.combined && data.combined.url) ||
       (Array.isArray(data.audios) && data.audios[0] && data.audios[0].url) ||
       "";
+    const regen = buildRegenPayload(data, stage);
     if (!backgroundAuto) {
-      addMessage("assistant", annotatedReply, assistantMeta, { audioUrl: primaryAudioUrl });
+      addMessage("assistant", annotatedReply, assistantMeta, { audioUrl: primaryAudioUrl, regen });
     }
     history.push({
       role: "assistant",
       content: `${data.speaker || speaker}: ${data.reply}`,
-      // リロード後も注釈・meta 行・再生対象を復元するための表示用メタ（LM context には非影響）。
-      display: { text: annotatedReply, meta: assistantMeta, audioUrl: primaryAudioUrl },
+      // リロード後も注釈・meta 行・再生対象・再生成パラメータを復元するための表示用メタ（LM context には非影響）。
+      display: { text: annotatedReply, meta: assistantMeta, audioUrl: primaryAudioUrl, regen },
     });
     lastAssistantSpeaker = data.speaker || speaker;
     lastAssistantText = data.reply;
@@ -1499,7 +1547,7 @@ async function sendChatTurn({
         playItems = [...playItems];
         playItems[0] = {
           ...playItems[0],
-          deferredMessage: { reply: annotatedReply, meta: assistantMeta, audioUrl: primaryAudioUrl },
+          deferredMessage: { reply: annotatedReply, meta: assistantMeta, audioUrl: primaryAudioUrl, regen },
         };
       }
       playQueue(playItems, data.speaker || speaker, { append: backgroundAuto });
@@ -1776,6 +1824,101 @@ saveAudioButton.addEventListener("click", async () => {
   } catch (error) {
     audioSaveStatus.textContent = `save error: ${error.message}`;
   }
+});
+
+// 選択中の返答（node）に対応する history エントリを、表示用 audioUrl の一致で探す。
+// 生成ファイル名はタイムスタンプ付きで一意なため、URL 一致で確実に対応付けられる。
+function findHistoryEntryByAudioUrl(url) {
+  if (!url) return null;
+  return (
+    history.find((entry) => entry && entry.display && entry.display.audioUrl === url) || null
+  );
+}
+
+// irodori 再生成：選択中の返答テキストを LLM を介さず TTS のみで作り直し、音声を差し替える。
+// 辞書追加やコード修正の後に、同じ返答へ最新の読み・表現を反映させたいときに使う。
+regenAudioButton.addEventListener("click", async () => {
+  const node = selectedMessageNode;
+  const regen = node && node._regen;
+  if (!node || !regen) {
+    audioSaveStatus.textContent = "no target";
+    return;
+  }
+  if (regenBusy) return;
+  regenBusy = true;
+  updateSelectionActions();
+  const oldUrl = node.dataset.audioUrl || "";
+  audioSaveStatus.textContent = "regenerating...";
+  try {
+    const res = await fetch("/api/regenerate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...regen,
+        // リモート TTS（2P）設定は再生成時点の UI 値を使う。
+        ttsBackendMode: ttsBackendMode.value,
+        secondTtsHost: secondTtsHost.value.trim(),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    const newUrl =
+      (data.combined && data.combined.url) ||
+      (Array.isArray(data.audios) && data.audios[0] && data.audios[0].url) ||
+      "";
+    if (!newUrl) throw new Error("no audio returned");
+    node.dataset.audioUrl = newUrl;
+    if (Array.isArray(data.segments)) node._regen = { ...regen, segments: data.segments };
+    // history 側の表示用 URL と再生成パラメータも更新し、保存/リロード後も差し替えを保持する。
+    const entry = findHistoryEntryByAudioUrl(oldUrl);
+    if (entry && entry.display) {
+      entry.display.audioUrl = newUrl;
+      if (entry.display.regen) entry.display.regen = node._regen;
+    }
+    // 選択中だった場合はプレイヤーを差し替え、再生成結果をそのまま鳴らす。
+    if (selectedAudioUrl === oldUrl || selectedMessageNode === node) {
+      loadAudioIntoPlayer(newUrl, { autoplay: true });
+    }
+    audioSaveStatus.textContent = "regenerated";
+  } catch (error) {
+    audioSaveStatus.textContent = `regen error: ${error.message}`;
+  } finally {
+    regenBusy = false;
+    updateSelectionActions();
+  }
+});
+
+// 削除：選択中の返答を会話から取り除く。誤操作防止のため (y/N) 確認を必須にし、
+// ENTER（空入力）や y 以外は削除せず、y を入力したときのみ実行する。
+deleteMessageButton.addEventListener("click", () => {
+  const node = selectedMessageNode;
+  if (!node) {
+    audioSaveStatus.textContent = "no target";
+    return;
+  }
+  const answer = window.prompt("本当に削除しますか？ (y/N)", "");
+  if (answer === null || answer.trim().toLowerCase() !== "y") {
+    audioSaveStatus.textContent = "delete canceled";
+    return;
+  }
+  const url = node.dataset.audioUrl || "";
+  const entry = findHistoryEntryByAudioUrl(url);
+  if (entry) {
+    const idx = history.indexOf(entry);
+    if (idx >= 0) history.splice(idx, 1);
+  }
+  node.remove();
+  // 削除した枠が再生対象だった場合はプレイヤーを空にする。
+  if (selectedAudioUrl === url) {
+    player.pause();
+    player.removeAttribute("src");
+    player.load();
+    selectedAudioUrl = "";
+  }
+  selectedMessageNode = null;
+  updateSelectionActions();
+  updateContextUsage();
+  audioSaveStatus.textContent = "deleted";
 });
 
 messageInput.addEventListener("compositionstart", () => {

@@ -615,25 +615,48 @@ button:disabled {
 
 .audio-panel {
   width: min(100%, var(--chat-width));
-  display: grid;
-  grid-template-columns: minmax(220px, 1fr) 72px 104px minmax(180px, 240px) minmax(90px, 160px);
+  display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   align-items: center;
+}
+
+.audio-panel #player {
+  flex: 1 1 240px;
+  min-width: 200px;
 }
 
 audio {
   width: 100%;
 }
 
-#saveAudio {
+#regenAudio,
+#saveAudio,
+#deleteMessage {
   min-height: 38px;
-  padding: 6px 10px;
+  padding: 6px 12px;
+  flex: 0 0 auto;
+}
+
+#regenAudio:disabled,
+#deleteMessage:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .audio-panel #openOptions {
   min-height: 38px;
   min-width: 104px;
   padding: 6px 12px;
+  flex: 0 0 auto;
+}
+
+.audio-panel .address-control {
+  flex: 1 1 180px;
+}
+
+.audio-panel #audioSaveStatus {
+  flex: 1 1 90px;
 }
 
 #audioSaveStatus {
@@ -945,15 +968,15 @@ body.is-shutdown {
     grid-column: 1 / -1;
   }
 
-  .audio-panel {
-    grid-template-columns: 1fr 72px 104px;
+  .audio-panel #player {
+    flex-basis: 100%;
   }
 
   .address-control {
-    grid-column: 1 / -1;
+    flex-basis: 100%;
   }
 
   #audioSaveStatus {
-    grid-column: 1 / -1;
+    flex-basis: 100%;
   }
 }

@@ -2950,6 +2950,222 @@ def build_combined_audio(
         return None
 
 
+def render_reply_audio(
+    reply: str,
+    segments: list | None,
+    *,
+    speaker_slot: str = "main",
+    tts_caption: str = "",
+    steps: int = DEFAULT_CHARACTER_STEPS,
+    speech_rate: str = "normal",
+    emoji_style: str = "",
+    fallback_emoji: str = "",
+    chunk_limit: int = 8,
+    cfg_scale_text: float = IRODORI_CFG_SCALE_TEXT,
+    cfg_scale_caption: float = IRODORI_CFG_SCALE_CAPTION,
+    cfg_scale_speaker: float = IRODORI_CFG_SCALE_SPEAKER,
+    reference_path: Path = IRODORI_REF_WAV,
+    second_reference_path: Path = LUVIA_REF_WAV,
+    tts_backend_mode: str = "local",
+    second_tts_url: str = "",
+) -> dict:
+    """返答テキスト（＋感情セグメント）から TTS 音声を合成し、結合済み音声までまとめて返す。
+
+    ``/api/chat`` の初回生成と ``/api/regenerate`` の再生成で共通利用する。LLM 生成は含まず、
+    合成部分（読み・絵文字スタイル・キャラ別 CFG/steps/reference）のみを担う。読み辞書やコード
+    修正は合成時に自動反映されるため、再生成で読み間違いや表現の不備を後から直せる。
+    """
+    duration_scale = tts_duration_scale_for_rate(speech_rate)
+    effective_emoji = emoji_style or fallback_emoji
+    use_second_speaker = speaker_slot == "second"
+    reference_wav = second_reference_path if use_second_speaker else reference_path
+    use_remote_tts = (
+        use_second_speaker
+        and tts_backend_mode == "remote"
+        and remote_luvia_enabled(second_tts_url)
+    )
+    remote_reference_wav = (
+        remote_ref_for_luvia(reference_wav)
+        if use_remote_tts and LUVIA_REMOTE_TTS_HOST and LUVIA_REMOTE_IRODORI_ROOT and LUVIA_REMOTE_REF_WAV
+        else (LUVIA_REMOTE_REF_WAV if use_remote_tts else "")
+    )
+    synthesize = synthesize_sentence_remote_luvia if use_remote_tts else synthesize_sentence
+    synth_kwargs = (
+        {"remote_ref_wav": remote_reference_wav, "remote_tts_url": second_tts_url}
+        if use_remote_tts
+        else {"ref_wav": reference_wav}
+    )
+    # CFG Scale はキャラクターごとの値を全 TTS 経路へ共通で渡す。
+    # seed はリプライ単位で 1 つ生成し全チャンクへ共通で渡す（音色の当たりを揃える）。
+    synth_kwargs.update(
+        {
+            "cfg_scale_text": cfg_scale_text,
+            "cfg_scale_caption": cfg_scale_caption,
+            "cfg_scale_speaker": cfg_scale_speaker,
+            "seed": new_tts_seed(),
+        }
+    )
+    # 感情セグメント単位に (感情style, 絵文字, 本文) を組み立てる。
+    # segments が空（=分割なし/機能オフ）なら返答全体を 1 セグメントとして扱う。
+    if segments:
+        seg_units = [
+            (
+                str(seg.get("style") or ""),
+                str(emoji_style or seg.get("emoji") or ""),
+                str(seg.get("text") or ""),
+            )
+            for seg in segments
+        ]
+    else:
+        seg_units = [("", effective_emoji, reply)]
+    seg_chunk_limit = max(1, min(20, chunk_limit))
+    steps = max(1, min(120, steps))
+    audios: list[dict] = []
+    chunks: list[str] = []
+    seg_meta: list[dict[str, str]] = []
+    for seg_style, seg_emoji, seg_text in seg_units:
+        # セグメント（感情の単位）は原則 1 発話でまとめて生成する。短い単独チャンクを
+        # 作らないことで TTS の末尾暴走を防ぐ。長すぎるセグメントのみ複数チャンクへ分割。
+        seg_chunks = group_sentences(
+            seg_text, max_chars=TTS_SEGMENT_MAX_CHARS, limit=seg_chunk_limit
+        )
+        if not seg_chunks:
+            continue
+        # 各セグメントの caption は「基底 TTS Caption + 感情style」を必ず連結する。
+        seg_caption = compose_caption(tts_caption, seg_style)
+        seg_meta.append({"style": seg_style, "emoji": seg_emoji, "text": seg_text})
+        for chunk_pos, chunk in enumerate(seg_chunks):
+            # 発声効果の絵文字は種類で出し分ける。単発音（吐息・喘ぎ・泣き声など）は
+            # 先頭チャンクのみに付与し、繰り返し挿入（＝意味不明な発声）を防ぐ。持続系
+            # （話し方・声色・音響効果）は全チャンクに付与し表現のぶれを防ぐ。通常はセグメント
+            # ＝1 チャンクなのでどちらも先頭に 1 回。分割された長いセグメントで差が出る。
+            chunk_emoji = seg_emoji if (chunk_pos == 0 or emoji_is_sustained(seg_emoji)) else ""
+            audios.append(
+                synthesize(
+                    chunk,
+                    len(audios) + 1,
+                    steps=steps,
+                    emoji_style=chunk_emoji,
+                    caption=seg_caption,
+                    duration_scale=duration_scale,
+                    **synth_kwargs,
+                )
+            )
+            chunks.append(chunk)
+    # 代表となる感情絵文字（立ち絵 pose 用）: 最初の非空セグメント絵文字、無ければ従来値。
+    representative_emoji = (
+        next((meta["emoji"] for meta in seg_meta if meta["emoji"]), "")
+        or effective_emoji
+    )
+    # 分割音声を時系列順に 1 つの WAV へ結合する（ローカル TTS のみ対象）。
+    combined_audio = build_combined_audio(
+        audios, text=reply, emoji_style=representative_emoji, caption=tts_caption
+    )
+    return {
+        "audios": audios,
+        "chunks": chunks,
+        "segMeta": seg_meta,
+        "combined": combined_audio,
+        "representativeEmoji": representative_emoji,
+        "expression": expression_for_emoji(representative_emoji),
+        "effectiveEmoji": effective_emoji,
+        "durationScale": duration_scale,
+        "useRemoteTts": use_remote_tts,
+        "referenceWav": reference_wav,
+    }
+
+
+def regenerate_reply_audio(payload: dict) -> dict:
+    """選択中の返答テキストを、LLM を介さず TTS のみ再合成して差し替える。
+
+    英数字の読み間違いを辞書追加で直したり、合成コードの不備を修正した後に、同じ返答
+    テキストへ最新の読み・表現を適用し直すための経路。感情セグメント・キャラ別 CFG/steps/
+    reference はフロントが保持している生成時の値をそのまま受け取り、忠実に再現する。
+    """
+    reply = str(payload.get("reply") or "").strip()
+    segments = payload.get("segments") if isinstance(payload.get("segments"), list) else []
+    if not reply and not segments:
+        raise ValueError("reply text is required")
+    speaker_slot = "second" if str(payload.get("speakerSlot") or "") == "second" else "main"
+    speaker = str(payload.get("speaker") or ("ルヴィア" if speaker_slot == "second" else "リノン")).strip()
+    tts_caption = str(payload.get("ttsCaption") or IRODORI_CAPTION).strip()
+    steps = sanitize_steps(payload.get("steps"), DEFAULT_CHARACTER_STEPS)
+    speech_rate = str(payload.get("speechRate") or "normal").strip().lower()
+    emoji_style = str(payload.get("emojiStyle") or "").strip()
+    llm_emoji = str(payload.get("llmEmojiStyle") or "").strip()
+    cfg_scale_text = sanitize_cfg_scale(payload.get("cfgScaleText"), IRODORI_CFG_SCALE_TEXT)
+    cfg_scale_caption = sanitize_cfg_scale(payload.get("cfgScaleCaption"), IRODORI_CFG_SCALE_CAPTION)
+    cfg_scale_speaker = sanitize_cfg_scale(payload.get("cfgScaleSpeaker"), IRODORI_CFG_SCALE_SPEAKER)
+    reference_path = sanitize_reference_path(payload.get("referencePath"), IRODORI_REF_WAV)
+    second_reference_path = sanitize_reference_path(payload.get("secondReferencePath"), LUVIA_REF_WAV)
+    tts_backend_mode = str(payload.get("ttsBackendMode") or "local").strip().lower()
+    second_tts_host = str(payload.get("secondTtsHost") or payload.get("secondTtsUrl") or "").strip()
+    second_tts_url = normalize_remote_tts_url(second_tts_host)
+
+    # 感情スタイル（絵文字）は生成時に seg_meta へ焼き込まれているため、絵文字上書きは掛けず
+    # セグメント側の値をそのまま使う。セグメントが無い返答のみ代表絵文字をフォールバックに使う。
+    render = render_reply_audio(
+        reply,
+        segments,
+        speaker_slot=speaker_slot,
+        tts_caption=tts_caption,
+        steps=steps,
+        speech_rate=speech_rate,
+        emoji_style="",
+        fallback_emoji=emoji_style or llm_emoji,
+        cfg_scale_text=cfg_scale_text,
+        cfg_scale_caption=cfg_scale_caption,
+        cfg_scale_speaker=cfg_scale_speaker,
+        reference_path=reference_path,
+        second_reference_path=second_reference_path,
+        tts_backend_mode=tts_backend_mode,
+        second_tts_url=second_tts_url,
+    )
+    audios = render["audios"]
+    combined_audio = render["combined"]
+    if not audios:
+        raise ValueError("regeneration produced no audio")
+    append_chat_log(
+        {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "source": "regenerate",
+            "speaker": speaker,
+            "speakerSlot": speaker_slot,
+            "reply": reply,
+            "emojiStyle": render["representativeEmoji"],
+            "expression": render["expression"],
+            "ttsCaption": tts_caption,
+            "reference": str(render["referenceWav"]),
+            "secondTtsRemote": render["useRemoteTts"],
+            "chunkCount": len(render["chunks"]),
+            "combinedUrl": (combined_audio or {}).get("url"),
+            "audios": [
+                {
+                    "text": item.get("text"),
+                    "ttsText": item.get("ttsText"),
+                    "emojiStyle": item.get("emojiStyle"),
+                    "expression": item.get("expression"),
+                    "elapsed": item.get("elapsed"),
+                    "url": item.get("url"),
+                }
+                for item in audios
+            ],
+        }
+    )
+    return {
+        "ok": True,
+        "reply": reply,
+        "speaker": speaker,
+        "segments": render["segMeta"],
+        "emojiStyle": render["representativeEmoji"],
+        "expression": render["expression"],
+        "speechRate": speech_rate,
+        "durationScale": render["durationScale"],
+        "audios": audios,
+        "combined": combined_audio,
+    }
+
+
 def handle_external_speak(payload: dict) -> dict:
     text = str(payload.get("text") or payload.get("message") or "").strip()
     if not text:
@@ -3239,6 +3455,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(exc)})
             return
 
+        if parsed.path == "/api/regenerate":
+            try:
+                self.send_json(200, regenerate_reply_audio(read_json_body(self)))
+            except Exception as exc:
+                self.send_json(500, {"error": str(exc)})
+            return
+
         if parsed.path == "/api/speak":
             try:
                 event = handle_external_speak(read_json_body(self))
@@ -3423,89 +3646,34 @@ class Handler(BaseHTTPRequestHandler):
                 style_guide=style_guide,
                 generation_mode=generation_mode,
             )
-            effective_emoji = emoji_style or llm_emoji
-            reference_wav = second_reference_path if use_second_speaker else reference_path
-            use_remote_tts = (
-                use_second_speaker
-                and tts_backend_mode == "remote"
-                and remote_luvia_enabled(second_tts_url)
+            # 合成部分（感情セグメント→TTS→結合）は /api/regenerate と共通の関数へ委譲する。
+            render = render_reply_audio(
+                reply,
+                segments,
+                speaker_slot=speaker_slot,
+                tts_caption=tts_caption,
+                steps=steps,
+                speech_rate=speech_rate,
+                emoji_style=emoji_style,
+                fallback_emoji=llm_emoji,
+                chunk_limit=chunk_limit,
+                cfg_scale_text=cfg_scale_text,
+                cfg_scale_caption=cfg_scale_caption,
+                cfg_scale_speaker=cfg_scale_speaker,
+                reference_path=reference_path,
+                second_reference_path=second_reference_path,
+                tts_backend_mode=tts_backend_mode,
+                second_tts_url=second_tts_url,
             )
-            remote_reference_wav = (
-                remote_ref_for_luvia(reference_wav)
-                if use_remote_tts and LUVIA_REMOTE_TTS_HOST and LUVIA_REMOTE_IRODORI_ROOT and LUVIA_REMOTE_REF_WAV
-                else (LUVIA_REMOTE_REF_WAV if use_remote_tts else "")
-            )
-            synthesize = synthesize_sentence_remote_luvia if use_remote_tts else synthesize_sentence
-            synth_kwargs = (
-                {"remote_ref_wav": remote_reference_wav, "remote_tts_url": second_tts_url}
-                if use_remote_tts
-                else {"ref_wav": reference_wav}
-            )
-            # CFG Scale はキャラクターごとの値を全 TTS 経路へ共通で渡す。
-            # seed はリプライ単位で 1 つ生成し全チャンクへ共通で渡す（音色の当たりを揃える）。
-            synth_kwargs.update(
-                {
-                    "cfg_scale_text": cfg_scale_text,
-                    "cfg_scale_caption": cfg_scale_caption,
-                    "cfg_scale_speaker": cfg_scale_speaker,
-                    "seed": new_tts_seed(),
-                }
-            )
-            # 感情セグメント単位に (感情style, 絵文字, 本文) を組み立てる。
-            # segments が空（=分割なし/機能オフ）なら返答全体を 1 セグメントとして扱う。
-            if segments:
-                seg_units = [
-                    (
-                        str(seg.get("style") or ""),
-                        str(emoji_style or seg.get("emoji") or ""),
-                        str(seg.get("text") or ""),
-                    )
-                    for seg in segments
-                ]
-            else:
-                seg_units = [("", effective_emoji, reply)]
-            seg_chunk_limit = max(1, min(20, chunk_limit))
-            audios: list[dict] = []
-            chunks: list[str] = []
-            seg_meta: list[dict[str, str]] = []
-            for seg_style, seg_emoji, seg_text in seg_units:
-                # セグメント（感情の単位）は原則 1 発話でまとめて生成する。短い単独チャンクを
-                # 作らないことで TTS の末尾暴走を防ぐ。長すぎるセグメントのみ複数チャンクへ分割。
-                seg_chunks = group_sentences(
-                    seg_text, max_chars=TTS_SEGMENT_MAX_CHARS, limit=seg_chunk_limit
-                )
-                if not seg_chunks:
-                    continue
-                # 各セグメントの caption は「基底 TTS Caption + 感情style」を必ず連結する。
-                seg_caption = compose_caption(tts_caption, seg_style)
-                seg_meta.append({"style": seg_style, "emoji": seg_emoji, "text": seg_text})
-                for chunk_pos, chunk in enumerate(seg_chunks):
-                    # 発声効果の絵文字は種類で出し分ける。単発音（吐息・喘ぎ・泣き声など）は
-                    # 先頭チャンクのみに付与し、繰り返し挿入（＝意味不明な発声）を防ぐ。持続系
-                    # （話し方・声色・音響効果）は全チャンクに付与し表現のぶれを防ぐ。通常はセグメント
-                    # ＝1 チャンクなのでどちらも先頭に 1 回。分割された長いセグメントで差が出る。
-                    chunk_emoji = seg_emoji if (chunk_pos == 0 or emoji_is_sustained(seg_emoji)) else ""
-                    audios.append(
-                        synthesize(
-                            chunk,
-                            len(audios) + 1,
-                            steps=max(1, min(120, steps)),
-                            emoji_style=chunk_emoji,
-                            caption=seg_caption,
-                            duration_scale=duration_scale,
-                            **synth_kwargs,
-                        )
-                    )
-                    chunks.append(chunk)
-            # 代表となる感情絵文字（立ち絵 pose 用）: 最初の非空セグメント絵文字、無ければ従来値。
-            representative_emoji = (
-                next((meta["emoji"] for meta in seg_meta if meta["emoji"]), "")
-                or effective_emoji
-            )
-            # 分割音声を時系列順に 1 つの WAV へ結合する（ローカル TTS のみ対象）。
-            combined_audio = build_combined_audio(
-                audios, text=reply, emoji_style=representative_emoji, caption=tts_caption
-            )
+            audios = render["audios"]
+            chunks = render["chunks"]
+            seg_meta = render["segMeta"]
+            combined_audio = render["combined"]
+            representative_emoji = render["representativeEmoji"]
+            effective_emoji = render["effectiveEmoji"]
+            duration_scale = render["durationScale"]
+            use_remote_tts = render["useRemoteTts"]
+            reference_wav = render["referenceWav"]
             append_chat_log(
                 {
                     "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
