@@ -34,6 +34,13 @@ focused on higher-quality Japanese character speech and day-to-day usability.
 - **Usability** — selectable replies with targeted play/download/save, persisted
   annotations across reloads, per-reply regenerate/delete, and per-character logs,
   saved audio, and context limits.
+- **Local long-term memory (RAG)** — semantically retrieves the most relevant past
+  conversations for the current message and injects them as a reference block, so
+  characters stay consistent over long histories. Embeddings run fully on CPU (no VRAM)
+  via `intfloat/multilingual-e5-small` with a dual backend (fastembed/ONNX, or
+  transformers+torch), stored per-character in SQLite. Existing logs/histories are left
+  untouched and it degrades gracefully when the optional deps are absent. A one-shot
+  backfill script (`tools/backfill_rag_memory.py`) imports existing histories.
 
 ## Screenshots / 画面モード
 

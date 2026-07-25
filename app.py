@@ -43,6 +43,12 @@ DEFAULT_IRODORI_ROOT = (APP_ROOT.parent / "Irodori-TTS").resolve()
 IRODORI_ROOT = Path(os.environ.get("IRODORI_ROOT", str(DEFAULT_IRODORI_ROOT))).resolve()
 LM_STUDIO_URL = os.environ.get("LM_STUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/")
 DEFAULT_MODEL = os.environ.get("LM_STUDIO_MODEL", "gemma-4-12b-it")
+# ローカルRAG長期記憶レイヤー（fastembed + sqlite3, 完全CPU/VRAM0）。
+# 依存(fastembed/numpy)が未導入でも import は成功し、機能は自動フォールバックされる。
+try:
+    import rag_memory
+except Exception:  # 予期せぬ import 失敗でも本体は起動させる
+    rag_memory = None
 DEFAULT_CONTEXT_LIMIT = int(os.environ.get("LM_STUDIO_CONTEXT_LIMIT", "8200"))
 # キャラクター返答の生成待ち時間（秒）。返答が遅くて "timed out" になる場合はこの値を延ばす。
 LM_STUDIO_TIMEOUT = int(os.environ.get("LM_STUDIO_TIMEOUT", "300"))
@@ -2470,6 +2476,7 @@ def request_lmstudio(
     two_only_mode: bool = False,
     style_guide: str = "",
     generation_mode: str = DEFAULT_LM_GENERATION_MODE,
+    memory_block: str = "",
 ) -> tuple[str, str, str, int, list[dict[str, str]]]:
     if generation_mode not in LM_GENERATION_MODES:
         generation_mode = DEFAULT_LM_GENERATION_MODE
@@ -2495,6 +2502,18 @@ def request_lmstudio(
         if two_only_mode
         else ""
     )
+    # RAG で取り出した過去ログの差し込み枠。関係ある記憶だけ自然に織り込ませ、
+    # 無関係な古い記憶は無視させる指示をセットで与える（人格・文脈の統一性維持）。
+    memory_instruction = ""
+    if str(memory_block or "").strip():
+        memory_instruction = (
+            "\n\n【参考：過去の二人の会話の記憶】\n"
+            f"{str(memory_block).strip()}\n"
+            "上の記憶は、いまのユーザー発言に意味的に近い過去ログを類似度の高い順に並べた参考情報です。"
+            "現在の会話の文脈と明らかに関係がある記憶のみを自然に会話へ織り込み、"
+            "関係のない古い記憶は完全に無視してください。"
+            "記憶をそのまま列挙・引用したり「記憶によると」等のメタ発言をしたりしないでください。"
+        )
     # 感情の変化ごとにセグメント分割させる新モード。台詞禁止モード時は挙動維持のため
     # 従来の「返答全体で絵文字1つ」を使う。
     segmented_mode = auto_emoji and not no_dialogue
@@ -2563,7 +2582,8 @@ def request_lmstudio(
         f"{character_prompt.strip()}\n"
         f"{address_instruction}\n"
         f"{no_dialogue_instruction}\n"
-        f"{two_only_instruction}\n"
+        f"{two_only_instruction}"
+        f"{memory_instruction}\n"
         f"{length_instruction}"
         "思考過程は出さず、最終回答だけを出してください。/no_think"
         f"{emoji_instruction}"
@@ -3756,6 +3776,9 @@ class Handler(BaseHTTPRequestHandler):
                 generation_mode = DEFAULT_LM_GENERATION_MODE
             speaker_slot = "second" if str(body.get("speakerSlot") or "") == "second" else "main"
             speaker = str(body.get("speaker") or ("ルヴィア" if body.get("twoPlayerMode") else "リノン")).strip()
+            # RAG 長期記憶はキャラクター単位で分離する。フロントは characterId を送るが、
+            # 未指定の旧クライアント互換として speaker 名からも導出する。
+            character_id = safe_character_id(body.get("characterId") or speaker)
             if model == "__codex_queue__":
                 queued = enqueue_codex_inbox(
                     {
@@ -3850,6 +3873,25 @@ class Handler(BaseHTTPRequestHandler):
                 )
             raw_messages.append({"role": "user", "content": user_text})
             messages, context_stats = compact_messages_for_context(raw_messages, context_limit)
+            # RAG: 直近文脈（compact_messages_for_context）はそのまま活かしつつ、
+            # 意味的に近い過去ログを裏で top-k 抽出して参考枠として差し込む（併用）。
+            # 失敗時・ヒット0件時は memory_block を空にして従来動作へフォールバックする。
+            memory_block = ""
+            if rag_memory is not None:
+                try:
+                    recalled = rag_memory.recall_memory(
+                        character_id,
+                        user_text,
+                        slot=speaker_slot,
+                        recent_user_texts=[
+                            item.get("content")
+                            for item in raw_messages
+                            if item.get("role") == "user"
+                        ],
+                    )
+                    memory_block = rag_memory.build_memory_block(recalled)
+                except Exception:
+                    memory_block = ""
             reply, model_used, llm_emoji, chunk_limit, segments = request_lmstudio(
                 messages,
                 model,
@@ -3862,6 +3904,7 @@ class Handler(BaseHTTPRequestHandler):
                 two_only_mode=two_only_mode,
                 style_guide=style_guide,
                 generation_mode=generation_mode,
+                memory_block=memory_block,
             )
             # 合成部分（感情セグメント→TTS→結合）は /api/regenerate と共通の関数へ委譲する。
             render = render_reply_audio(
@@ -3951,6 +3994,22 @@ class Handler(BaseHTTPRequestHandler):
                     "segments": seg_meta,
                 }
             )
+            # RAG: 今回の 1 往復（ユーザー発言＋返答）を長期記憶へベクトル保存する。
+            # 失敗しても本処理は継続（純粋な追加レイヤーとして扱う）。
+            if rag_memory is not None and reply:
+                try:
+                    # 2人だけモードは user_text がお題/進行指示なので mode で区別し、
+                    # 想起時に「ユーザー」ではなく「お題＋話者名」で差し込ませる。
+                    rag_memory.save_memory(
+                        character_id,
+                        speaker_slot,
+                        user_text,
+                        reply,
+                        mode="two_only" if two_only_mode else "normal",
+                        speaker=speaker,
+                    )
+                except Exception:
+                    pass
             self.send_json(
                 200,
                 {

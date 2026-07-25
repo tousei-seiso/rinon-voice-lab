@@ -351,6 +351,8 @@ function activeStage(slot = defaultTurnSlot()) {
   const fallbackName = isSecond ? secondCharacterName : mainCharacterName;
   return {
     speaker: character?.name || fallbackName,
+    // RAG 長期記憶をキャラクター単位で分離するための安定した ID。
+    id: character?.id || (isSecond ? activeSecondCharacterId : activeMainCharacterId),
     slot: isSecond ? "second" : "main",
     systemPrompt: character?.systemPrompt || (isSecond ? secondSystemPrompt.value : systemPrompt.value),
     ttsCaption: character?.ttsCaption || (isSecond ? secondTtsCaption.value : ttsCaption.value),
@@ -1594,6 +1596,7 @@ async function sendChatTurn({
         llmGenerationMode: llmGenerationMode.value,
         speaker: stage.speaker,
         speakerSlot: stage.slot,
+        characterId: stage.id,
         systemPrompt: stage.systemPrompt,
         userAddress: userAddress.value,
         ttsCaption: stage.ttsCaption,

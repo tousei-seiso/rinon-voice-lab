@@ -1,0 +1,28 @@
+# ローカルRAG長期記憶（rag_memory.py）用の任意依存。
+#
+# 本体 app.py は従来どおり標準ライブラリのみで起動する。以下を入れると、
+# キャラクターごとの過去会話を意味検索して差し込む RAG 機能が有効になる。
+# 未インストールでも app.py は動作し、RAG は自動的に無効化される。
+#
+# rag_memory.py は「2系統バックエンド」で、環境に応じて自動選択する:
+#
+#   A) fastembed 方式（軽量・ONNX/CPU・torch不要） … 汎用・可搬性重視の環境向け
+#        python -m pip install -r requirements-rag.txt   # 下の fastembed 行
+#      ※ fastembed は onnxruntime を伴い protobuf>=4.25 を要求する。
+#        TTS スタック(descript-audiotools/dac 等の protobuf<3.20)と同一環境には
+#        入れられない点に注意。
+#
+#   B) transformers + torch 方式（CPU固定・VRAM不使用） … torch が既にある環境向け
+#      （例: Irodori-TTS の .venv は torch/transformers を同梱）。追加依存ゼロ・
+#       protobuf 競合なしで動く。fastembed が入っていなければ自動でこちらを使う。
+#        必要なら:  python -m pip install "transformers>=4.39" torch
+#
+# いずれの方式でも intfloat/multilingual-e5-small を初回のみ自動DL（CPU実行）。
+
+# --- A) fastembed 方式を使う場合はこの2行 ---
+fastembed>=0.3
+numpy>=1.24
+
+# --- B) transformers+torch 方式（torch 既存環境向け。必要時のみ有効化）---
+# transformers>=4.39
+# torch
