@@ -1315,6 +1315,31 @@ async function saveSession() {
   sessionStatus.textContent = `saved ${data.historyCount} turns`;
 }
 
+// 会話が1ターン追加されるたびに、手動 Save と同じ保存処理を静かに実行する。
+// フローを妨げないよう例外は握りつぶし、多重実行は直列化する（保存中に届いた要求は
+// 完了後にもう一度だけ走らせ、最新状態を取りこぼさない）。
+let autoSaveInFlight = null;
+let autoSavePending = false;
+function autoSaveSession() {
+  if (autoSaveInFlight) {
+    autoSavePending = true;
+    return;
+  }
+  autoSaveInFlight = (async () => {
+    try {
+      await saveSession();
+    } catch (error) {
+      sessionStatus.textContent = `auto-save error: ${error.message}`;
+    } finally {
+      autoSaveInFlight = null;
+      if (autoSavePending) {
+        autoSavePending = false;
+        autoSaveSession();
+      }
+    }
+  })();
+}
+
 async function loadSession(silent = false, preserveActiveCharacter = false) {
   const res = await fetch("/api/session");
   const data = await res.json();
@@ -1653,6 +1678,8 @@ async function sendChatTurn({
       // リロード後も注釈・meta 行・再生対象・再生成パラメータを復元するための表示用メタ（LM context には非影響）。
       display: { text: annotatedReply, meta: assistantMeta, audioUrl: primaryAudioUrl, regen },
     });
+    // 会話が1ターン追加されたので、Save ボタンを待たずに履歴を自動保存する。
+    autoSaveSession();
     lastAssistantSpeaker = data.speaker || stage.speaker;
     lastAssistantText = data.reply;
     updateContextUsage();
