@@ -39,7 +39,13 @@ _EMBED_MODEL_NAME = os.environ.get("RAG_EMBED_MODEL", "intfloat/multilingual-e5-
 # multilingual-e5-small の埋め込み次元。
 _EMBED_DIM = int(os.environ.get("RAG_EMBED_DIM", "384"))
 # 既定で差し込む過去ログの件数。
-DEFAULT_TOP_K = int(os.environ.get("RAG_TOP_K", "3"))
+# 注意: 既定 3 は小さすぎた。e5 はスコアが高域に圧縮され、感情的で長い往復が上位を
+# 占めやすいため、事実（作った料理など）を述べた往復はランキング 4〜8 位に沈みがち。
+# 実測（ruri 503件）で「作った料理」系の記憶は 4〜6 位に居り、k=3 では全て足切りされて
+# いた。列挙・想起の取りこぼしを防ぐため既定を 8 にする。文脈長／速度・オフトピックな
+# 感情記憶の混入が気になる環境は RAG_TOP_K で下げられる（ローカル LM なので API 課金は
+# 増えず、効くのは context 圧迫と速度のみ。実際に入る件数は min_score による上限内）。
+DEFAULT_TOP_K = int(os.environ.get("RAG_TOP_K", "8"))
 # cosine 類似度の下限。これ未満の記憶は「関係が薄い」として差し込まない。
 # 注意: multilingual-e5-small は無関係な文でも 0.75〜0.82 程度の高い cosine を
 # 返す（スコア分布が高域に圧縮される）モデル。実測では、明確に関係する料理の記憶
