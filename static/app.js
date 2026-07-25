@@ -109,7 +109,10 @@ let activeMainCharacterId = "rinon";
 let activeSecondCharacterId = "luvia";
 let editingCharacterId = "rinon";
 
+// 現在アクティブなメインキャラの作業用会話ログ。切替/保存の前に characterHistories へ退避する。
 const history = [];
+// メインキャラ ID をキーにしたキャラ別会話ログの退避先。
+const characterHistories = {};
 let queue = [];
 let interactionLocked = false;
 let autoMode = false;
@@ -1041,7 +1044,42 @@ async function saveCharacters() {
   sessionStatus.textContent = `saved ${data.characters?.length || 0} characters`;
 }
 
+// history エントリの浅いコピー（display はネストごと複製）。退避先での意図しない共有を防ぐ。
+function cloneHistoryEntry(entry) {
+  const copy = { role: entry.role, content: entry.content };
+  if (entry.display && typeof entry.display === "object") {
+    copy.display = { ...entry.display };
+  }
+  return copy;
+}
+
+// 現在の history を、アクティブなメインキャラのログとして characterHistories に退避する。
+function commitActiveHistory() {
+  characterHistories[activeMainCharacterId] = history.map(cloneHistoryEntry);
+}
+
+// メインキャラ切替時に、直前キャラのログを退避し、新キャラのログを画面へ復元する。
+function switchCharacterHistory(previousId, nextId) {
+  if (previousId) {
+    characterHistories[previousId] = history.map(cloneHistoryEntry);
+  }
+  // 再生中の音声とキューは会話単位でリセットする。
+  autoMode = false;
+  autoPending = false;
+  queue = [];
+  player.pause();
+  player.removeAttribute("src");
+  player.load();
+  selectedAudioUrl = "";
+  selectedMessageNode = null;
+  renderHistory(characterHistories[nextId] || []);
+  updateSelectionActions();
+  updateAutoControls();
+}
+
 function sessionPayload() {
+  // 保存前に現在の会話ログをアクティブキャラのログとして確定させる。
+  commitActiveHistory();
   return {
     settings: {
       systemPrompt: systemPrompt.value,
@@ -1071,7 +1109,7 @@ function sessionPayload() {
       emojiStyle: emojiStyleSelect.value,
       emojiCustom: emojiCustom.value,
     },
-    history,
+    histories: characterHistories,
   };
 }
 
@@ -1113,6 +1151,8 @@ function clearContext() {
   autoWebQuery = "";
   autoWebResults = [];
   history.length = 0;
+  // アクティブなメインキャラのログのみを消去する（他キャラのログは保持）。
+  characterHistories[activeMainCharacterId] = [];
   messagesEl.innerHTML = "";
   queue = [];
   player.pause();
@@ -1178,10 +1218,19 @@ function applySession(profile) {
   setSelectValue(emojiStyleSelect, settings.emojiStyle);
   emojiCustom.value = settings.emojiCustom || "";
   refreshEmojiInputs();
-  renderHistory(profile.history || []);
-  sessionStatus.textContent = profile.savedAt
-    ? `loaded ${profile.history?.length || 0} turns`
-    : "loaded";
+  // キャラ別ログを復元。旧フォーマット（単一 history）はアクティブキャラのログへ振り分ける。
+  for (const key of Object.keys(characterHistories)) delete characterHistories[key];
+  const histories = profile.histories && typeof profile.histories === "object" ? profile.histories : null;
+  if (histories) {
+    for (const [id, items] of Object.entries(histories)) {
+      if (Array.isArray(items)) characterHistories[id] = items.map(cloneHistoryEntry);
+    }
+  } else if (Array.isArray(profile.history) && profile.history.length) {
+    characterHistories[activeMainCharacterId] = profile.history.map(cloneHistoryEntry);
+  }
+  renderHistory(characterHistories[activeMainCharacterId] || []);
+  const activeCount = (characterHistories[activeMainCharacterId] || []).length;
+  sessionStatus.textContent = profile.savedAt ? `loaded ${activeCount} turns` : "loaded";
 }
 
 async function saveSession() {
@@ -1702,8 +1751,13 @@ document.addEventListener("keydown", (event) => {
   }
 });
 mainCharacterSelect.addEventListener("change", () => {
+  const previousId = activeMainCharacterId;
   activeMainCharacterId = mainCharacterSelect.value;
   syncActiveCharacterState();
+  if (previousId !== activeMainCharacterId) {
+    // メインキャラを変えたら、直前キャラのログを退避して新キャラのログへ切り替える。
+    switchCharacterHistory(previousId, activeMainCharacterId);
+  }
 });
 secondCharacterSelect.addEventListener("change", () => {
   activeSecondCharacterId = secondCharacterSelect.value;
@@ -1818,6 +1872,8 @@ saveAudioButton.addEventListener("click", async () => {
       body: JSON.stringify({
         url: currentUrl,
         label: twoPlayerMode.checked ? "2p" : "rinon",
+        // 保存音声をキャラクター別フォルダへ振り分けるためメインキャラ ID を送る。
+        characterId: activeMainCharacterId,
       }),
     });
     const data = await res.json();

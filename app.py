@@ -32,6 +32,8 @@ CHAT_LOG_PATH = LOG_ROOT / "chat.jsonl"
 EMOTION_LOG_PATH = LOG_ROOT / "chat_emotion.jsonl"
 PROFILE_ROOT = APP_ROOT / "profiles"
 SESSION_PROFILE_PATH = PROFILE_ROOT / "latest_session.json"
+# 会話ログはキャラクターごとにフォルダ分けして保存する（profiles/sessions/<charId>/history.json）。
+SESSION_HISTORY_ROOT = PROFILE_ROOT / "sessions"
 CHARACTER_PROFILE_PATH = PROFILE_ROOT / "characters.json"
 SAVED_AUDIO_ROOT = APP_ROOT / "saved_audio"
 USER_REFERENCE_ROOT = STATIC_ROOT / "reference" / "user_refs"
@@ -1275,41 +1277,63 @@ def sanitize_history(value: object) -> list[dict]:
     return history
 
 
-def save_session_profile(payload: dict) -> dict:
+def sanitize_histories(value: object) -> dict[str, list[dict]]:
+    """キャラクター ID をキーにした会話ログのマップを検証・整形する。"""
+    result: dict[str, list[dict]] = {}
+    if isinstance(value, dict):
+        for key, entries in value.items():
+            char_id = str(key or "").strip()
+            if not char_id:
+                continue
+            result[char_id] = sanitize_history(entries)
+    return result
+
+
+def safe_character_id(value: object, fallback: str = "rinon") -> str:
+    """キャラクター ID をフォルダ名に使える安全な文字列へ整形する。"""
+    cleaned = re.sub(r"[^0-9A-Za-z_-]+", "_", str(value or "").strip()).strip("_")
+    return cleaned[:64] or fallback
+
+
+def normalize_session_settings(settings: dict) -> dict:
+    settings = settings if isinstance(settings, dict) else {}
+    return {
+        "systemPrompt": str(settings.get("systemPrompt") or ""),
+        "mainCharacterName": str(settings.get("mainCharacterName") or "リノン"),
+        "secondCharacterName": str(settings.get("secondCharacterName") or "ルヴィア"),
+        "activeMainCharacterId": str(settings.get("activeMainCharacterId") or "rinon"),
+        "activeSecondCharacterId": str(settings.get("activeSecondCharacterId") or "luvia"),
+        "userAddress": str(settings.get("userAddress") or "あなた"),
+        "ttsCaption": str(settings.get("ttsCaption") or IRODORI_CAPTION),
+        "secondSystemPrompt": str(settings.get("secondSystemPrompt") or ""),
+        "secondTtsCaption": str(settings.get("secondTtsCaption") or IRODORI_CAPTION),
+        "referencePath": str(settings.get("referencePath") or IRODORI_REF_WAV),
+        "secondReferencePath": str(settings.get("secondReferencePath") or LUVIA_REF_WAV),
+        "contextLimit": int(settings.get("contextLimit") or DEFAULT_CONTEXT_LIMIT),
+        "model": str(settings.get("model") or DEFAULT_MODEL),
+        "steps": int(settings.get("steps") or 12),
+        "speechRate": str(settings.get("speechRate") or "normal"),
+        "replyLength": str(settings.get("replyLength") or "normal"),
+        "llmGenerationMode": str(settings.get("llmGenerationMode") or DEFAULT_LM_GENERATION_MODE),
+        "sendShortcut": str(settings.get("sendShortcut") or "enter"),
+        "ttsBackendMode": str(settings.get("ttsBackendMode") or "local"),
+        "secondTtsHost": str(settings.get("secondTtsHost") or ""),
+        "autoEmoji": bool(settings.get("autoEmoji", True)),
+        "webSearch": bool(settings.get("webSearch", False)),
+        "twoPlayerMode": bool(settings.get("twoPlayerMode", False)),
+        "twoOnlyMode": bool(settings.get("twoOnlyMode", False)),
+        "emojiStyle": str(settings.get("emojiStyle") or ""),
+        "emojiCustom": str(settings.get("emojiCustom") or ""),
+    }
+
+
+def write_session_settings(settings: dict) -> dict:
+    """グローバル設定（会話ログを含まない）を latest_session.json へ保存する。"""
     PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
-    settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
     profile = {
-        "version": 1,
+        "version": 3,
         "savedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "settings": {
-            "systemPrompt": str(settings.get("systemPrompt") or ""),
-            "mainCharacterName": str(settings.get("mainCharacterName") or "リノン"),
-            "secondCharacterName": str(settings.get("secondCharacterName") or "ルヴィア"),
-            "activeMainCharacterId": str(settings.get("activeMainCharacterId") or "rinon"),
-            "activeSecondCharacterId": str(settings.get("activeSecondCharacterId") or "luvia"),
-            "userAddress": str(settings.get("userAddress") or "あなた"),
-            "ttsCaption": str(settings.get("ttsCaption") or IRODORI_CAPTION),
-            "secondSystemPrompt": str(settings.get("secondSystemPrompt") or ""),
-            "secondTtsCaption": str(settings.get("secondTtsCaption") or IRODORI_CAPTION),
-            "referencePath": str(settings.get("referencePath") or IRODORI_REF_WAV),
-            "secondReferencePath": str(settings.get("secondReferencePath") or LUVIA_REF_WAV),
-            "contextLimit": int(settings.get("contextLimit") or DEFAULT_CONTEXT_LIMIT),
-            "model": str(settings.get("model") or DEFAULT_MODEL),
-            "steps": int(settings.get("steps") or 12),
-            "speechRate": str(settings.get("speechRate") or "normal"),
-            "replyLength": str(settings.get("replyLength") or "normal"),
-            "llmGenerationMode": str(settings.get("llmGenerationMode") or DEFAULT_LM_GENERATION_MODE),
-            "sendShortcut": str(settings.get("sendShortcut") or "enter"),
-            "ttsBackendMode": str(settings.get("ttsBackendMode") or "local"),
-            "secondTtsHost": str(settings.get("secondTtsHost") or ""),
-            "autoEmoji": bool(settings.get("autoEmoji", True)),
-            "webSearch": bool(settings.get("webSearch", False)),
-            "twoPlayerMode": bool(settings.get("twoPlayerMode", False)),
-            "twoOnlyMode": bool(settings.get("twoOnlyMode", False)),
-            "emojiStyle": str(settings.get("emojiStyle") or ""),
-            "emojiCustom": str(settings.get("emojiCustom") or ""),
-        },
-        "history": sanitize_history(payload.get("history")),
+        "settings": normalize_session_settings(settings),
     }
     SESSION_PROFILE_PATH.write_text(
         json.dumps(profile, ensure_ascii=False, indent=2),
@@ -1318,21 +1342,110 @@ def save_session_profile(payload: dict) -> dict:
     return profile
 
 
-def load_session_profile() -> dict:
-    if not SESSION_PROFILE_PATH.exists():
-        return {
-            "exists": False,
-            "path": str(SESSION_PROFILE_PATH),
-            "settings": {},
-            "history": [],
-        }
-    profile = json.loads(SESSION_PROFILE_PATH.read_text(encoding="utf-8"))
-    if not isinstance(profile, dict):
-        raise ValueError("saved profile is invalid")
-    profile["exists"] = True
-    profile["path"] = str(SESSION_PROFILE_PATH)
-    profile["history"] = sanitize_history(profile.get("history"))
+def write_character_history(char_id: str, entries: list[dict]) -> Path:
+    """1 キャラ分の会話ログを profiles/sessions/<charId>/history.json へ書き出す。"""
+    safe_id = safe_character_id(char_id)
+    char_dir = SESSION_HISTORY_ROOT / safe_id
+    char_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 2,
+        "savedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "characterId": str(char_id),
+        "history": sanitize_history(entries),
+    }
+    history_file = char_dir / "history.json"
+    history_file.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return history_file
+
+
+def read_character_histories() -> dict[str, list[dict]]:
+    """profiles/sessions/*/history.json をすべて読み込みキャラ別ログのマップを返す。"""
+    result: dict[str, list[dict]] = {}
+    if not SESSION_HISTORY_ROOT.exists():
+        return result
+    for char_dir in sorted(SESSION_HISTORY_ROOT.iterdir()):
+        if not char_dir.is_dir():
+            continue
+        history_file = char_dir / "history.json"
+        if not history_file.exists():
+            continue
+        try:
+            data = json.loads(history_file.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        char_id = str(data.get("characterId") or char_dir.name).strip() or char_dir.name
+        result[char_id] = sanitize_history(data.get("history"))
+    return result
+
+
+def save_session_profile(payload: dict) -> dict:
+    settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
+    active_main = str(settings.get("activeMainCharacterId") or "rinon")
+    histories = sanitize_histories(payload.get("histories"))
+    if not histories and isinstance(payload.get("history"), list):
+        # 旧クライアント互換: 単一 history はアクティブなメインキャラのログとして扱う。
+        legacy = sanitize_history(payload.get("history"))
+        if legacy:
+            histories = {active_main: legacy}
+    profile = write_session_settings(settings)
+    for char_id, entries in histories.items():
+        write_character_history(char_id, entries)
+    profile["histories"] = histories
     return profile
+
+
+def load_session_profile() -> dict:
+    settings: dict = {}
+    legacy_history: object = None
+    legacy_histories: object = None
+    profile_exists = SESSION_PROFILE_PATH.exists()
+    if profile_exists:
+        raw = json.loads(SESSION_PROFILE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("saved profile is invalid")
+        settings = raw.get("settings") if isinstance(raw.get("settings"), dict) else {}
+        # 旧フォーマットでは会話ログが settings と同じファイルに同居していた。
+        if isinstance(raw.get("histories"), dict):
+            legacy_histories = raw.get("histories")
+        elif isinstance(raw.get("history"), list):
+            legacy_history = raw.get("history")
+    active_main = str(settings.get("activeMainCharacterId") or "rinon")
+
+    # 新フォーマット: キャラ別フォルダから会話ログを読み込む。
+    histories = read_character_histories()
+
+    # 旧ログの自動振り分け: フォルダ側が空で、旧ファイルにログが残っている場合のみ移行する。
+    migrated = False
+    if not histories:
+        if isinstance(legacy_histories, dict):
+            histories = sanitize_histories(legacy_histories)
+            migrated = bool(histories)
+        elif isinstance(legacy_history, list):
+            legacy = sanitize_history(legacy_history)
+            if legacy:
+                # 単一ログは保存時のアクティブなメインキャラのログとして振り分ける。
+                histories = {active_main: legacy}
+                migrated = True
+
+    if migrated:
+        for char_id, entries in histories.items():
+            write_character_history(char_id, entries)
+        # 移行済みログを latest_session.json から取り除き、以降はフォルダ側を正とする。
+        if profile_exists:
+            write_session_settings(settings)
+
+    return {
+        "exists": profile_exists or bool(histories),
+        "path": str(SESSION_PROFILE_PATH),
+        "settings": settings,
+        "histories": histories,
+        "history": histories.get(active_main, []),
+    }
 
 
 def sanitize_reference_path(value: object, fallback: Path) -> Path:
@@ -1583,19 +1696,104 @@ def save_current_audio(payload: dict) -> dict:
     if not str(source_path).startswith(str(generated_root)) or not source_path.exists():
         raise FileNotFoundError("audio file was not found")
 
-    SAVED_AUDIO_ROOT.mkdir(parents=True, exist_ok=True)
+    # 保存音声もキャラクターごとのフォルダに振り分ける（saved_audio/<charId>/...）。
+    char_dir_name = safe_character_id(payload.get("characterId"))
+    audio_dir = SAVED_AUDIO_ROOT / char_dir_name
+    audio_dir.mkdir(parents=True, exist_ok=True)
     label = re.sub(r"[^0-9A-Za-z_-]+", "_", str(payload.get("label") or "rinon").strip())
     label = label.strip("_")[:40] or "rinon"
     saved_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{label}_{source_path.name}"
-    saved_path = SAVED_AUDIO_ROOT / saved_name
+    saved_path = audio_dir / saved_name
     shutil.copy2(source_path, saved_path)
     return {
         "ok": True,
         "path": str(saved_path),
-        "url": f"/saved_audio/{saved_name}",
+        "url": f"/saved_audio/{char_dir_name}/{saved_name}",
         "name": saved_name,
         "size": saved_path.stat().st_size,
     }
+
+
+def generated_name_from_saved(file_name: str) -> str:
+    """旧保存名 ``<日付>_<時刻>_<label>_<生成ファイル名>`` から生成ファイル名を取り出す。
+
+    保存音声は ``save_current_audio`` が ``f"{ts}_{label}_{source_path.name}"`` で命名する。
+    ``ts`` は ``%Y%m%d_%H%M%S``（アンダースコア1個）なので、先頭3トークン
+    （日付・時刻・label）を除いた残りが元の生成ファイル名（例: ``reply_..._combined.wav``）。
+    """
+    parts = file_name.split("_", 3)
+    return parts[3] if len(parts) >= 4 else ""
+
+
+def legacy_audio_label(file_name: str) -> str:
+    """旧保存名の label トークン（固定値 rinon / 2p 等）を取り出す。照合失敗時の保険用。"""
+    parts = file_name.split("_")
+    return parts[2] if len(parts) >= 3 else ""
+
+
+def build_audio_owner_index() -> dict[str, str]:
+    """各キャラのログに登録された音声ファイル名 → キャラ ID の対応表を作る。
+
+    ログの ``display.audioUrl`` は ``/generated/<生成ファイル名>`` を指す。この生成
+    ファイル名は保存音声のファイル名末尾にもそのまま含まれるため、これを突き合わせれば
+    旧保存音声がどのキャラの会話で生成されたものかを確定できる。
+    """
+    index: dict[str, str] = {}
+    for char_id, entries in read_character_histories().items():
+        for entry in entries:
+            display = entry.get("display") if isinstance(entry, dict) else None
+            if not isinstance(display, dict):
+                continue
+            url = str(display.get("audioUrl") or "")
+            if not url:
+                continue
+            base = Path(urlparse(url).path or url).name
+            if base:
+                index.setdefault(base, char_id)
+    return index
+
+
+def migrate_legacy_audio() -> int:
+    """saved_audio/ 直下の旧形式ファイルを、新形式（キャラ別フォルダ）へ複製する。
+
+    振り分け先は、キャラ別ログに登録された音声ファイル名との照合で確定する（確実）。
+    照合できないファイルのみ、旧ファイル名の label をフォールダ名にフォールバックする。
+    元ファイルはフォールバック配信用にその場へ残し、新形式の場所へ同名で複製する。
+    複製済みならスキップするため、起動のたびに呼んでも安全（冪等）。
+    """
+    if not SAVED_AUDIO_ROOT.exists():
+        return 0
+    owner_index = build_audio_owner_index()
+    copied = 0
+    for entry in sorted(SAVED_AUDIO_ROOT.iterdir()):
+        if not entry.is_file():
+            continue  # 既に振り分け済みのサブフォルダは対象外。
+        gen_name = generated_name_from_saved(entry.name)
+        # まずログ照合でキャラを確定。見つからなければ label をフォールバックに使う。
+        bucket = owner_index.get(gen_name) or legacy_audio_label(entry.name)
+        target_dir = SAVED_AUDIO_ROOT / safe_character_id(bucket)
+        target_path = target_dir / entry.name
+        if target_path.exists():
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(entry, target_path)
+        copied += 1
+    return copied
+
+
+def run_startup_migrations() -> None:
+    """起動時に、旧形式のログ・音声ファイルを新形式へ移行する。"""
+    try:
+        # 旧形式の会話ログ（latest_session.json 内）をキャラ別フォルダへ移行する。
+        load_session_profile()
+    except Exception as exc:  # 移行失敗は致命的ではないため起動は継続する。
+        print(f"[startup] session log migration skipped: {exc}", flush=True)
+    try:
+        copied = migrate_legacy_audio()
+        if copied:
+            print(f"[startup] migrated {copied} legacy audio file(s) into per-character folders", flush=True)
+    except Exception as exc:
+        print(f"[startup] audio migration skipped: {exc}", flush=True)
 
 
 def stop_irodori_ui_processes() -> list[dict[str, str | int]]:
@@ -3389,7 +3587,8 @@ class Handler(BaseHTTPRequestHandler):
         file_path = (STATIC_ROOT / rel).resolve()
         if parsed.path.startswith("/saved_audio/"):
             static_root = SAVED_AUDIO_ROOT.resolve()
-            file_path = (SAVED_AUDIO_ROOT / Path(unquote(parsed.path)).name).resolve()
+            rel_audio = Path(unquote(parsed.path.removeprefix("/saved_audio/")))
+            file_path = (SAVED_AUDIO_ROOT / rel_audio).resolve()
         if parsed.path.startswith("/Character/"):
             static_root = CHARACTER_ROOT.resolve()
             rel_character = Path(unquote(parsed.path.removeprefix("/Character/")))
@@ -3420,7 +3619,7 @@ class Handler(BaseHTTPRequestHandler):
                         "ok": True,
                         "path": str(SESSION_PROFILE_PATH),
                         "savedAt": profile["savedAt"],
-                        "historyCount": len(profile["history"]),
+                        "historyCount": sum(len(v) for v in profile["histories"].values()),
                     },
                 )
             except Exception as exc:
@@ -3777,6 +3976,7 @@ def main() -> None:
     STATIC_ROOT.mkdir(parents=True, exist_ok=True)
     (STATIC_ROOT / "generated").mkdir(parents=True, exist_ok=True)
     CHARACTER_ROOT.mkdir(parents=True, exist_ok=True)
+    run_startup_migrations()
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"Irodori LM Studio chat: http://{host}:{port}/", flush=True)
     httpd.serve_forever()
