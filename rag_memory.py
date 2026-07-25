@@ -307,11 +307,15 @@ def recall_memory(
     k: int = DEFAULT_TOP_K,
     *,
     slot: str | None = None,
+    mode: str | None = None,
     recent_user_texts: list | None = None,
     min_score: float = DEFAULT_MIN_SCORE,
 ) -> list[dict]:
     """現在のユーザー発言に意味的に近い過去ログを類似度順に上位 k 件返す。
 
+    ``slot`` を渡すとその話者スロット、``mode`` を渡すとその会話モード
+    （'normal' / 'two_only'）の記憶だけに絞り込む。1P 通常会話と 2P モードで
+    記憶が混ざらないよう、呼び出し側は現在のターンの mode を渡すこと。
     見つからない / DB が無い / モデル未導入 のいずれでも空リストを返す
     （呼び出し側は従来の文脈生成へフォールバックする）。
     """
@@ -332,21 +336,30 @@ def recall_memory(
         conn = sqlite3.connect(str(path), timeout=5.0)
         conn.execute("PRAGMA busy_timeout=5000")
         try:
-            # slot が指定された場合はその話者スロットの記憶だけを対象にする。
-            # 従来は slot 引数を受け取りながら SQL に反映しておらず、1P(main)/2P(second)
-            # の記憶が混ざって想起され、「誰が誰に対しての発言か」を取り違える一因に
-            # なっていた（backfill は全件 slot='main' で投入される点に注意）。
+            # slot / mode が指定された場合は、その話者スロット・会話モードの記憶だけを
+            # 対象にする。従来は両引数を受け取りながら SQL に反映しておらず、
+            #   ・1P(main)/2P(second) の記憶が混ざる（slot 未反映）
+            #   ・通常会話(normal)に「2人だけモード(two_only)」のお題が混ざる（mode 未反映）
+            # という取り違えが起きていた。特に mode 混在は、2P モードのお題として送った
+            # 「〇〇ラーメン」等が 1P 通常会話で「ユーザーが作った料理」として誤想起される
+            # 原因になっていた。1P 通常会話は normal のみ、2P モードは two_only のみを想起する。
+            # （backfill は全件 slot='main' / mode='normal' で投入される点に注意）。
+            conditions: list[str] = []
+            params: list[str] = []
             slot_key = str(slot or "").strip()
             if slot_key:
-                rows = conn.execute(
-                    "SELECT ts, user_text, reply_text, mode, speaker, embedding "
-                    "FROM memories WHERE slot = ?",
-                    (slot_key,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT ts, user_text, reply_text, mode, speaker, embedding FROM memories"
-                ).fetchall()
+                conditions.append("slot = ?")
+                params.append(slot_key)
+            mode_key = str(mode or "").strip()
+            if mode_key:
+                conditions.append("mode = ?")
+                params.append(mode_key)
+            where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+            rows = conn.execute(
+                "SELECT ts, user_text, reply_text, mode, speaker, embedding FROM memories"
+                + where,
+                params,
+            ).fetchall()
         finally:
             conn.close()
     except Exception:

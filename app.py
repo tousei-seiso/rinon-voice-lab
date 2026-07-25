@@ -3885,6 +3885,9 @@ class Handler(BaseHTTPRequestHandler):
                         character_id,
                         user_text,
                         slot=speaker_slot,
+                        # 2人だけモードのお題と 1P 通常会話の記憶が混ざらないよう、
+                        # 現在のターンと同じ会話モードの記憶だけを想起対象にする。
+                        mode="two_only" if two_only_mode else "normal",
                         recent_user_texts=[
                             item.get("content")
                             for item in raw_messages
