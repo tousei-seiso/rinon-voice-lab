@@ -14,6 +14,27 @@ Rinon Voice Lab connects:
 - Optional lightweight Web-search notes for LLM prompts
 - Optional 2P remote TTS on a second PC
 
+## Improvements over upstream
+
+This is a fork of [sakugetu/rinon-voice-lab](https://github.com/sakugetu/rinon-voice-lab),
+focused on higher-quality Japanese character speech and day-to-day usability.
+
+- **Emotion-aware acting** — per-emotion caption segmentation, one-utterance-per-segment
+  synthesis (fewer short-chunk artifacts), single/sustained vocal-effect emoji handling,
+  and per-character style guides & Num Steps to stop timbre drift.
+- **Stable timbre** — per-character CFG Scale (text/caption/speaker), a raised default
+  speaker CFG, and one fixed seed shared across all chunks of a reply.
+- **Better Japanese TTS** — English-to-kana normalization to prevent runaway output,
+  multiple kana dictionaries with an alkana fetch helper, and utf-8-sig (BOM) CSV loading.
+- **Robust LM Studio integration** — configurable timeout (300s), hardened JSON parsing,
+  json_schema structured output with safe fallback, assistant-prefill to avoid empty
+  replies, and selectable generation modes (prefill/original/quality_guard/unlimited).
+- **Single-file audio** — split Irodori output combined into one WAV, including correct
+  handling of IEEE-float (format 3) WAV via manual RIFF parsing.
+- **Usability** — selectable replies with targeted play/download/save, persisted
+  annotations across reloads, per-reply regenerate/delete, and per-character logs,
+  saved audio, and context limits.
+
 ## Screenshots / 画面モード
 
 ### 1P Mode / 1Pモード
