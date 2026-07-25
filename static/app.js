@@ -121,8 +121,10 @@ let queue = [];
 let interactionLocked = false;
 let autoMode = false;
 let autoPending = false;
-let autoNextSpeaker = mainCharacterName;
-let playbackSpeaker = mainCharacterName;
+// 発話の識別はキャラ名ではなくスロット（"main"=1P / "second"=2P）で行う。
+// 1P と 2P に同名キャラを割り当てても取り違えないようにするため。
+let autoNextSlot = "main";
+let playbackSlot = "main";
 let lastAssistantSpeaker = "";
 let lastAssistantText = "";
 // 現在選択中の返答テキストの音声 URL と、全再生に適用する再生速度。
@@ -317,14 +319,38 @@ function setSecondExpression(name) {
   );
 }
 
-function activeStage(speaker = "") {
+// スロットに対応するキャラ名を返す（表示・バックエンド送信・プロンプト文面用）。
+function characterNameForSlot(slot) {
+  return slot === "second" ? secondCharacterName : mainCharacterName;
+}
+
+// もう一方のスロットを返す（自動会話のターン交代・相手参照用）。
+function otherSlot(slot) {
+  return slot === "second" ? "main" : "second";
+}
+
+// 履歴テキストの話者名からスロットを推定する（再生成のフォールバック専用）。
+// 1P/2P 同名だと名前だけでは判別できないため、その場合は 1P を既定にする。
+function slotForSpeakerName(name) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return defaultTurnSlot();
+  if (trimmed === secondCharacterName && secondCharacterName !== mainCharacterName) return "second";
+  return "main";
+}
+
+// 引数なしで発話する既定スロット。2Pキャラモードのときは 2P、それ以外は 1P。
+function defaultTurnSlot() {
+  return twoPlayerMode.checked ? "second" : "main";
+}
+
+function activeStage(slot = defaultTurnSlot()) {
+  const isSecond = slot === "second";
   const mainCharacter = characterById(activeMainCharacterId);
   const secondCharacter = characterById(activeSecondCharacterId);
-  const activeSpeaker = speaker || (twoPlayerMode.checked ? secondCharacterName : mainCharacterName);
-  const isSecond = activeSpeaker === secondCharacterName;
   const character = isSecond ? secondCharacter : mainCharacter;
+  const fallbackName = isSecond ? secondCharacterName : mainCharacterName;
   return {
-    speaker: character?.name || activeSpeaker,
+    speaker: character?.name || fallbackName,
     slot: isSecond ? "second" : "main",
     systemPrompt: character?.systemPrompt || (isSecond ? secondSystemPrompt.value : systemPrompt.value),
     ttsCaption: character?.ttsCaption || (isSecond ? secondTtsCaption.value : ttsCaption.value),
@@ -337,8 +363,8 @@ function activeStage(speaker = "") {
   };
 }
 
-function setActiveSpeaker(speaker, preserveTwoPlayer = false) {
-  if (speaker === secondCharacterName) {
+function setActiveSpeaker(slot, preserveTwoPlayer = false) {
+  if (slot === "second") {
     twoPlayerMode.checked = true;
   } else if (!preserveTwoPlayer) {
     twoPlayerMode.checked = false;
@@ -346,18 +372,18 @@ function setActiveSpeaker(speaker, preserveTwoPlayer = false) {
   updateTwoPlayerMode();
 }
 
-function setStageStatus(text, speaker = "") {
-  const stage = activeStage(speaker);
-  speaking.textContent = stage.slot === "main" ? text : "ready";
-  secondSpeaking.textContent = stage.slot === "second" ? text : "standby";
+function setStageStatus(text, slot = defaultTurnSlot()) {
+  const isSecond = slot === "second";
+  speaking.textContent = isSecond ? "ready" : text;
+  secondSpeaking.textContent = isSecond ? text : "standby";
 }
 
-function setSpeakingState(active, speaker = "") {
-  const stage = activeStage(speaker);
-  document.body.classList.toggle("speaking-main", active && stage.slot === "main");
-  document.body.classList.toggle("speaking-second", active && stage.slot === "second");
-  portraitWrap.classList.toggle("is-speaking", active && stage.slot === "main");
-  secondPortraitWrap.classList.toggle("is-speaking", active && stage.slot === "second");
+function setSpeakingState(active, slot = defaultTurnSlot()) {
+  const isSecond = slot === "second";
+  document.body.classList.toggle("speaking-main", active && !isSecond);
+  document.body.classList.toggle("speaking-second", active && isSecond);
+  portraitWrap.classList.toggle("is-speaking", active && !isSecond);
+  secondPortraitWrap.classList.toggle("is-speaking", active && isSecond);
 }
 
 function addMessage(role, text, meta = "", options = {}) {
@@ -546,10 +572,6 @@ function updateAutoControls() {
   messageInput.readOnly = false;
 }
 
-function otherSpeaker(speaker) {
-  return speaker === mainCharacterName ? secondCharacterName : mainCharacterName;
-}
-
 function currentEmojiStyle() {
   return emojiCustom.value.trim() || emojiStyleSelect.value;
 }
@@ -631,7 +653,7 @@ function updateTwoPlayerMode() {
   }
   twoOnlyMode.disabled = !twoPlayerMode.checked;
   document.body.classList.toggle("two-player-mode", twoPlayerMode.checked);
-  updateAudioPan(playbackSpeaker);
+  updateAudioPan(playbackSlot);
   if (!interactionLocked) {
     speaking.textContent = "ready";
     secondSpeaking.textContent = twoPlayerMode.checked ? "ready" : "standby";
@@ -665,13 +687,13 @@ function unlockAudioPlayback() {
   }
 }
 
-function updateAudioPan(speaker = "") {
+function updateAudioPan(slot = defaultTurnSlot()) {
   if (!ensureAudioPanner()) return;
   if (!twoPlayerMode.checked) {
     stereoPanner.pan.value = 0;
     return;
   }
-  stereoPanner.pan.value = speaker === secondCharacterName ? 0.22 : -0.22;
+  stereoPanner.pan.value = slot === "second" ? 0.22 : -0.22;
 }
 
 function setSelectValue(select, value) {
@@ -730,8 +752,10 @@ function syncActiveCharacterState() {
   secondCharacterName = secondCharacter?.name || DEFAULT_SECOND_CHARACTER_NAME;
   mainReferencePath = mainCharacter?.referencePath || mainReferencePath;
   secondReferencePath = secondCharacter?.referencePath || secondReferencePath;
-  mainCharacterNameLabel.textContent = mainCharacterName;
-  secondCharacterNameLabel.textContent = secondCharacterName;
+  // 1P と 2P が同名だと左右の区別がつかないため、その場合だけ枠を併記する。
+  const sameName = mainCharacterName === secondCharacterName;
+  mainCharacterNameLabel.textContent = sameName ? `${mainCharacterName}（1P）` : mainCharacterName;
+  secondCharacterNameLabel.textContent = sameName ? `${secondCharacterName}（2P）` : secondCharacterName;
   systemPrompt.value = mainCharacter?.systemPrompt || systemPrompt.value;
   ttsCaption.value = mainCharacter?.ttsCaption || ttsCaption.value;
   secondSystemPrompt.value = secondCharacter?.systemPrompt || secondSystemPrompt.value;
@@ -1300,15 +1324,15 @@ async function loadSession(silent = false, preserveActiveCharacter = false) {
   applySession(data, preserveActiveCharacter);
 }
 
-function playQueue(items, speaker = activeStage().speaker, options = {}) {
-  const nextItems = [...items].map((item) => ({ ...item, speaker }));
+function playQueue(items, slot = activeStage().slot, options = {}) {
+  const nextItems = [...items].map((item) => ({ ...item, slot }));
   const isAudioActive = Boolean(player.currentSrc) && !player.paused && !player.ended;
   if (options.append && isAudioActive) {
     queue.push(...nextItems);
     return;
   }
   queue = options.append ? [...queue, ...nextItems] : nextItems;
-  playbackSpeaker = speaker;
+  playbackSlot = slot;
   if (queue.length === 0) {
     setInteractionLocked(false);
     return;
@@ -1316,8 +1340,8 @@ function playQueue(items, speaker = activeStage().speaker, options = {}) {
   playNext();
 }
 
-function hasBufferedOtherSpeaker(speaker) {
-  return queue.some((item) => (item.speaker || speaker) !== speaker);
+function hasBufferedOtherSlot(slot) {
+  return queue.some((item) => (item.slot || slot) !== slot);
 }
 
 function playNext() {
@@ -1334,8 +1358,8 @@ function playNext() {
     }
     return;
   }
-  playbackSpeaker = next.speaker || playbackSpeaker;
-  updateAudioPan(playbackSpeaker);
+  playbackSlot = next.slot || playbackSlot;
+  updateAudioPan(playbackSlot);
   let deferredNode = null;
   if (next.deferredMessage) {
     deferredNode = addMessage(
@@ -1345,23 +1369,23 @@ function playNext() {
       { audioUrl: next.deferredMessage.audioUrl || next.url || "", regen: next.deferredMessage.regen },
     );
   }
-  if (playbackSpeaker === mainCharacterName) {
-    setExpression(next.expression || "neutral");
-  } else if (playbackSpeaker === secondCharacterName) {
+  if (playbackSlot === "second") {
     setSecondExpression(next.expression || "neutral");
+  } else {
+    setExpression(next.expression || "neutral");
   }
-  setStageStatus("speaking", playbackSpeaker);
-  setSpeakingState(true, playbackSpeaker);
+  setStageStatus("speaking", playbackSlot);
+  setSpeakingState(true, playbackSlot);
   // 再生する返答を「現在選択中」にしてハイライトを同期する。
   // 分割音声（結合なし）で後続チャンク再生中は一致枠が無いので、現在の選択を維持する。
   loadAudioIntoPlayer(next.url, { autoplay: false });
   const playedNode = deferredNode || findMessageByAudioUrl(next.url);
   if (playedNode) highlightSelectedMessage(playedNode);
   player.play().catch(() => {
-    setStageStatus("tap play", playbackSpeaker);
+    setStageStatus("tap play", playbackSlot);
     setSpeakingState(false);
   });
-  if (autoMode && !autoPending && !hasBufferedOtherSpeaker(playbackSpeaker)) {
+  if (autoMode && !autoPending && !hasBufferedOtherSlot(playbackSlot)) {
     window.setTimeout(() => continueAutoConversation(), 0);
   }
 }
@@ -1376,21 +1400,21 @@ document.addEventListener("pointerdown", unlockAudioPlayback, { passive: true, o
 document.addEventListener("keydown", unlockAudioPlayback, { passive: true, once: true });
 document.addEventListener("touchstart", unlockAudioPlayback, { passive: true, once: true });
 
-function speakerForExternalEvent(event) {
+function slotForExternalEvent(event) {
   if (event.speakerSlot === "second") {
     if (!twoPlayerMode.checked) {
       twoPlayerMode.checked = true;
       updateTwoPlayerMode();
     }
-    return secondCharacterName;
+    return "second";
   }
-  return mainCharacterName;
+  return "main";
 }
 
 function handleExternalSpeakEvent(event) {
   const audios = Array.isArray(event.audios) ? event.audios : [];
   if (!audios.length) return;
-  const speaker = speakerForExternalEvent(event);
+  const slot = slotForExternalEvent(event);
   const timing = audios.map((item) => `${item.elapsed}s`).join(", ");
   const style = event.emojiStyle ? ` / style ${event.emojiStyle}` : "";
   const sourceSpeaker = event.speaker ? ` from ${event.speaker}` : "";
@@ -1412,7 +1436,7 @@ function handleExternalSpeakEvent(event) {
         },
       ]
     : audios;
-  playQueue(playItems, speaker, { append: true });
+  playQueue(playItems, slot, { append: true });
 }
 
 async function primeExternalSpeakEvents() {
@@ -1525,7 +1549,7 @@ async function refreshStatus() {
 async function sendChatTurn({
   message,
   visibleUserText = message,
-  speaker = activeStage().speaker,
+  slot = activeStage().slot,
   isAuto = false,
   allowWhileLocked = false,
   backgroundAuto = false,
@@ -1545,18 +1569,18 @@ async function sendChatTurn({
   if (!backgroundAuto) {
     messageInput.value = "";
   }
-  setActiveSpeaker(speaker, isAuto || autoMode);
+  const stage = activeStage(slot);
+  setActiveSpeaker(slot, isAuto || autoMode);
   if (!backgroundAuto) {
     setInteractionLocked(true, "Wait");
-    setStageStatus("thinking", speaker);
-    setSpeakingState(false, speaker);
-    if (speaker === mainCharacterName) setExpression("soft");
+    setStageStatus("thinking", slot);
+    setSpeakingState(false, slot);
+    if (slot === "main") setExpression("soft");
   } else {
-    sessionStatus.textContent = `auto thinking: ${speaker}`;
+    sessionStatus.textContent = `auto thinking: ${stage.speaker}`;
   }
 
   try {
-    const stage = activeStage(speaker);
     const res = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1588,7 +1612,7 @@ async function sendChatTurn({
         contextLimit: Number(contextLimit.value || 8200),
         emojiStyle: autoEmoji.checked ? "" : currentEmojiStyle(),
         autoEmoji: autoEmoji.checked,
-        webSearch: webSearchNow || (webSearch.checked && speaker === mainCharacterName && !isAuto),
+        webSearch: webSearchNow || (webSearch.checked && slot === "main" && !isAuto),
         webContext,
         webTopic,
         noDialogue: autoNoDialogue || wantsNoDialogue(text),
@@ -1622,11 +1646,11 @@ async function sendChatTurn({
     }
     history.push({
       role: "assistant",
-      content: `${data.speaker || speaker}: ${data.reply}`,
+      content: `${data.speaker || stage.speaker}: ${data.reply}`,
       // リロード後も注釈・meta 行・再生対象・再生成パラメータを復元するための表示用メタ（LM context には非影響）。
       display: { text: annotatedReply, meta: assistantMeta, audioUrl: primaryAudioUrl, regen },
     });
-    lastAssistantSpeaker = data.speaker || speaker;
+    lastAssistantSpeaker = data.speaker || stage.speaker;
     lastAssistantText = data.reply;
     updateContextUsage();
     if (Array.isArray(data.audios) && data.audios.length) {
@@ -1648,10 +1672,10 @@ async function sendChatTurn({
           deferredMessage: { reply: annotatedReply, meta: assistantMeta, audioUrl: primaryAudioUrl, regen },
         };
       }
-      playQueue(playItems, data.speaker || speaker, { append: backgroundAuto });
+      playQueue(playItems, stage.slot, { append: backgroundAuto });
     } else {
-      setStageStatus(data.codexQueued ? "codex queued" : "ready", data.speaker || speaker);
-      setSpeakingState(false, data.speaker || speaker);
+      setStageStatus(data.codexQueued ? "codex queued" : "ready", stage.slot);
+      setSpeakingState(false, stage.slot);
       if (!backgroundAuto && !interactionLocked) {
         setInteractionLocked(false);
       }
@@ -1661,7 +1685,7 @@ async function sendChatTurn({
     autoMode = false;
     autoPending = false;
     addMessage("assistant", `エラー: ${error.message}`);
-    setStageStatus("error", speaker);
+    setStageStatus("error", stage.slot);
     if (!backgroundAuto) {
       setInteractionLocked(false);
     }
@@ -1682,7 +1706,7 @@ composer.addEventListener("submit", async (event) => {
   await sendChatTurn({
     message: text,
     visibleUserText: text,
-    speaker: activeStage().speaker,
+    slot: activeStage().slot,
     isAuto: false,
   });
 });
@@ -1697,7 +1721,7 @@ async function startAutoConversation() {
   autoMode = true;
   autoPending = false;
   updateTwoPlayerMode();
-  autoNextSpeaker = mainCharacterName;
+  autoNextSlot = "main";
   lastAssistantSpeaker = "";
   lastAssistantText = "";
   autoTopic = topic;
@@ -1709,8 +1733,8 @@ async function startAutoConversation() {
   autoNoDialogue = wantsNoDialogue(topic);
   updateAutoControls();
   sessionStatus.textContent = "auto running";
-  const firstSpeaker = autoNextSpeaker;
-  autoNextSpeaker = otherSpeaker(firstSpeaker);
+  const firstSlot = autoNextSlot;
+  autoNextSlot = otherSlot(firstSlot);
   autoTurnCount += 1;
   const firstAutoMessage = autoNoDialogue
     ? `${twoOnlyGuidance()}${noDialogueGuidance()}お題: ${autoTopic}\nこれは2人の自動進行の第${autoTurnCount}ターンです。通常の会話として返さず、発声・吐息・擬音の強弱、間、苦しさ、気持ちよさの変化だけで少し展開してください。`
@@ -1718,7 +1742,7 @@ async function startAutoConversation() {
   await sendChatTurn({
     message: firstAutoMessage,
     visibleUserText: `お題: ${topic}`,
-    speaker: firstSpeaker,
+    slot: firstSlot,
     isAuto: true,
     webSearchNow: webSearch.checked,
     webTopic: topic,
@@ -1728,13 +1752,14 @@ async function startAutoConversation() {
 async function continueAutoConversation() {
   if (!autoMode || autoPending) return;
   autoPending = true;
-  const speaker = autoNextSpeaker;
-  autoNextSpeaker = otherSpeaker(speaker);
+  const slot = autoNextSlot;
+  autoNextSlot = otherSlot(slot);
   autoTurnCount += 1;
   const queuedTopic = consumeQueuedAutoTopic();
   const shouldRefreshWeb = Boolean(queuedTopic && webSearch.checked);
+  const speaker = characterNameForSlot(slot);
+  const partner = characterNameForSlot(otherSlot(slot));
   sessionStatus.textContent = queuedTopic ? `auto: ${speaker} / new topic` : `auto: ${speaker}`;
-  const partner = otherSpeaker(speaker);
   const previousLine = lastAssistantText
     ? `直前に${partner}がこう言いました。\n「${lastAssistantText}」\n`
     : "";
@@ -1750,7 +1775,7 @@ async function continueAutoConversation() {
     await sendChatTurn({
       message: nextAutoMessage,
       visibleUserText: "",
-      speaker,
+      slot,
       isAuto: true,
       allowWhileLocked: true,
       backgroundAuto: true,
@@ -1961,7 +1986,7 @@ function buildFallbackRegen(node) {
     }
   }
   if (!reply) return null;
-  const stage = activeStage(speakerName);
+  const stage = activeStage(slotForSpeakerName(speakerName));
   return {
     reply,
     segments: [],
