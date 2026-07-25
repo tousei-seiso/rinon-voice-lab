@@ -41,7 +41,14 @@ _EMBED_DIM = int(os.environ.get("RAG_EMBED_DIM", "384"))
 # 既定で差し込む過去ログの件数。
 DEFAULT_TOP_K = int(os.environ.get("RAG_TOP_K", "3"))
 # cosine 類似度の下限。これ未満の記憶は「関係が薄い」として差し込まない。
-DEFAULT_MIN_SCORE = float(os.environ.get("RAG_MIN_SCORE", "0.80"))
+# 注意: multilingual-e5-small は無関係な文でも 0.75〜0.82 程度の高い cosine を
+# 返す（スコア分布が高域に圧縮される）モデル。実測では、明確に関係する料理の記憶
+# ですら 0.79 前後になり、旧既定 0.80 だと本当に関係する記憶まで足切りされていた。
+# しかも recall は降順走査で「最初に閾値を割った時点で break」するため、途中に
+# 0.80 未満の 1 件があると、それ以降の関連記憶がまとめて捨てられていた。
+# → 取りこぼしを防ぐため 0.75 を既定にする。ノイズ混入は top-k と LLM 側の
+#    織り込み指示で抑える。RAG_MIN_SCORE を上げると想起率は下がる（本末転倒）ので注意。
+DEFAULT_MIN_SCORE = float(os.environ.get("RAG_MIN_SCORE", "0.75"))
 # 1 レコードあたりのプロンプト表示上限（文脈肥大の防止）。
 _SNIPPET_LIMIT = int(os.environ.get("RAG_SNIPPET_LIMIT", "140"))
 
@@ -319,9 +326,21 @@ def recall_memory(
         conn = sqlite3.connect(str(path), timeout=5.0)
         conn.execute("PRAGMA busy_timeout=5000")
         try:
-            rows = conn.execute(
-                "SELECT ts, user_text, reply_text, mode, speaker, embedding FROM memories"
-            ).fetchall()
+            # slot が指定された場合はその話者スロットの記憶だけを対象にする。
+            # 従来は slot 引数を受け取りながら SQL に反映しておらず、1P(main)/2P(second)
+            # の記憶が混ざって想起され、「誰が誰に対しての発言か」を取り違える一因に
+            # なっていた（backfill は全件 slot='main' で投入される点に注意）。
+            slot_key = str(slot or "").strip()
+            if slot_key:
+                rows = conn.execute(
+                    "SELECT ts, user_text, reply_text, mode, speaker, embedding "
+                    "FROM memories WHERE slot = ?",
+                    (slot_key,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT ts, user_text, reply_text, mode, speaker, embedding FROM memories"
+                ).fetchall()
         finally:
             conn.close()
     except Exception:
