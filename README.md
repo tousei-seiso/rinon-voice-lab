@@ -11,6 +11,7 @@ Rinon Voice Lab connects:
 - Irodori-TTS VoiceDesign speech generation
 - Editable 1P/2P character profiles
 - Character portraits and expression variants
+- Local CPU long-term memory (RAG) with auto-saved chat history
 - Optional lightweight Web-search notes for LLM prompts
 - Optional 2P remote TTS on a second PC
 
@@ -41,6 +42,17 @@ focused on higher-quality Japanese character speech and day-to-day usability.
   transformers+torch), stored per-character in SQLite. Existing logs/histories are left
   untouched and it degrades gracefully when the optional deps are absent. A one-shot
   backfill script (`tools/backfill_rag_memory.py`) imports existing histories.
+- **Sharper recall** — retrieval is filtered by conversation mode (1P vs 2P) and speaker
+  slot so 2P topics don't leak into 1P chats; the raw message is rewritten by the LLM into
+  a focused search query (drops filler and negated/excluded terms, keeps the action's
+  subject/object, and falls back to the user as subject when it is omitted); enumeration
+  questions ("list them all") fan out into several queries whose results are merged, and
+  are listed exhaustively only when explicitly asked; and near-duplicate collapse plus
+  `top_k`/`min_score` tuning keep context-dropped memories in reach. Rebuild/diagnose
+  helpers: `tools/rebuild_from_chatlog.py`, `tools/diagnose_recall.py`.
+- **History foundation** — session history auto-saves on every turn (conversation mode,
+  speaker, and timestamp preserved), and speakers are keyed by slot (1P=main / 2P=second)
+  so same-named 1P/2P characters never get mixed up in logs or recall.
 
 ## Screenshots / 画面モード
 
@@ -186,6 +198,14 @@ Useful environment variables:
 | `IRODORI_MODEL_PRECISION` | `auto` | Model precision: `auto`, `fp32`, or `bf16` |
 | `IRODORI_CODEC_DEVICE` | `auto` | Codec device, usually the same as the model device |
 | `IRODORI_CODEC_PRECISION` | `auto` | Codec precision. macOS uses `fp32` |
+| `RAG_MEMORY_ENABLED` | `1` | Enable RAG long-term memory (`0` to disable) |
+| `RAG_EMBED_MODEL` | `intfloat/multilingual-e5-small` | Embedding model |
+| `RAG_RECALL_TOP_K` | `16` | Max memories recalled per message |
+| `RAG_RECALL_MIN_SCORE` | `0.75` | Recall similarity threshold |
+| `RAG_RECALL_DEDUP` | `1` | Collapse near-duplicate memories (`0` to disable) |
+| `RAG_QUERY_REWRITE` | `1` | LLM rewrite of the recall query (`0` uses the raw text) |
+| `RAG_QUERY_REWRITE_MODE` | empty | Generation mode for the rewrite (empty follows the chat; `prefill` is faster) |
+| `RAG_QUERY_REWRITE_MULTI` | `3` | Max recall queries generated for enumeration asks (`1` = single) |
 
 ## Character Data
 

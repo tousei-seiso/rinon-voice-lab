@@ -7,7 +7,8 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
 - LM Studio の OpenAI互換ローカルAPIと連携
 - Irodori-TTS VoiceDesign による日本語音声生成
 - 1P/2P キャラクターの設定、名前、TTS Caption、表情画像を編集
-- 会話ログ、セッション、キャラクターデータの保存と読み込み
+- 会話ログ、セッション、キャラクターデータの保存と読み込み（1ターンごとに自動保存）
+- ローカルCPUで動く RAG 長期記憶（過去会話の意味検索）
 - 簡易Web検索メモをLLMプロンプトへ追加
 - 2P音声だけを別PCの Irodori-TTS へ送るリモートTTSモード
 
@@ -65,6 +66,17 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
 - 埋め込みは `intfloat/multilingual-e5-small` を**完全CPU実行（VRAM不使用）**。fastembed(ONNX) または transformers+torch の2系統を環境に応じて自動選択
 - 記憶はキャラクターごとに SQLite 保存。既存のログ・履歴には一切手を加えず、依存が未導入なら自動で無効化（従来動作を維持）
 - 「2人だけモード」の記憶は「お題＋話者名」で想起。既存履歴の一括投入スクリプト（`tools/backfill_rag_memory.py`）付き
+- 想起の的中率を高める作り込み:
+  - 会話モード（1P通常／2人だけモード）と話者スロットで想起を絞り込み、2Pのお題が1P会話へ漏れ出すのを防止
+  - ユーザー発話をそのまま検索せず、LLM で焦点を絞った検索クエリへ書き換え（挨拶・依頼の枕詞を除去、「〜以外」などの否定語を排除、行為の主体・客体を保持し、主語省略時のみユーザーを主体に補完）
+  - 「全部挙げて」等の列挙・網羅質問では観点違いの複数クエリを生成して和集合で取得し、ユーザーが明示的に求めたときだけ記憶を漏れなく列挙
+  - 近重複の集約、`top_k` / `min_score` の調整、圧縮後コンテキスト基準の重複除去により、長い履歴で文脈から溢れた過去も取りこぼさない
+- 再構築・診断ツール: `tools/rebuild_from_chatlog.py`（`logs/chat.jsonl` を正本に履歴と記憶DBを元の時刻付きで再生成）、`tools/diagnose_recall.py`（想起スコアを一覧して当たり外れを診断）
+
+### 9. 会話履歴の自動保存と話者識別
+- 会話が1ターン進むごとにセッション履歴を自動保存（明示保存を待たずに復元できる）
+- 履歴に会話モード・話者・タイムスタンプを保持し、オートセーブでもモードを取り違えない
+- 話者をスロット（1P=main／2P=second）で識別し、1Pと2Pで同名のキャラクターでも記録・想起が混ざらない
 
 ## 画面モード
 
@@ -204,6 +216,14 @@ Irodori-TTS の依存関係は次のどちらかで入れてください。
 | `IRODORI_MODEL_PRECISION` | `auto` | モデル精度。`auto`, `fp32`, `bf16` |
 | `IRODORI_CODEC_DEVICE` | `auto` | codec 実行デバイス。通常はモデルと同じ |
 | `IRODORI_CODEC_PRECISION` | `auto` | codec 精度。macOS では `fp32` |
+| `RAG_MEMORY_ENABLED` | `1` | RAG長期記憶の有効化（`0`で無効・従来動作） |
+| `RAG_EMBED_MODEL` | `intfloat/multilingual-e5-small` | 埋め込みモデル |
+| `RAG_RECALL_TOP_K` | `16` | 1発言あたり想起する記憶の最大件数 |
+| `RAG_RECALL_MIN_SCORE` | `0.75` | 想起の類似度しきい値 |
+| `RAG_RECALL_DEDUP` | `1` | 近重複記憶の集約（`0`で無効） |
+| `RAG_QUERY_REWRITE` | `1` | 検索クエリのLLM書き換え（`0`で無効・原文検索） |
+| `RAG_QUERY_REWRITE_MODE` | （空） | 書き換えLLMの生成モード（空でチャットに追従。重ければ `prefill`） |
+| `RAG_QUERY_REWRITE_MULTI` | `3` | 列挙質問で生成する検索クエリの最大本数（`1`で単一） |
 
 ## キャラクターデータ
 
