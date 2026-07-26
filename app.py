@@ -2468,9 +2468,17 @@ _QUERY_REWRITE_ENABLED = os.environ.get("RAG_QUERY_REWRITE", "1").strip().lower(
     "",
 }
 _QUERY_REWRITE_MAXTOK = int(os.environ.get("RAG_QUERY_REWRITE_MAXTOK", "64"))
+# 書き換えLLM呼び出しの生成モード。空ならチャットと同じ generation_mode に追従する。
+# 例: 品質最優先(unlimited)でチャットしつつ、書き換えだけ prefill で高速化したいとき指定。
+_QUERY_REWRITE_MODE = os.environ.get("RAG_QUERY_REWRITE_MODE", "").strip().lower()
 
 
-def rewrite_recall_query(user_text: str, recent_context: str = "", model: str | None = None) -> str:
+def rewrite_recall_query(
+    user_text: str,
+    recent_context: str = "",
+    model: str | None = None,
+    generation_mode: str = "",
+) -> str:
     """ユーザー発話から、RAG 想起用に焦点を絞った検索クエリを LLM で生成する。
 
     生の会話発話は挨拶・相槌・依頼の枕詞などの雑音が多く、意味検索（e5）の精度が落ちる
@@ -2504,8 +2512,22 @@ def rewrite_recall_query(user_text: str, recent_context: str = "", model: str | 
         "max_tokens": _QUERY_REWRITE_MAXTOK,
         "stream": False,
     }
+    # 生成モードごとに content 取得の作法が異なる（思考ONの unlimited/quality_guard は
+    # 思考を完走させて content を埋め、prefill は空白assistantで思考を抑止、original は
+    # そのまま＝思考モデルでは空になり得る）。プリフィルを直に付けると unlimited 等の
+    # 思考ONモードと競合するため、通常チャットと同じ _request_lmstudio_content に委譲して
+    # 現在のモードへ追従する。RAG_QUERY_REWRITE_MODE で上書き可。
+    rewrite_mode = _QUERY_REWRITE_MODE or str(generation_mode or "").strip().lower()
+    if rewrite_mode not in LM_GENERATION_MODES:
+        rewrite_mode = DEFAULT_LM_GENERATION_MODE
     try:
-        data = _post_lmstudio_chat(payload, False)
+        data = _request_lmstudio_content(
+            payload,
+            segmented_mode=False,
+            auto_emoji=False,
+            base_max_tokens=_QUERY_REWRITE_MAXTOK,
+            mode=rewrite_mode,
+        )
         content = str(data["choices"][0]["message"].get("content") or "").strip()
     except Exception:
         return ""
@@ -4014,7 +4036,9 @@ class Handler(BaseHTTPRequestHandler):
                         if _m.get("role") == "assistant":
                             recent_ctx = compact_text(_m.get("content"), 200)
                             break
-                    recall_query = rewrite_recall_query(user_text, recent_ctx, model=model) or user_text
+                    recall_query = rewrite_recall_query(
+                        user_text, recent_ctx, model=model, generation_mode=generation_mode
+                    ) or user_text
                     if recall_query != user_text:
                         print(f"[rag] recall query rewritten -> {compact_text(recall_query, 80)}")
                     recalled = rag_memory.recall_memory(
