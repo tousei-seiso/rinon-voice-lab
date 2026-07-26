@@ -2476,8 +2476,12 @@ _QUERY_REWRITE_MODE = os.environ.get("RAG_QUERY_REWRITE_MODE", "").strip().lower
 # 1 なら従来どおり単一クエリ。和集合は同一記憶を最高スコアで重複除去してから top_k で切る。
 _QUERY_REWRITE_MULTI = max(1, int(os.environ.get("RAG_QUERY_REWRITE_MULTI", "3")))
 # 想起の件数/閾値の独立ノブ（tools/diagnose_recall.py で実測してから調整する用）。
-# 既定は rag_memory 側の既定と同値なので、環境変数を指定しない限り挙動は変わらない。
-_RECALL_TOP_K = int(os.environ.get("RAG_RECALL_TOP_K", "8"))
+# top_k=12: 実測で e5 のスコアは 0.78〜0.88 の狭帯に圧縮され、料理系の記憶が団子状態で
+# 30 件すべて min_score(0.75) 以上だった。つまり閾値ではなく件数が律速で、8 枠では列挙質問
+# の実料理（塩じゃけ/シソ餃子/かつおのたたき等）が圏外へこぼれる。全件が高スコアなので枠を
+# 広げても品質は落ちない。min_score は下げても無意味（閾値未満の除外料理は存在しない）ため
+# 0.75 据え置き。いずれも RAG_RECALL_TOP_K / RAG_RECALL_MIN_SCORE で上書き可。
+_RECALL_TOP_K = int(os.environ.get("RAG_RECALL_TOP_K", "12"))
 _RECALL_MIN_SCORE = float(os.environ.get("RAG_RECALL_MIN_SCORE", "0.75"))
 
 
