@@ -2459,6 +2459,66 @@ def _post_lmstudio_chat(payload: dict, use_structured: bool) -> dict:
         raise
 
 
+# RAG 想起クエリの LLM 書き換え設定（環境変数で調整可）。
+_QUERY_REWRITE_ENABLED = os.environ.get("RAG_QUERY_REWRITE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+_QUERY_REWRITE_MAXTOK = int(os.environ.get("RAG_QUERY_REWRITE_MAXTOK", "64"))
+
+
+def rewrite_recall_query(user_text: str, recent_context: str = "", model: str | None = None) -> str:
+    """ユーザー発話から、RAG 想起用に焦点を絞った検索クエリを LLM で生成する。
+
+    生の会話発話は挨拶・相槌・依頼の枕詞などの雑音が多く、意味検索（e5）の精度が落ちる
+    （例:「それじゃ早速声を聞かせて…質問です…讃岐うどん…作った料理を挙げて」だと、料理
+    より前置きや讃岐うどんに埋め込みが引っ張られる）。ここで話題の核だけを短いクエリへ
+    書き換えてから recall する。失敗・空・無効化時は空文字を返し、呼び出し側は原文へ
+    フォールバックする（RAG は純粋な追加レイヤーなので、この経路が転んでも会話は継続）。
+    """
+    user_text = str(user_text or "").strip()
+    if not _QUERY_REWRITE_ENABLED or not user_text:
+        return ""
+    system = (
+        "あなたは検索クエリ生成器です。ユーザーの発話から、過去の会話ログを意味検索する"
+        "ための短い日本語クエリだけを出力します。挨拶・相槌・依頼の枕詞（例:『声を聞かせて』"
+        "『質問です』『思いつくだけ挙げて』）は捨て、知りたい事柄の核（名詞・動詞・固有名詞）"
+        "だけを2〜12語ほど空白区切りで並べてください。説明・引用符・記号・箇条書き・思考は"
+        "出さず、クエリ本文だけを1行で返してください。/no_think"
+    )
+    parts: list[str] = []
+    if str(recent_context or "").strip():
+        parts.append(f"直近の文脈（背景・参考）:\n{str(recent_context).strip()}")
+    parts.append(f"ユーザー発話:\n{user_text}")
+    parts.append("検索クエリ:")
+    payload = {
+        "model": model or DEFAULT_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "\n\n".join(parts)},
+        ],
+        "temperature": 0.0,
+        "max_tokens": _QUERY_REWRITE_MAXTOK,
+        "stream": False,
+    }
+    try:
+        data = _post_lmstudio_chat(payload, False)
+        content = str(data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        return ""
+    if not content:
+        return ""
+    # 1 行へ畳み、先に「検索クエリ:」等のラベルを剥がしてから囲みの引用符/かぎ括弧を除く
+    # （順序が逆だとラベルに守られて先頭の「が残る）。
+    content = content.splitlines()[0].strip()
+    content = re.sub(r"^(検索クエリ|クエリ|query)\s*[:：]\s*", "", content, flags=re.IGNORECASE).strip()
+    content = content.strip("「」『』\"'`  ").strip()
+    return content
+
+
 def _thinking_prefill(segmented_mode: bool, auto_emoji: bool) -> tuple[str, str]:
     """思考(reasoning)を抑止するためのアシスタント・プリフィルを返す。
 
@@ -3945,9 +4005,21 @@ class Handler(BaseHTTPRequestHandler):
             memory_block = ""
             if rag_memory is not None:
                 try:
+                    # 生発話は会話的な雑音（挨拶・枕詞）が多く意味検索の精度が落ちるため、
+                    # LLM で焦点を絞った検索クエリへ書き換えてから recall する。直近の
+                    # assistant 発話を背景に渡し、「他には？」等の follow-up も解決させる。
+                    # 失敗・空なら原文へフォールバック（RAG は純粋な追加レイヤー）。
+                    recent_ctx = ""
+                    for _m in reversed(messages):
+                        if _m.get("role") == "assistant":
+                            recent_ctx = compact_text(_m.get("content"), 200)
+                            break
+                    recall_query = rewrite_recall_query(user_text, recent_ctx, model=model) or user_text
+                    if recall_query != user_text:
+                        print(f"[rag] recall query rewritten -> {compact_text(recall_query, 80)}")
                     recalled = rag_memory.recall_memory(
                         character_id,
-                        user_text,
+                        recall_query,
                         slot=speaker_slot,
                         # 2人だけモードのお題と 1P 通常会話の記憶が混ざらないよう、
                         # 現在のターンと同じ会話モードの記憶だけを想起対象にする。
