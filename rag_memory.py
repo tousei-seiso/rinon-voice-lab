@@ -253,6 +253,7 @@ def save_memory(
     reply_text: str,
     mode: str = "normal",
     speaker: str = "",
+    ts: str = "",
 ) -> bool:
     """1 往復（ユーザー発言＋返答）をベクトル化して Chroma ではなく sqlite へ保存する。
 
@@ -270,6 +271,8 @@ def save_memory(
         return False
     mode = "two_only" if str(mode or "").strip() == "two_only" else "normal"
     speaker = str(speaker or "").strip()
+    # 元会話の時刻を渡せる（backfill/再構築で使う）。未指定なら保存時刻を刻む。
+    ts = str(ts or "").strip() or time.strftime("%Y-%m-%dT%H:%M:%S%z")
     # 埋め込み本文のラベルも世界観に合わせる（2人だけモードはユーザー概念が無い）。
     stimulus_label = "お題" if mode == "two_only" else "ユーザー"
     reply_label = speaker if (mode == "two_only" and speaker) else "返答"
@@ -285,7 +288,7 @@ def save_memory(
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(slot or "main"),
-                    time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    ts,
                     user_text,
                     reply_text,
                     mode,

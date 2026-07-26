@@ -1276,6 +1276,9 @@ def sanitize_history(value: object) -> list[dict]:
         speaker = str(item.get("speaker") or "").strip()
         if speaker:
             entry["speaker"] = speaker
+        ts = str(item.get("ts") or "").strip()
+        if ts:
+            entry["ts"] = ts
         # アシスタント返答は、リロード後も注釈（感情キャプション）・meta 行・再生対象を
         # 復元できるよう表示用メタを保持する。LM context（content）とは別物で、
         # /api/chat の文脈生成では無視される。
@@ -1397,8 +1400,13 @@ def _prior_mode_map(history_file: Path) -> dict[tuple[str, str], tuple[str, str]
             key = (str(item.get("role") or ""), str(item.get("content") or "").strip())
             mode = str(item.get("mode") or "").strip()
             speaker = str(item.get("speaker") or "").strip()
-            if mode in {"normal", "two_only"} or speaker:
-                result[key] = (mode if mode in {"normal", "two_only"} else "", speaker)
+            ts = str(item.get("ts") or "").strip()
+            if mode in {"normal", "two_only"} or speaker or ts:
+                result[key] = (
+                    mode if mode in {"normal", "two_only"} else "",
+                    speaker,
+                    ts,
+                )
     return result
 
 
@@ -1420,11 +1428,13 @@ def write_character_history(char_id: str, entries: list[dict]) -> Path:
             saved = prior.get(key)
             if not saved:
                 continue
-            saved_mode, saved_speaker = saved
+            saved_mode, saved_speaker, saved_ts = saved
             if saved_mode and "mode" not in entry:
                 entry["mode"] = saved_mode
             if saved_speaker and "speaker" not in entry:
                 entry["speaker"] = saved_speaker
+            if saved_ts and "ts" not in entry:
+                entry["ts"] = saved_ts
 
     payload = {
         "version": 2,
