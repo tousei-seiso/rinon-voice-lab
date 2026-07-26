@@ -2476,13 +2476,25 @@ _QUERY_REWRITE_MODE = os.environ.get("RAG_QUERY_REWRITE_MODE", "").strip().lower
 # 1 なら従来どおり単一クエリ。和集合は同一記憶を最高スコアで重複除去してから top_k で切る。
 _QUERY_REWRITE_MULTI = max(1, int(os.environ.get("RAG_QUERY_REWRITE_MULTI", "3")))
 # 想起の件数/閾値の独立ノブ（tools/diagnose_recall.py で実測してから調整する用）。
-# top_k=12: 実測で e5 のスコアは 0.78〜0.88 の狭帯に圧縮され、料理系の記憶が団子状態で
-# 30 件すべて min_score(0.75) 以上だった。つまり閾値ではなく件数が律速で、8 枠では列挙質問
-# の実料理（塩じゃけ/シソ餃子/かつおのたたき等）が圏外へこぼれる。全件が高スコアなので枠を
-# 広げても品質は落ちない。min_score は下げても無意味（閾値未満の除外料理は存在しない）ため
-# 0.75 据え置き。いずれも RAG_RECALL_TOP_K / RAG_RECALL_MIN_SCORE で上書き可。
-_RECALL_TOP_K = int(os.environ.get("RAG_RECALL_TOP_K", "12"))
+# top_k=16: 実測で e5 のスコアは 0.78〜0.88 の狭帯に圧縮され、料理系の記憶が団子状態で
+# 30 件すべて min_score(0.75) 以上だった。つまり閾値ではなく件数が律速で、枠が狭いと列挙
+# 質問の実料理（塩じゃけ/シソ餃子/かつおのたたき等）が圏外へこぼれる。全件が高スコアなので
+# 枠を広げても品質は落ちない（近重複は _recall_dup_signature で畳んでから切るため水増しも
+# 起きない）。min_score は下げても無意味（閾値未満の除外料理は存在しない）ため 0.75 据え置き。
+# いずれも RAG_RECALL_TOP_K / RAG_RECALL_MIN_SCORE で上書き可。
+_RECALL_TOP_K = int(os.environ.get("RAG_RECALL_TOP_K", "16"))
 _RECALL_MIN_SCORE = float(os.environ.get("RAG_RECALL_MIN_SCORE", "0.75"))
+
+
+def _recall_dup_signature(mem: dict) -> str:
+    """近重複を畳むための集約キー。同一シーンの記録（同じプロンプトが再生成・繰り返し
+    プレイで別 ts に複数）を 1 つにまとめるため、user_text（無ければ reply_text）から
+    空白・記号を除いた先頭 32 文字を署名にする。異なる料理は先頭が変わるので畳まれない
+    （例:「今日は米のご飯と塩じゃけ…」の重複だけを集約し、麻辣麻婆とゴーヤ麻婆は別扱い）。"""
+    text = str(mem.get("user_text") or "").strip() or str(mem.get("reply_text") or "")
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[、。！？!?…・,.\"'`「」『』（）()]", "", text)
+    return text[:32] or str(mem.get("ts") or "")
 
 
 def rewrite_recall_queries(
@@ -2517,7 +2529,10 @@ def rewrite_recall_queries(
         "（意味検索は否定を表現できず、その語に検索が引きずられて逆効果になるため）。\n"
         f"・「全部」「他には」「いくつも」等、網羅・列挙を求める発話では、観点や言い換えを"
         f"変えたクエリを 1 行 1 本で最大 {n} 行まで出す（例: 料理なら 1 行目『作った 料理 献立』、"
-        "2 行目『夕飯 おかず 手料理』のように角度を変える）。単純な質問なら 1 行でよい。\n"
+        "2 行目『夕飯 おかず 手料理』、3 行目『和食 中華 手料理』のように角度を変える）。"
+        "会話ログは日常の場面なので、抽象的な総称語（一覧・メニュー・レシピ・カテゴリ等）は"
+        "使わず、日常の具体語（夕飯・晩御飯・おかず・和食・中華・煮物 等）や想定される品目・"
+        "食材で角度を変えること。単純な質問なら 1 行でよい。\n"
         "・説明・引用符・記号・箇条書き番号・思考は出さず、クエリ本文だけを行区切りで返す。/no_think"
     )
     parts: list[str] = []
@@ -4118,8 +4133,20 @@ class Handler(BaseHTTPRequestHandler):
                                 _cur.get("score") or 0
                             ):
                                 merged[_key] = _mem
+                    # 近重複の集約: 同じ晩御飯シーンが別 ts で何度も記録されている
+                    # （再生成や繰り返しプレイで同一プロンプトが複数日ぶん）と、列挙の
+                    # top_k 枠を同じ料理が食い潰して種類数が伸びない。正規化した署名で
+                    # まとめ、各クラスタは最高スコアの 1 件だけ残してから top_k に切る。
+                    collapsed: dict = {}
+                    for _mem in merged.values():
+                        _sig = _recall_dup_signature(_mem)
+                        _cur = collapsed.get(_sig)
+                        if _cur is None or float(_mem.get("score") or 0) > float(
+                            _cur.get("score") or 0
+                        ):
+                            collapsed[_sig] = _mem
                     recalled = sorted(
-                        merged.values(), key=lambda x: -float(x.get("score") or 0)
+                        collapsed.values(), key=lambda x: -float(x.get("score") or 0)
                     )[:_RECALL_TOP_K]
                     memory_block = rag_memory.build_memory_block(recalled)
                 except Exception:
