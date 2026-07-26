@@ -2471,37 +2471,58 @@ _QUERY_REWRITE_MAXTOK = int(os.environ.get("RAG_QUERY_REWRITE_MAXTOK", "64"))
 # 書き換えLLM呼び出しの生成モード。空ならチャットと同じ generation_mode に追従する。
 # 例: 品質最優先(unlimited)でチャットしつつ、書き換えだけ prefill で高速化したいとき指定。
 _QUERY_REWRITE_MODE = os.environ.get("RAG_QUERY_REWRITE_MODE", "").strip().lower()
+# 想起クエリを最大何本生成するか。「全部挙げて」等の列挙・網羅質問は 1 本のクエリだと
+# 全列挙が top-k に埋もれるため、観点違いのクエリを複数本出して和集合で網を広げる。
+# 1 なら従来どおり単一クエリ。和集合は同一記憶を最高スコアで重複除去してから top_k で切る。
+_QUERY_REWRITE_MULTI = max(1, int(os.environ.get("RAG_QUERY_REWRITE_MULTI", "3")))
+# 想起の件数/閾値の独立ノブ（tools/diagnose_recall.py で実測してから調整する用）。
+# 既定は rag_memory 側の既定と同値なので、環境変数を指定しない限り挙動は変わらない。
+_RECALL_TOP_K = int(os.environ.get("RAG_RECALL_TOP_K", "8"))
+_RECALL_MIN_SCORE = float(os.environ.get("RAG_RECALL_MIN_SCORE", "0.75"))
 
 
-def rewrite_recall_query(
+def rewrite_recall_queries(
     user_text: str,
     recent_context: str = "",
     model: str | None = None,
     generation_mode: str = "",
-) -> str:
-    """ユーザー発話から、RAG 想起用に焦点を絞った検索クエリを LLM で生成する。
+) -> list[str]:
+    """ユーザー発話から、RAG 想起用の検索クエリを LLM で生成する（最大 N 本）。
 
     生の会話発話は挨拶・相槌・依頼の枕詞などの雑音が多く、意味検索（e5）の精度が落ちる
-    （例:「それじゃ早速声を聞かせて…質問です…讃岐うどん…作った料理を挙げて」だと、料理
-    より前置きや讃岐うどんに埋め込みが引っ張られる）。ここで話題の核だけを短いクエリへ
-    書き換えてから recall する。失敗・空・無効化時は空文字を返し、呼び出し側は原文へ
-    フォールバックする（RAG は純粋な追加レイヤーなので、この経路が転んでも会話は継続）。
+    （例:「それじゃ早速声を聞かせて…質問です…讃岐うどん以外に作った料理を挙げて」）。
+    さらに除外・列挙質問には固有の弱点が 2 つある:
+      ・除外語（「讃岐うどん以外」）をクエリに残すと、意味検索は否定を表現できず逆に
+        その語へ検索が引きずられ、狙いの記憶（他の料理）の順位が下がる。
+      ・「全部挙げて」は全列挙を求めるが、意味検索は類似度 top-k しか返せず、1 本の
+        クエリでは網羅に構造的に弱い。
+    そこで話題の核だけへ書き換え（除外語・否定語は捨てる）つつ、列挙質問では観点違いの
+    クエリを複数本返す。呼び出し側は各クエリで recall して和集合を取る。失敗・空・無効化
+    時は空リストを返し、呼び出し側は原文へフォールバックする（RAG は純粋な追加レイヤー）。
     """
     user_text = str(user_text or "").strip()
     if not _QUERY_REWRITE_ENABLED or not user_text:
-        return ""
+        return []
+    n = _QUERY_REWRITE_MULTI
     system = (
         "あなたは検索クエリ生成器です。ユーザーの発話から、過去の会話ログを意味検索する"
-        "ための短い日本語クエリだけを出力します。挨拶・相槌・依頼の枕詞（例:『声を聞かせて』"
-        "『質問です』『思いつくだけ挙げて』）は捨て、知りたい事柄の核（名詞・動詞・固有名詞）"
-        "だけを2〜12語ほど空白区切りで並べてください。説明・引用符・記号・箇条書き・思考は"
-        "出さず、クエリ本文だけを1行で返してください。/no_think"
+        "ための短い日本語クエリを出力します。次の規則に従ってください。\n"
+        "・挨拶・相槌・依頼の枕詞（例:『声を聞かせて』『質問です』『思いつくだけ挙げて』）は捨てる。\n"
+        "・知りたい事柄の核（名詞・動詞・固有名詞）だけを、1 行あたり 2〜10 語ほど空白区切りで並べる。\n"
+        "・『〜以外』『〜を除いて』などで除外された語や否定語は絶対にクエリへ入れない"
+        "（意味検索は否定を表現できず、その語に検索が引きずられて逆効果になるため）。\n"
+        f"・「全部」「他には」「いくつも」等、網羅・列挙を求める発話では、観点や言い換えを"
+        f"変えたクエリを 1 行 1 本で最大 {n} 行まで出す（例: 料理なら 1 行目『作った 料理 献立』、"
+        "2 行目『夕飯 おかず 手料理』のように角度を変える）。単純な質問なら 1 行でよい。\n"
+        "・説明・引用符・記号・箇条書き番号・思考は出さず、クエリ本文だけを行区切りで返す。/no_think"
     )
     parts: list[str] = []
     if str(recent_context or "").strip():
         parts.append(f"直近の文脈（背景・参考）:\n{str(recent_context).strip()}")
     parts.append(f"ユーザー発話:\n{user_text}")
     parts.append("検索クエリ:")
+    # 複数行を出させるぶん、prefill/original モードのフォールバック上限を少し広げる。
+    rewrite_maxtok = _QUERY_REWRITE_MAXTOK if n <= 1 else max(_QUERY_REWRITE_MAXTOK, 32 * n)
     payload = {
         "model": model or DEFAULT_MODEL,
         "messages": [
@@ -2509,7 +2530,7 @@ def rewrite_recall_query(
             {"role": "user", "content": "\n\n".join(parts)},
         ],
         "temperature": 0.0,
-        "max_tokens": _QUERY_REWRITE_MAXTOK,
+        "max_tokens": rewrite_maxtok,
         "stream": False,
     }
     # 生成モードごとに content 取得の作法が異なる（思考ONの unlimited/quality_guard は
@@ -2525,20 +2546,35 @@ def rewrite_recall_query(
             payload,
             segmented_mode=False,
             auto_emoji=False,
-            base_max_tokens=_QUERY_REWRITE_MAXTOK,
+            base_max_tokens=rewrite_maxtok,
             mode=rewrite_mode,
         )
         content = str(data["choices"][0]["message"].get("content") or "").strip()
     except Exception:
-        return ""
+        return []
     if not content:
-        return ""
-    # 1 行へ畳み、先に「検索クエリ:」等のラベルを剥がしてから囲みの引用符/かぎ括弧を除く
-    # （順序が逆だとラベルに守られて先頭の「が残る）。
-    content = content.splitlines()[0].strip()
-    content = re.sub(r"^(検索クエリ|クエリ|query)\s*[:：]\s*", "", content, flags=re.IGNORECASE).strip()
-    content = content.strip("「」『』\"'`  ").strip()
-    return content
+        return []
+    # 各行を独立クエリとして拾い、「検索クエリ:」等のラベル・箇条書き記号・囲みの引用符を
+    # 剥がしてから重複を除く（大小無視）。上限 n 本で打ち切る。
+    queries: list[str] = []
+    seen: set[str] = set()
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^(検索クエリ|クエリ|query)\s*[:：]\s*", "", line, flags=re.IGNORECASE).strip()
+        line = re.sub(r"^(?:[-*・>]+|\d+[.)、])\s*", "", line).strip()
+        line = line.strip("「」『』\"'`  ").strip()
+        if not line:
+            continue
+        key = line.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append(line)
+        if len(queries) >= n:
+            break
+    return queries
 
 
 def _thinking_prefill(segmented_mode: bool, auto_emoji: bool) -> tuple[str, str]:
@@ -4036,28 +4072,51 @@ class Handler(BaseHTTPRequestHandler):
                         if _m.get("role") == "assistant":
                             recent_ctx = compact_text(_m.get("content"), 200)
                             break
-                    recall_query = rewrite_recall_query(
+                    recall_queries = rewrite_recall_queries(
                         user_text, recent_ctx, model=model, generation_mode=generation_mode
-                    ) or user_text
-                    if recall_query != user_text:
-                        print(f"[rag] recall query rewritten -> {compact_text(recall_query, 80)}")
-                    recalled = rag_memory.recall_memory(
-                        character_id,
-                        recall_query,
-                        slot=speaker_slot,
-                        # 2人だけモードのお題と 1P 通常会話の記憶が混ざらないよう、
-                        # 現在のターンと同じ会話モードの記憶だけを想起対象にする。
-                        mode="two_only" if two_only_mode else "normal",
-                        # dedup は「LLM が実際に見る圧縮後 messages」を基準にする。
-                        # raw_messages（全履歴）基準にすると、文脈から溢れて要約に
-                        # 畳まれた古い記憶まで除外され、RAG が本来補うべき“文脈落ち
-                        # した過去”を差し込めなくなる（＝想起の盲点・幻覚の原因）。
-                        recent_user_texts=[
-                            item.get("content")
-                            for item in messages
-                            if item.get("role") == "user"
-                        ],
-                    )
+                    ) or [user_text]
+                    if recall_queries != [user_text]:
+                        print(
+                            "[rag] recall queries rewritten -> "
+                            + " | ".join(compact_text(q, 60) for q in recall_queries)
+                        )
+                    # dedup は「LLM が実際に見る圧縮後 messages」を基準にする。
+                    # raw_messages（全履歴）基準にすると、文脈から溢れて要約に畳まれた
+                    # 古い記憶まで除外され、RAG が本来補うべき“文脈落ちした過去”を差し
+                    # 込めなくなる（＝想起の盲点・幻覚の原因）。
+                    recent_user_texts = [
+                        item.get("content")
+                        for item in messages
+                        if item.get("role") == "user"
+                    ]
+                    # 2人だけモードのお題と 1P 通常会話の記憶が混ざらないよう、現在の
+                    # ターンと同じ会話モードの記憶だけを想起対象にする。
+                    recall_mode = "two_only" if two_only_mode else "normal"
+                    # 複数クエリの想起結果を ts で和集合（同一記憶は最高スコアを採用）し、
+                    # スコア降順で top_k に切る。「全部挙げて」等の列挙質問で、1 本のクエリ
+                    # では top-k に埋もれる記憶を、観点違いのクエリで拾い上げるための併合。
+                    merged: dict = {}
+                    for _q in recall_queries:
+                        for _mem in rag_memory.recall_memory(
+                            character_id,
+                            _q,
+                            k=_RECALL_TOP_K,
+                            slot=speaker_slot,
+                            mode=recall_mode,
+                            recent_user_texts=recent_user_texts,
+                            min_score=_RECALL_MIN_SCORE,
+                        ):
+                            _key = str(_mem.get("ts") or "") or (
+                                f"{_mem.get('user_text')}\n{_mem.get('reply_text')}"
+                            )
+                            _cur = merged.get(_key)
+                            if _cur is None or float(_mem.get("score") or 0) > float(
+                                _cur.get("score") or 0
+                            ):
+                                merged[_key] = _mem
+                    recalled = sorted(
+                        merged.values(), key=lambda x: -float(x.get("score") or 0)
+                    )[:_RECALL_TOP_K]
                     memory_block = rag_memory.build_memory_block(recalled)
                 except Exception:
                     memory_block = ""
