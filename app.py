@@ -2484,6 +2484,15 @@ _QUERY_REWRITE_MULTI = max(1, int(os.environ.get("RAG_QUERY_REWRITE_MULTI", "3")
 # いずれも RAG_RECALL_TOP_K / RAG_RECALL_MIN_SCORE で上書き可。
 _RECALL_TOP_K = int(os.environ.get("RAG_RECALL_TOP_K", "16"))
 _RECALL_MIN_SCORE = float(os.environ.get("RAG_RECALL_MIN_SCORE", "0.75"))
+# 近重複の集約を切る用（RAG_RECALL_DEDUP=0 で無効化）。集約が別料理まで畳んで
+# いないか等を、再コンパイル無しで A/B するための逃がし弁。
+_RECALL_DEDUP = os.environ.get("RAG_RECALL_DEDUP", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
 
 
 def _recall_dup_signature(mem: dict) -> str:
@@ -2502,6 +2511,8 @@ def rewrite_recall_queries(
     recent_context: str = "",
     model: str | None = None,
     generation_mode: str = "",
+    user_name: str = "",
+    char_name: str = "",
 ) -> list[str]:
     """ユーザー発話から、RAG 想起用の検索クエリを LLM で生成する（最大 N 本）。
 
@@ -2520,6 +2531,27 @@ def rewrite_recall_queries(
     if not _QUERY_REWRITE_ENABLED or not user_text:
         return []
     n = _QUERY_REWRITE_MULTI
+    # 主体・客体は発話ごとに変わる（「ナデシコが破壊した」「オサムが作った」等）ので、
+    # 上の汎用ルールで明示された主体・客体はそのまま保つ。ただし主語が省略され文脈でも
+    # 特定できない行為質問（例:「作った料理は？」）に限っては、この会話が基本ユーザー→
+    # キャラの関係であることを手掛かりに、主体をユーザー名で補ってアンカーする（フォール
+    # バック）。名前が総称（あなた/君 等）や未設定なら補わない。
+    _generic_names = {"", "あなた", "きみ", "君", "お前", "おまえ", "きみたち"}
+    _u = str(user_name or "").strip()
+    _c = str(char_name or "").strip()
+    _who = ""
+    actor_rule = ""
+    if _u and _u not in _generic_names:
+        _who = f"ユーザー={_u}" + (
+            f"／キャラクター={_c}" if (_c and _c not in _generic_names) else ""
+        )
+        _to = f"相手（{_c}）に" if (_c and _c not in _generic_names) else ""
+        actor_rule = (
+            f"・上記で主体が発話に明示されているならそれを優先する。主体が省略され文脈でも"
+            f"特定できない行為・出来事の質問に限り、この会話は基本『{_u}（ユーザー）が{_to}"
+            f"行う』関係なので、主体を {_u} と補ってクエリに含める"
+            f"（例: 主語のない『作った料理は？』→『{_u} 作った 料理』）。\n"
+        )
     system = (
         "あなたは検索クエリ生成器です。ユーザーの発話から、過去の会話ログを意味検索する"
         "ための短い日本語クエリを出力します。次の規則に従ってください。\n"
@@ -2527,17 +2559,26 @@ def rewrite_recall_queries(
         "・知りたい事柄の核（名詞・動詞・固有名詞）だけを、1 行あたり 2〜10 語ほど空白区切りで並べる。\n"
         "・『〜以外』『〜を除いて』などで除外された語や否定語は絶対にクエリへ入れない"
         "（意味検索は否定を表現できず、その語に検索が引きずられて逆効果になるため）。\n"
+        "・『作った・破壊した・言った・渡した・行った』等の行為や出来事を尋ねる発話では、"
+        "その行為の主体（誰が/何が）・客体（何を/誰に/何に対して）・動詞をできるだけクエリに"
+        "残し、『誰が（何が）何にしたか』の関係を保つ。主体・客体が発話に明示されていれば、"
+        "それをユーザー/キャラに勝手に置き換えず、そのまま使う"
+        "（例:『あのときナデシコがグラビティブラストで破壊したのは何だっけ？』→"
+        "『ナデシコ グラビティブラスト 破壊 対象』）。\n"
         f"・「全部」「他には」「いくつも」等、網羅・列挙を求める発話では、観点や言い換えを"
         f"変えたクエリを 1 行 1 本で最大 {n} 行まで出す（例: 料理なら 1 行目『作った 料理 献立』、"
         "2 行目『夕飯 おかず 手料理』、3 行目『和食 中華 手料理』のように角度を変える）。"
         "会話ログは日常の場面なので、抽象的な総称語（一覧・メニュー・レシピ・カテゴリ等）は"
         "使わず、日常の具体語（夕飯・晩御飯・おかず・和食・中華・煮物 等）や想定される品目・"
         "食材で角度を変えること。単純な質問なら 1 行でよい。\n"
-        "・説明・引用符・記号・箇条書き番号・思考は出さず、クエリ本文だけを行区切りで返す。/no_think"
+        + actor_rule
+        + "・説明・引用符・記号・箇条書き番号・思考は出さず、クエリ本文だけを行区切りで返す。/no_think"
     )
     parts: list[str] = []
     if str(recent_context or "").strip():
         parts.append(f"直近の文脈（背景・参考）:\n{str(recent_context).strip()}")
+    if _who:
+        parts.append(f"登場人物: {_who}")
     parts.append(f"ユーザー発話:\n{user_text}")
     parts.append("検索クエリ:")
     # 複数行を出させるぶん、prefill/original モードのフォールバック上限を少し広げる。
@@ -4092,7 +4133,12 @@ class Handler(BaseHTTPRequestHandler):
                             recent_ctx = compact_text(_m.get("content"), 200)
                             break
                     recall_queries = rewrite_recall_queries(
-                        user_text, recent_ctx, model=model, generation_mode=generation_mode
+                        user_text,
+                        recent_ctx,
+                        model=model,
+                        generation_mode=generation_mode,
+                        user_name=user_address,
+                        char_name=speaker,
                     ) or [user_text]
                     if recall_queries != [user_text]:
                         print(
@@ -4137,17 +4183,37 @@ class Handler(BaseHTTPRequestHandler):
                     # （再生成や繰り返しプレイで同一プロンプトが複数日ぶん）と、列挙の
                     # top_k 枠を同じ料理が食い潰して種類数が伸びない。正規化した署名で
                     # まとめ、各クラスタは最高スコアの 1 件だけ残してから top_k に切る。
-                    collapsed: dict = {}
-                    for _mem in merged.values():
-                        _sig = _recall_dup_signature(_mem)
-                        _cur = collapsed.get(_sig)
-                        if _cur is None or float(_mem.get("score") or 0) > float(
-                            _cur.get("score") or 0
-                        ):
-                            collapsed[_sig] = _mem
+                    # RAG_RECALL_DEDUP=0 で無効化（切り分け用）。
+                    if _RECALL_DEDUP:
+                        collapsed: dict = {}
+                        for _mem in merged.values():
+                            _sig = _recall_dup_signature(_mem)
+                            _cur = collapsed.get(_sig)
+                            if _cur is None or float(_mem.get("score") or 0) > float(
+                                _cur.get("score") or 0
+                            ):
+                                collapsed[_sig] = _mem
+                        pool = collapsed.values()
+                    else:
+                        pool = merged.values()
                     recalled = sorted(
-                        collapsed.values(), key=lambda x: -float(x.get("score") or 0)
+                        pool, key=lambda x: -float(x.get("score") or 0)
                     )[:_RECALL_TOP_K]
+                    # 想起が「何を」差し込んだかを可視化（想起漏れ/誤想起の切り分け用）。
+                    # 実発話が曖昧（「作った料理」＝誰が作った？）だと、オサムが作った料理の
+                    # 記憶ではなく別の記憶を拾って回答がすり替わることがあるため、件数だけで
+                    # なく上位のスニペットも出す。
+                    if recalled:
+                        print(
+                            f"[rag] recalled {len(recalled)} memories "
+                            f"(union={len(merged)}, score {recalled[-1].get('score')}"
+                            f"..{recalled[0].get('score')}): "
+                            + " / ".join(
+                                compact_text(m.get("user_text"), 20) for m in recalled[:6]
+                            )
+                        )
+                    else:
+                        print("[rag] recalled 0 memories")
                     memory_block = rag_memory.build_memory_block(recalled)
                 except Exception:
                     memory_block = ""
