@@ -1267,6 +1267,15 @@ def sanitize_history(value: object) -> list[dict]:
         if role not in {"user", "assistant"} or not content:
             continue
         entry: dict = {"role": role, "content": content}
+        # RAG 記憶の会話モードを表示外メタとして保持する（display と同じく LM 文脈では
+        # 無視される）。手作業や再構築で付けた "mode"/"speaker" を保存往復で失わない
+        # ため、正当な値だけ引き継ぐ。詳細は write_character_history のマージ処理参照。
+        mode = str(item.get("mode") or "").strip()
+        if mode in {"normal", "two_only"}:
+            entry["mode"] = mode
+        speaker = str(item.get("speaker") or "").strip()
+        if speaker:
+            entry["speaker"] = speaker
         # アシスタント返答は、リロード後も注釈（感情キャプション）・meta 行・再生対象を
         # 復元できるよう表示用メタを保持する。LM context（content）とは別物で、
         # /api/chat の文脈生成では無視される。
@@ -1366,18 +1375,63 @@ def write_session_settings(settings: dict) -> dict:
     return profile
 
 
+def _prior_mode_map(history_file: Path) -> dict[tuple[str, str], tuple[str, str]]:
+    """既存 history.json の (role, content) → (mode, speaker) を読み出す。
+
+    自動保存はクライアントから来た全履歴で丸ごと上書きするが、クライアントは
+    手作業/再構築で付けた mode/speaker を送り返さない場合がある。それらを毎回の
+    保存で失わないよう、ディスク上の既存注釈を内容一致で引き継ぐためのマップ。
+    """
+    if not history_file.exists():
+        return {}
+    try:
+        data = json.loads(history_file.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return {}
+    history = data.get("history") if isinstance(data, dict) else None
+    result: dict[tuple[str, str], tuple[str, str]] = {}
+    if isinstance(history, list):
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            key = (str(item.get("role") or ""), str(item.get("content") or "").strip())
+            mode = str(item.get("mode") or "").strip()
+            speaker = str(item.get("speaker") or "").strip()
+            if mode in {"normal", "two_only"} or speaker:
+                result[key] = (mode if mode in {"normal", "two_only"} else "", speaker)
+    return result
+
+
 def write_character_history(char_id: str, entries: list[dict]) -> Path:
     """1 キャラ分の会話ログを profiles/sessions/<charId>/history.json へ書き出す。"""
     safe_id = safe_character_id(char_id)
     char_dir = SESSION_HISTORY_ROOT / safe_id
     char_dir.mkdir(parents=True, exist_ok=True)
+    history_file = char_dir / "history.json"
+
+    sanitized = sanitize_history(entries)
+    # クライアントが mode/speaker を送り返さなくても、ディスク上の既存注釈を内容一致で
+    # 復元する（手動注釈が自動保存で消えるのを防ぐ）。新規ターンは既存に無いので、
+    # 会話モードは memory.sqlite3 側（save_memory）が確定値を持つ＝ここでは normal 相当。
+    prior = _prior_mode_map(history_file)
+    if prior:
+        for entry in sanitized:
+            key = (str(entry.get("role") or ""), str(entry.get("content") or "").strip())
+            saved = prior.get(key)
+            if not saved:
+                continue
+            saved_mode, saved_speaker = saved
+            if saved_mode and "mode" not in entry:
+                entry["mode"] = saved_mode
+            if saved_speaker and "speaker" not in entry:
+                entry["speaker"] = saved_speaker
+
     payload = {
         "version": 2,
         "savedAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "characterId": str(char_id),
-        "history": sanitize_history(entries),
+        "history": sanitized,
     }
-    history_file = char_dir / "history.json"
     history_file.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
