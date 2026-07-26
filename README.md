@@ -1,4 +1,4 @@
-# Rinon Voice Lab
+# Rinon Voice Lab — Tousei Edition
 
 Local character chat and speech app. Windows is the primary tested platform,
 and macOS support is experimental.
@@ -11,7 +11,6 @@ Rinon Voice Lab connects:
 - Irodori-TTS VoiceDesign speech generation
 - Editable 1P/2P character profiles
 - Character portraits and expression variants
-- Local CPU long-term memory (RAG) with auto-saved chat history
 - Optional lightweight Web-search notes for LLM prompts
 - Optional 2P remote TTS on a second PC
 

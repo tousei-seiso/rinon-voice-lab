@@ -1,4 +1,4 @@
-# Rinon Voice Lab 日本語README
+# Rinon Voice Lab 冬星版 日本語README
 
 Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつないで、キャラクター会話と音声読み上げを行うローカルアプリです。主な確認環境は Windows ですが、macOS では実験的に起動できるようにしています。
 
@@ -7,10 +7,23 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
 - LM Studio の OpenAI互換ローカルAPIと連携
 - Irodori-TTS VoiceDesign による日本語音声生成
 - 1P/2P キャラクターの設定、名前、TTS Caption、表情画像を編集
-- 会話ログ、セッション、キャラクターデータの保存と読み込み（1ターンごとに自動保存）
-- ローカルCPUで動く RAG 長期記憶（過去会話の意味検索）
+- 会話ログ、セッション、キャラクターデータの保存と読み込み
 - 簡易Web検索メモをLLMプロンプトへ追加
 - 2P音声だけを別PCの Irodori-TTS へ送るリモートTTSモード
+
+## 本家から改良した主な機能
+
+上の「主な機能」は本家 [sakugetu/rinon-voice-lab](https://github.com/sakugetu/rinon-voice-lab) のものです。
+冬星版ではそれに加えて、次の機能を追加・強化しています（各項目の詳細は下の「本家からの主な改良点」を参照）。
+
+- 感情キャプションによるセグメント演技（棒読み回避）
+- キャラクター別の CFG Scale / Num Steps / Style Guide による声質の安定化
+- 英語→かな正規化と複数かな辞書による日本語TTS品質の向上
+- LM Studio 連携の堅牢化（タイムアウト設定・structured output・生成モード切替）
+- 分割音声の1本化（1つの WAV に結合）
+- 返答の選択再生・再生成・キャラクター別のデータ管理
+- 会話履歴の1ターンごと自動保存（会話モード・話者・時刻を保持）
+- ローカルCPUで動く RAG 長期記憶（過去会話の意味検索）
 
 ## 本家からの主な改良点
 
