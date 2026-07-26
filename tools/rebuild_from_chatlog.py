@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import sys
 import time
@@ -54,6 +55,41 @@ SESSION_ROOT = _ROOT / "profiles" / "sessions"
 
 # speaker 表示名 → キャラ別フォルダ(char_id) の既定対応。--map で上書き/追加できる。
 DEFAULT_MAP = {"ルリ": "ruri", "ユリカ": "yurika"}
+
+
+def _strip_speaker(text: str, names: set[str]) -> str:
+    """返答文先頭の「名前: 」を外して素の返答テキストへ正規化する。"""
+    base = str(text or "").strip()
+    for name in sorted(names, key=len, reverse=True):
+        m = re.match(rf"^{re.escape(name)}\s*[:：]\s*", base)
+        if m:
+            return base[m.end():].strip()
+    return base
+
+
+def _load_emotion_annotation(names: set[str]) -> dict[str, str]:
+    """chat_emotion.jsonl から「素の返答 → 感情キャプション付き注釈文」の対応表を作る。
+
+    chat.jsonl の segments には分割本文(text)が無く注釈文を再構成できないため、
+    display.text へ載せるキャプション付き文はこの対応表から引く（これが無いと
+    再生成で感情キャプションが失われる。tools/repair_emotion_captions.py 参照）。
+    """
+    annot: dict[str, str] = {}
+    if not EMOTION_LOG.exists():
+        return annot
+    for line in EMOTION_LOG.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        raw = _strip_speaker(rec.get("reply"), names)
+        annotated = str(rec.get("annotatedReply") or "")
+        if raw and "（" in annotated and "）" in annotated and raw not in annot:
+            annot[raw] = annotated
+    return annot
 
 
 def _read_chat_records() -> list[dict]:
@@ -113,7 +149,7 @@ def _group_by_char(records: list[dict], mapping: dict[str, str], skip_unmapped: 
     return grouped, unmapped
 
 
-def _write_history(char_id: str, turns: list[dict]) -> int:
+def _write_history(char_id: str, turns: list[dict], annot: dict[str, str], names: set[str]) -> int:
     """char_id の history.json をターン列から再生成する。書いたエントリ数を返す。"""
     char_dir = SESSION_ROOT / char_id
     char_dir.mkdir(parents=True, exist_ok=True)
@@ -136,9 +172,13 @@ def _write_history(char_id: str, turns: list[dict]) -> int:
         }
         if turn["speaker"]:
             assistant["speaker"] = turn["speaker"]
-        if turn["combinedUrl"]:
+        # 感情キャプション付きの表示文（あれば）を display.text へ載せる。素の reply では
+        # なく chat_emotion.jsonl 由来の注釈文を使うことで、再生成でキャプションを失わない。
+        annotated = annot.get(_strip_speaker(turn["reply"], names))
+        display_text = annotated if annotated else turn["reply"]
+        if annotated or turn["combinedUrl"]:
             assistant["display"] = {
-                "text": turn["reply"],
+                "text": display_text,
                 "meta": "",
                 "audioUrl": turn["combinedUrl"],
             }
@@ -248,6 +288,9 @@ def main() -> int:
             print("→ --map で対応を指定するか --skip-unmapped を付けてください。中断します。", file=sys.stderr)
             return 2
 
+    # 素の返答 → 感情キャプション付き注釈文。display.text 復元に使う（話者名で接頭辞を剥がす）。
+    annot = _load_emotion_annotation(set(mapping.keys()))
+
     char_ids = sorted(grouped)
     for char_id in char_ids:
         turns = grouped[char_id]
@@ -255,11 +298,15 @@ def main() -> int:
             normal = sum(1 for t in turns if t["mode"] == "normal")
             two = sum(1 for t in turns if t["mode"] == "two_only")
             with_ts = sum(1 for t in turns if t["ts"])
-            print(f"[{char_id}] turns={len(turns)} normal={normal} two_only={two} ts有={with_ts}")
+            captioned = sum(1 for t in turns if _strip_speaker(t["reply"], set(mapping.keys())) in annot)
+            print(
+                f"[{char_id}] turns={len(turns)} normal={normal} two_only={two} "
+                f"ts有={with_ts} キャプション復元可={captioned}"
+            )
             continue
         if args.reset:
             _reset_db(char_id)
-        n_hist = _write_history(char_id, turns)
+        n_hist = _write_history(char_id, turns, annot, set(mapping.keys()))
         counts = _rebuild_db(char_id, turns)
         print(
             f"[{char_id}] turns={len(turns)} history={n_hist}行 "
