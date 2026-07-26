@@ -3952,9 +3952,13 @@ class Handler(BaseHTTPRequestHandler):
                         # 2人だけモードのお題と 1P 通常会話の記憶が混ざらないよう、
                         # 現在のターンと同じ会話モードの記憶だけを想起対象にする。
                         mode="two_only" if two_only_mode else "normal",
+                        # dedup は「LLM が実際に見る圧縮後 messages」を基準にする。
+                        # raw_messages（全履歴）基準にすると、文脈から溢れて要約に
+                        # 畳まれた古い記憶まで除外され、RAG が本来補うべき“文脈落ち
+                        # した過去”を差し込めなくなる（＝想起の盲点・幻覚の原因）。
                         recent_user_texts=[
                             item.get("content")
-                            for item in raw_messages
+                            for item in messages
                             if item.get("role") == "user"
                         ],
                     )
