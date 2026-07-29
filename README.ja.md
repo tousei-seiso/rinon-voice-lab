@@ -99,6 +99,12 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
   - 抽出はハイブリッド。日本語の授受表現（「〜してあげた」＝発話者→相手、「〜してくれた」＝相手→発話者）と `role` の組み合わせで大半をLLMなしに確定し、決まらない往復だけローカルLLMへ回す
   - 判定できなかった要素は捨てず「主客不明」として保持（捨てると「台帳に無い＝存在しない」という別の漏れになる）
   - 台帳は索引であって正本ではないので、プロンプトには必ず**出典の原文**も併記し、最終判断の根拠を原文に置く
+  - 記録するのは「後から何があったかを思い出せる事実」だけ。実ログでの検証をもとに次を除外:
+    - **客体の無い事実**（`言う: （空）`）— 何も思い出せず、列挙の枠を食い潰すだけ
+    - **「言う」「見る」**（発話・知覚）— 会話ログ自体が「言ったこと」の記録なので冗長。実測ではゴミ客体の最大の発生源だった（約束・告白のように後から参照する内容は LLM 側が拾う）
+    - **中身の無い客体** — 助詞・形式名詞・代名詞（`の` `こと` `気` `私`）や `挨拶` `気持ち` `顔` `言葉` など
+    - **第三者が絡む行為の向き** — 受け手がユーザーでもそのキャラでもない場合は `unknown`（主客不明）にする。事実は残すが「俺が君にした事」の絞り込みには混ぜない
+  - 実測（771往復）では、日常会話に授受表現が少ないため**約87%の往復が LLM 抽出を要する**。`--rule-only` だけでは台帳がほぼ埋まらないので、構築時は LM Studio を起動して LLM 抽出ありで実行する
 
 **時系列の想起**（タイムスタンプの活用）
 - 「一番最初／初めて」「最後／最近」「いつ」「去年の夏」「3月」「2年前」などを正規表現で検出し（クエリ書き換えLLMの意図分類でも補完）、スコア上位プールを確保してから時刻順に並べ替えて選抜
@@ -282,39 +288,39 @@ Irodori-TTS の依存関係は次のどちらかで入れてください。
 
 主な環境変数:
 
-| 変数 | 標準値 | 内容 |
-| --- | --- | --- |
-| `IRODORI_ROOT` | アプリ隣の `..\Irodori-TTS` | Irodori-TTS の場所 |
-| `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | LM Studio の OpenAI互換API |
-| `LM_STUDIO_MODEL` | `gemma-4-12b-it` | 優先モデル名 |
-| `LM_STUDIO_CONTEXT_LIMIT` | `8200` | 表示上のコンテキスト上限 |
-| `IRODORI_TORCH_EXTRA` | `cu128` | Irodori-TTS インストール時の torch extra |
-| `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS のモデル実行デバイス。`auto`, `cuda`, `mps`, `cpu`, `xpu` |
-| `IRODORI_MODEL_PRECISION` | `auto` | モデル精度。`auto`, `fp32`, `bf16` |
-| `IRODORI_CODEC_DEVICE` | `auto` | codec 実行デバイス。通常はモデルと同じ |
-| `IRODORI_CODEC_PRECISION` | `auto` | codec 精度。macOS では `fp32` |
-| `RAG_MEMORY_ENABLED` | `1` | RAG長期記憶の有効化（`0`で無効・従来動作） |
-| `RAG_EMBED_MODEL` | `intfloat/multilingual-e5-small` | 埋め込みモデル |
-| `RAG_RECALL_TOP_K` | `16` | 1発言あたり想起する記憶の最大件数 |
-| `RAG_RECALL_MIN_SCORE` | `0.75` | 想起の類似度しきい値 |
-| `RAG_RECALL_DEDUP` | `1` | 近重複記憶の集約（`0`で無効） |
-| `RAG_QUERY_REWRITE` | `1` | 検索クエリのLLM書き換え（`0`で無効・原文検索） |
-| `RAG_QUERY_REWRITE_MODE` | （空） | 書き換えLLMの生成モード（空でチャットに追従。重ければ `prefill`） |
-| `RAG_QUERY_REWRITE_MULTI` | `3` | 列挙質問で生成する検索クエリの最大本数（`1`で単一） |
-| `RAG_LEXICAL_ENABLED` | `1` | 語彙チャネル（FTS5+LIKE）の有効化（`0`でベクトルのみ） |
-| `RAG_LEXICAL_LIMIT` | `24` | 語彙チャネルから載せる最大件数 |
-| `RAG_LEXICAL_LIMIT_ENUM` | `48` | 列挙質問時の語彙チャネル上限 |
-| `RAG_LEXICAL_SLACK` | `0.03` | 語彙一致行に許す類似度の緩め幅（独立した証拠なので閾値を下げる） |
-| `RAG_TEMPORAL_POOL_K` | `64` | 時系列で並べ替える前に確保する候補プール（狭いと最古/最新を取りこぼす） |
-| `RAG_TEMPORAL_K` | `8` | 年表としてプロンプトへ載せる件数 |
-| `RAG_TEMPORAL_BAND` | `0.04` | 時系列選抜で「話題の芯」と見なすスコア帯 |
-| `RAG_LEDGER_ENABLED` | `1` | 事実台帳の有効化（`0`で読み書きしない） |
-| `RAG_LEDGER_LIMIT` | `60` | 台帳から載せる事実の上限 |
-| `RAG_LEDGER_TURNS` | `8` | 台帳の裏付けとして年表へ含める原文の件数 |
-| `RAG_LEDGER_ALWAYS` | `0` | 時系列・列挙以外でも常に台帳を併用する |
-| `RAG_LEDGER_LIVE` | `1` | 返答後に今回の往復を台帳へ増分抽出（別スレッド） |
-| `RAG_LEDGER_LIVE_LLM` | `1` | 増分抽出でLLMを使う（`0`ならルール抽出のみ・完全に無料） |
-| `RAG_FACT_EXTRACT_MAXTOK` | `256` | 事実抽出LLMの生成上限 |
+| 変数 | 標準値 | 内容 | 本家 | 冬星版 |
+| --- | --- | --- | :-: | :-: |
+| `IRODORI_ROOT` | アプリ隣の `..\Irodori-TTS` | Irodori-TTS の場所 | ✅ | ✅ |
+| `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | LM Studio の OpenAI互換API | ✅ | ✅ |
+| `LM_STUDIO_MODEL` | `gemma-4-12b-it` | 優先モデル名 | ✅ | ✅ |
+| `LM_STUDIO_CONTEXT_LIMIT` | `8200` | 表示上のコンテキスト上限 | ✅ | ✅ |
+| `IRODORI_TORCH_EXTRA` | `cu128` | Irodori-TTS インストール時の torch extra | ✅ | ✅ |
+| `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS のモデル実行デバイス。`auto`, `cuda`, `mps`, `cpu`, `xpu` | ✅ | ✅ |
+| `IRODORI_MODEL_PRECISION` | `auto` | モデル精度。`auto`, `fp32`, `bf16` | ✅ | ✅ |
+| `IRODORI_CODEC_DEVICE` | `auto` | codec 実行デバイス。通常はモデルと同じ | ✅ | ✅ |
+| `IRODORI_CODEC_PRECISION` | `auto` | codec 精度。macOS では `fp32` | ✅ | ✅ |
+| `RAG_MEMORY_ENABLED` | `1` | RAG長期記憶の有効化（`0`で無効・従来動作） | — | ✅ |
+| `RAG_EMBED_MODEL` | `intfloat/multilingual-e5-small` | 埋め込みモデル | — | ✅ |
+| `RAG_RECALL_TOP_K` | `16` | 1発言あたり想起する記憶の最大件数 | — | ✅ |
+| `RAG_RECALL_MIN_SCORE` | `0.75` | 想起の類似度しきい値 | — | ✅ |
+| `RAG_RECALL_DEDUP` | `1` | 近重複記憶の集約（`0`で無効） | — | ✅ |
+| `RAG_QUERY_REWRITE` | `1` | 検索クエリのLLM書き換え（`0`で無効・原文検索） | — | ✅ |
+| `RAG_QUERY_REWRITE_MODE` | （空） | 書き換えLLMの生成モード（空でチャットに追従。重ければ `prefill`） | — | ✅ |
+| `RAG_QUERY_REWRITE_MULTI` | `3` | 列挙質問で生成する検索クエリの最大本数（`1`で単一） | — | ✅ |
+| `RAG_LEXICAL_ENABLED` | `1` | 語彙チャネル（FTS5+LIKE）の有効化（`0`でベクトルのみ） | — | ✅ |
+| `RAG_LEXICAL_LIMIT` | `24` | 語彙チャネルから載せる最大件数 | — | ✅ |
+| `RAG_LEXICAL_LIMIT_ENUM` | `48` | 列挙質問時の語彙チャネル上限 | — | ✅ |
+| `RAG_LEXICAL_SLACK` | `0.03` | 語彙一致行に許す類似度の緩め幅（独立した証拠なので閾値を下げる） | — | ✅ |
+| `RAG_TEMPORAL_POOL_K` | `64` | 時系列で並べ替える前に確保する候補プール（狭いと最古/最新を取りこぼす） | — | ✅ |
+| `RAG_TEMPORAL_K` | `8` | 年表としてプロンプトへ載せる件数 | — | ✅ |
+| `RAG_TEMPORAL_BAND` | `0.02` | 時系列選抜で「話題の芯」と見なすスコア帯（実測: e5 のスコアは 0.80〜0.84 に潰れるため広げると無関係な古い記憶が「最初」を奪う） | — | ✅ |
+| `RAG_LEDGER_ENABLED` | `1` | 事実台帳の有効化（`0`で読み書きしない） | — | ✅ |
+| `RAG_LEDGER_LIMIT` | `60` | 台帳から載せる事実の上限 | — | ✅ |
+| `RAG_LEDGER_TURNS` | `8` | 台帳の裏付けとして年表へ含める原文の件数 | — | ✅ |
+| `RAG_LEDGER_ALWAYS` | `0` | 時系列・列挙以外でも常に台帳を併用する | — | ✅ |
+| `RAG_LEDGER_LIVE` | `1` | 返答後に今回の往復を台帳へ増分抽出（別スレッド） | — | ✅ |
+| `RAG_LEDGER_LIVE_LLM` | `1` | 増分抽出でLLMを使う（`0`ならルール抽出のみ・完全に無料） | — | ✅ |
+| `RAG_FACT_EXTRACT_MAXTOK` | `256` | 事実抽出LLMの生成上限 | — | ✅ |
 
 ## キャラクターデータ
 

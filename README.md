@@ -68,7 +68,15 @@ focused on higher-quality Japanese character speech and day-to-day usability.
     message role settle most turns with no LLM call, and only the undecided ones go to the
     local LLM. Unresolved fields are kept as "direction unknown" rather than dropped, and
     the ledger is always presented alongside the **source turns** so the original text
-    remains the ground truth.
+    remains the ground truth. Only facts that help recall what happened are recorded —
+    validated against real logs, the ledger rejects facts with no object, the verbs *say*
+    and *see* (the conversation log is already the record of what was said, and these were
+    the single largest source of junk objects), contentless objects (particles, formal
+    nouns, pronouns, and words like greeting / feeling / face), and it downgrades an
+    action's direction to unknown when a third party is involved, so filtering for "what I
+    did for you" never pulls in acts aimed at someone else. Measured over 771 turns, ~87%
+    of turns need the LLM pass, so build the ledger with LM Studio running rather than
+    `--rule-only`.
 - **Timestamp-aware recall** — asks like "the very first", "the last / lately", "when",
   "last summer", "in March", "two years ago" are detected by regex (with the rewrite LLM's
   intent tag as a fallback), a wide candidate pool is gathered and then re-sorted by time.
@@ -243,39 +251,39 @@ IRODORI_TORCH_EXTRA=cpu tools/install_irodori_tts.sh
 
 Useful environment variables:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `IRODORI_ROOT` | `..\Irodori-TTS` next to this app | Irodori-TTS checkout and virtual environment |
-| `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | LM Studio OpenAI-compatible endpoint |
-| `LM_STUDIO_MODEL` | `gemma-4-12b-it` | Preferred model name |
-| `LM_STUDIO_CONTEXT_LIMIT` | `8200` | Visible context budget |
-| `IRODORI_TORCH_EXTRA` | `cu128` | Installer torch extra: `cu128`, `cpu`, `rocm`, or `xpu` |
-| `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS model device: `auto`, `cuda`, `mps`, `cpu`, or `xpu` |
-| `IRODORI_MODEL_PRECISION` | `auto` | Model precision: `auto`, `fp32`, or `bf16` |
-| `IRODORI_CODEC_DEVICE` | `auto` | Codec device, usually the same as the model device |
-| `IRODORI_CODEC_PRECISION` | `auto` | Codec precision. macOS uses `fp32` |
-| `RAG_MEMORY_ENABLED` | `1` | Enable RAG long-term memory (`0` to disable) |
-| `RAG_EMBED_MODEL` | `intfloat/multilingual-e5-small` | Embedding model |
-| `RAG_RECALL_TOP_K` | `16` | Max memories recalled per message |
-| `RAG_RECALL_MIN_SCORE` | `0.75` | Recall similarity threshold |
-| `RAG_RECALL_DEDUP` | `1` | Collapse near-duplicate memories (`0` to disable) |
-| `RAG_QUERY_REWRITE` | `1` | LLM rewrite of the recall query (`0` uses the raw text) |
-| `RAG_QUERY_REWRITE_MODE` | empty | Generation mode for the rewrite (empty follows the chat; `prefill` is faster) |
-| `RAG_QUERY_REWRITE_MULTI` | `3` | Max recall queries generated for enumeration asks (`1` = single) |
-| `RAG_LEXICAL_ENABLED` | `1` | Enable the lexical channel (FTS5+LIKE); `0` = vector only |
-| `RAG_LEXICAL_LIMIT` | `24` | Max rows taken from the lexical channel |
-| `RAG_LEXICAL_LIMIT_ENUM` | `48` | Lexical limit for enumeration asks |
-| `RAG_LEXICAL_SLACK` | `0.03` | Similarity slack for lexical hits (independent evidence) |
-| `RAG_TEMPORAL_POOL_K` | `64` | Candidate pool gathered before re-sorting by time |
-| `RAG_TEMPORAL_K` | `8` | Timeline rows injected into the prompt |
-| `RAG_TEMPORAL_BAND` | `0.04` | Score band treated as "on topic" for temporal selection |
-| `RAG_LEDGER_ENABLED` | `1` | Enable the fact ledger (`0` disables read/write) |
-| `RAG_LEDGER_LIMIT` | `60` | Max facts injected from the ledger |
-| `RAG_LEDGER_TURNS` | `8` | Source turns included as evidence for the ledger |
-| `RAG_LEDGER_ALWAYS` | `0` | Consult the ledger even for non-temporal/non-enumeration asks |
-| `RAG_LEDGER_LIVE` | `1` | Extract the current turn into the ledger after replying (background) |
-| `RAG_LEDGER_LIVE_LLM` | `1` | Use the LLM for live extraction (`0` = rule-only, free) |
-| `RAG_FACT_EXTRACT_MAXTOK` | `256` | Token cap for the fact-extraction LLM |
+| Variable | Default | Purpose | Upstream | Tousei |
+| --- | --- | --- | :-: | :-: |
+| `IRODORI_ROOT` | `..\Irodori-TTS` next to this app | Irodori-TTS checkout and virtual environment | ✅ | ✅ |
+| `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | LM Studio OpenAI-compatible endpoint | ✅ | ✅ |
+| `LM_STUDIO_MODEL` | `gemma-4-12b-it` | Preferred model name | ✅ | ✅ |
+| `LM_STUDIO_CONTEXT_LIMIT` | `8200` | Visible context budget | ✅ | ✅ |
+| `IRODORI_TORCH_EXTRA` | `cu128` | Installer torch extra: `cu128`, `cpu`, `rocm`, or `xpu` | ✅ | ✅ |
+| `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS model device: `auto`, `cuda`, `mps`, `cpu`, or `xpu` | ✅ | ✅ |
+| `IRODORI_MODEL_PRECISION` | `auto` | Model precision: `auto`, `fp32`, or `bf16` | ✅ | ✅ |
+| `IRODORI_CODEC_DEVICE` | `auto` | Codec device, usually the same as the model device | ✅ | ✅ |
+| `IRODORI_CODEC_PRECISION` | `auto` | Codec precision. macOS uses `fp32` | ✅ | ✅ |
+| `RAG_MEMORY_ENABLED` | `1` | Enable RAG long-term memory (`0` to disable) | — | ✅ |
+| `RAG_EMBED_MODEL` | `intfloat/multilingual-e5-small` | Embedding model | — | ✅ |
+| `RAG_RECALL_TOP_K` | `16` | Max memories recalled per message | — | ✅ |
+| `RAG_RECALL_MIN_SCORE` | `0.75` | Recall similarity threshold | — | ✅ |
+| `RAG_RECALL_DEDUP` | `1` | Collapse near-duplicate memories (`0` to disable) | — | ✅ |
+| `RAG_QUERY_REWRITE` | `1` | LLM rewrite of the recall query (`0` uses the raw text) | — | ✅ |
+| `RAG_QUERY_REWRITE_MODE` | empty | Generation mode for the rewrite (empty follows the chat; `prefill` is faster) | — | ✅ |
+| `RAG_QUERY_REWRITE_MULTI` | `3` | Max recall queries generated for enumeration asks (`1` = single) | — | ✅ |
+| `RAG_LEXICAL_ENABLED` | `1` | Enable the lexical channel (FTS5+LIKE); `0` = vector only | — | ✅ |
+| `RAG_LEXICAL_LIMIT` | `24` | Max rows taken from the lexical channel | — | ✅ |
+| `RAG_LEXICAL_LIMIT_ENUM` | `48` | Lexical limit for enumeration asks | — | ✅ |
+| `RAG_LEXICAL_SLACK` | `0.03` | Similarity slack for lexical hits (independent evidence) | — | ✅ |
+| `RAG_TEMPORAL_POOL_K` | `64` | Candidate pool gathered before re-sorting by time | — | ✅ |
+| `RAG_TEMPORAL_K` | `8` | Timeline rows injected into the prompt | — | ✅ |
+| `RAG_TEMPORAL_BAND` | `0.02` | Score band treated as "on topic" for temporal selection (measured: e5 scores collapse into 0.80–0.84, so widening it lets an unrelated old memory claim "the first") | — | ✅ |
+| `RAG_LEDGER_ENABLED` | `1` | Enable the fact ledger (`0` disables read/write) | — | ✅ |
+| `RAG_LEDGER_LIMIT` | `60` | Max facts injected from the ledger | — | ✅ |
+| `RAG_LEDGER_TURNS` | `8` | Source turns included as evidence for the ledger | — | ✅ |
+| `RAG_LEDGER_ALWAYS` | `0` | Consult the ledger even for non-temporal/non-enumeration asks | — | ✅ |
+| `RAG_LEDGER_LIVE` | `1` | Extract the current turn into the ledger after replying (background) | — | ✅ |
+| `RAG_LEDGER_LIVE_LLM` | `1` | Use the LLM for live extraction (`0` = rule-only, free) | — | ✅ |
+| `RAG_FACT_EXTRACT_MAXTOK` | `256` | Token cap for the fact-extraction LLM | — | ✅ |
 
 ## Character Data
 
