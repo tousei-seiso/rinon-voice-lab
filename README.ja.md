@@ -24,6 +24,7 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
 - 返答の選択再生・再生成・キャラクター別のデータ管理
 - 会話履歴の1ターンごと自動保存（会話モード・話者・時刻を保持）
 - ローカルCPUで動く RAG 長期記憶（過去会話の意味検索）
+- 時系列・網羅・主客に強い3チャネル想起（「一番最初に買ってあげた本は？」「作った料理を全部」に対応）
 
 ## 本家からの主な改良点
 
@@ -86,7 +87,70 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
   - 近重複の集約、`top_k` / `min_score` の調整、圧縮後コンテキスト基準の重複除去により、長い履歴で文脈から溢れた過去も取りこぼさない
 - 再構築・診断ツール: `tools/rebuild_from_chatlog.py`（`logs/chat.jsonl` を正本に履歴と記憶DBを元の時刻付きで再生成）、`tools/diagnose_recall.py`（想起スコアを一覧して当たり外れを診断）
 
-### 9. 会話履歴の自動保存と話者識別
+### 9. 3チャネル想起（時系列・網羅・主客）
+意味検索（cosine top-k）だけでは構造的に答えられない質問があります。「一番最初に買ってあげた本は？」は時間を見ないので最古の1件を保証できず、「作った料理を全部」は該当が上位k件を超えた時点で必ず溢れます。そこで用途の違う3つのチャネルを併用します。
+
+- **ベクトル（意味）**: 従来の類似度検索。話題の近い記憶を拾う
+- **語彙（全件一致・上限なし）**: SQLite の FTS5(trigram) 索引と `LIKE` のハイブリッド。順位ではなく一致で拾うので件数の窓による漏れが出ない
+  - trigram は3文字未満に反応しないため、3文字以上は FTS5、1〜2文字（「本」等の漢字1字）は `LIKE` に振り分け
+  - 活用差を吸収する語幹化（「買った」→「買」で「買ってあげた」にも一致）。日本語のクエリと本文の活用ズレによる取りこぼしを防止
+- **事実台帳（集計）**: 往復から「誰が・誰に・何を・どうした」を抽出し `facts` テーブルへ正規化。列挙は検索ではなく `SELECT DISTINCT` なので**全件が返る**
+  - 主体・客体・**行為の向き**（`user->char` / `char->user`）を構造として保持するため、「俺が君に作ってあげた料理」と「君が俺に作ってくれた料理」を取り違えない
+  - 抽出はハイブリッド。日本語の授受表現（「〜してあげた」＝発話者→相手、「〜してくれた」＝相手→発話者）と `role` の組み合わせで大半をLLMなしに確定し、決まらない往復だけローカルLLMへ回す
+  - 判定できなかった要素は捨てず「主客不明」として保持（捨てると「台帳に無い＝存在しない」という別の漏れになる）
+  - 台帳は索引であって正本ではないので、プロンプトには必ず**出典の原文**も併記し、最終判断の根拠を原文に置く
+
+**時系列の想起**（タイムスタンプの活用）
+- 「一番最初／初めて」「最後／最近」「いつ」「去年の夏」「3月」「2年前」などを正規表現で検出し（クエリ書き換えLLMの意図分類でも補完）、スコア上位プールを確保してから時刻順に並べ替えて選抜
+- プロンプトへは**古い順の年表**として渡す。各行に日付・経過期間（「約1年7ヶ月前」＝サーバ側で計算済み。LLMに日数計算をさせない）を添え、先頭が最古・末尾が最新であることを明示
+- 「記録の範囲」も併記し、範囲より前は「記録が無い」だけで「出来事が無かった」ことにはならないと伝える（記録上の最初を本当の最初と断定させない）
+- 期間表現は `since`/`until` へ解決して検索側で絞り込み
+
+**ツール**
+- `tools/build_fact_ledger.py`: 既存ログから台帳を一括構築（`--rule-only` でLLM不使用、`--dry-run` で確認、中断しても未抽出分から再開）
+- `tools/sync_memory.py`: 履歴を編集したあとに記憶系ファイルを**差分同期**（下記）
+- `tools/diagnose_temporal.py`: 時系列・列挙の想起を LLM 抜きで検証し、意図検出／ベクトル／語彙／台帳のどこで落ちているかを切り分け
+- `tools/audit_memory.py`: `chat.jsonl`・`history.json`・`memories` の件数を突き合わせ、**保存漏れ**（何をしても答えられない漏れ）と ts の健全性、孤児事実、台帳の抽出率を監査
+
+### 履歴を編集したあとの同期
+履歴系ファイルには上下関係があります。
+
+```
+logs/chat.jsonl                                ← 一番大本の正本（全ターンの生ログ）
+  ├→ profiles/sessions/<charId>/history.json     画面復元用のキャラ別履歴
+  ├→ profiles/sessions/<charId>/memory.sqlite3   RAG検索DB＋事実台帳
+  └→ logs/chat_emotion.jsonl                     感情キャプション付き返答
+```
+
+`tools/sync_memory.py` が、編集した場所に応じて下流を**差分だけ**揃えます（全往復の埋め込みを計算し直さないので高速で、事実台帳も保たれます）。
+
+| 編集した場所 | コマンド | 揃える対象 |
+|---|---|---|
+| **UIから会話を削除** | **不要（削除時に自動で全系統へ反映）** | 4系統すべて |
+| `chat.jsonl` を手修正 | `sync_memory.py --filter-emotion --extract` | history.json / memory.sqlite3 / chat_emotion.jsonl / 台帳 |
+| `history.json` を手修正 | `sync_memory.py --source history --propagate --extract` | memory.sqlite3 / 台帳 ＋ **大本の chat.jsonl と chat_emotion.jsonl へ削除を逆伝播** |
+| 全部作り直す（chat.jsonl が正本） | `rebuild_from_chatlog.py --reset` → `build_fact_ledger.py` | 全部 |
+| 全部作り直す（履歴が正本） | `rebuild_rag_from_history.py --reset --extract` | memory.sqlite3 / 台帳 |
+
+```bash
+python tools/sync_memory.py --dry-run                                   # まず差分の確認
+python tools/sync_memory.py --filter-emotion --extract --rule-only      # chat.jsonl を正本に同期
+
+python tools/sync_memory.py --source history --propagate --dry-run      # UI削除後の確認
+python tools/sync_memory.py --source history --propagate --extract --rule-only
+```
+
+差分同期がすること: 正本に無い往復をDBから削除（**その往復から抽出した事実も一緒に削除**）／DBに無い往復を追加（埋め込み計算は差分だけ）／時刻の変更を反映（台帳の日付も揃える）／出典を失った事実（孤児）を掃除。照合は「ユーザー発言＋返答＋会話モード」の一致で行います（`ts` は手修正されうるので照合キーに含めません）。
+
+> **UIの削除について**: 削除は往復単位（あなたの発言＋返答）で行われ、その場で **4系統すべて**（`history.json` / `chat.jsonl` / `chat_emotion.jsonl` / `memory.sqlite3` と事実台帳）から取り除かれます。同期スクリプトを流す必要はありません。生ログの書き換え前には `.bak` へ退避します。2人だけモードで同じお題に他の返答が残る場合は、お題を残して返答だけを消します。生成済みの音声ファイル（`static/generated`）は他から参照される可能性があるため消しません。
+>
+> この削除は自動保存（`/api/session`）とは**別経路**（`/api/delete-turn`）で行います。自動保存は「いまの会話コンテキスト」を書くだけなので、そこから削除を推論すると Clear Context（コンテキストのリセット）と区別できず、残すべき生ログまで消してしまいます。`history.json` と `chat.jsonl` は内容が一致しないのが正常です（前者は Clear Context で空になり、後者は残る）。
+>
+> **`--propagate` が必要な理由**: UIの削除は `history.json` にしか効かないので、一番大本の `chat.jsonl` には残ります。そのままだと後日 `rebuild_from_chatlog.py` を実行したときに削除した会話が復活します。`--propagate` は大本まで消して整合させます（実行前に `.sync.bak` へ退避）。なお `--propagate` は `chat.jsonl` 全体を見るため、`--char` で対象を絞らずに実行してください。
+>
+> **`--reset` を伴う全再構築の注意**: DB ファイルごと削除するため事実台帳も消えます（FTS5索引は自動で作り直されます）。`rebuild_rag_from_history.py` は `--extract` で台帳まで作り直せます。DBを作り直すと `memories.id` が振り直されるため、古い `source_id` を持つ事実は自動で掃除されます。
+
+### 10. 会話履歴の自動保存と話者識別
 - 会話が1ターン進むごとにセッション履歴を自動保存（明示保存を待たずに復元できる）
 - 履歴に会話モード・話者・タイムスタンプを保持し、オートセーブでもモードを取り違えない
 - 話者をスロット（1P=main／2P=second）で識別し、1Pと2Pで同名のキャラクターでも記録・想起が混ざらない
@@ -237,6 +301,20 @@ Irodori-TTS の依存関係は次のどちらかで入れてください。
 | `RAG_QUERY_REWRITE` | `1` | 検索クエリのLLM書き換え（`0`で無効・原文検索） |
 | `RAG_QUERY_REWRITE_MODE` | （空） | 書き換えLLMの生成モード（空でチャットに追従。重ければ `prefill`） |
 | `RAG_QUERY_REWRITE_MULTI` | `3` | 列挙質問で生成する検索クエリの最大本数（`1`で単一） |
+| `RAG_LEXICAL_ENABLED` | `1` | 語彙チャネル（FTS5+LIKE）の有効化（`0`でベクトルのみ） |
+| `RAG_LEXICAL_LIMIT` | `24` | 語彙チャネルから載せる最大件数 |
+| `RAG_LEXICAL_LIMIT_ENUM` | `48` | 列挙質問時の語彙チャネル上限 |
+| `RAG_LEXICAL_SLACK` | `0.03` | 語彙一致行に許す類似度の緩め幅（独立した証拠なので閾値を下げる） |
+| `RAG_TEMPORAL_POOL_K` | `64` | 時系列で並べ替える前に確保する候補プール（狭いと最古/最新を取りこぼす） |
+| `RAG_TEMPORAL_K` | `8` | 年表としてプロンプトへ載せる件数 |
+| `RAG_TEMPORAL_BAND` | `0.04` | 時系列選抜で「話題の芯」と見なすスコア帯 |
+| `RAG_LEDGER_ENABLED` | `1` | 事実台帳の有効化（`0`で読み書きしない） |
+| `RAG_LEDGER_LIMIT` | `60` | 台帳から載せる事実の上限 |
+| `RAG_LEDGER_TURNS` | `8` | 台帳の裏付けとして年表へ含める原文の件数 |
+| `RAG_LEDGER_ALWAYS` | `0` | 時系列・列挙以外でも常に台帳を併用する |
+| `RAG_LEDGER_LIVE` | `1` | 返答後に今回の往復を台帳へ増分抽出（別スレッド） |
+| `RAG_LEDGER_LIVE_LLM` | `1` | 増分抽出でLLMを使う（`0`ならルール抽出のみ・完全に無料） |
+| `RAG_FACT_EXTRACT_MAXTOK` | `256` | 事実抽出LLMの生成上限 |
 
 ## キャラクターデータ
 

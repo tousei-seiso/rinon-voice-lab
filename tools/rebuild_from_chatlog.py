@@ -26,6 +26,13 @@
   - --reset も --dry-run も無い場合は誤操作防止のため中断する。
   - 未知の speaker があると（--map に無い）中断する（--skip-unmapped で読み飛ばし）。
   - 依存(numpy/torch or fastembed)が必要。埋め込み不可なら中断する。
+  - **--reset は DB ファイルごと消すため、事実台帳(facts)も一緒に失われる。**
+    再生成後に ``tools/build_fact_ledger.py`` を実行して台帳を作り直すこと
+    （列挙質問の網羅と主客の取り違え防止に効く）。FTS5 語彙索引は自動で作られる。
+
+会話を数件だけ削除／修正した場合は、全再生成ではなく
+``tools/sync_memory.py``（差分同期）の方が速く、
+台帳も保たれる。本ツールは chat.jsonl から全部作り直す場合に使う。
 """
 
 from __future__ import annotations
@@ -216,6 +223,12 @@ def _rebuild_db(char_id: str, turns: list[dict]) -> dict:
             ts=turn["ts"],
         )
         counts["ok" if ok else "fail"] += 1
+    # DB を作り直すと memories.id が振り直されるので、古い source_id を指したままの
+    # 事実（別の往復・存在しない往復を指す）は掃除する。_reset_db を通っていれば
+    # 台帳自体も消えているが、--reset 無しの経路でも整合するようここで必ず実行する。
+    orphans = rag.prune_orphan_facts(char_id)
+    if orphans:
+        print(f"[{char_id}] 出典を失った事実を削除: {orphans} 件")
     return counts
 
 

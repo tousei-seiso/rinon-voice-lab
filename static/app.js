@@ -2093,26 +2093,80 @@ regenAudioButton.addEventListener("click", async () => {
   }
 });
 
-// 削除：選択中の返答を会話から取り除く。誤操作防止のため (y/N) 確認を必須にし、
-// ENTER（空入力）や y 以外は削除せず、y を入力したときのみ実行する。
+// 削除：選択中の返答を、対応するユーザー発言（お題）ごと会話から取り除く。
+// 誤操作防止のため (y/N) 確認を必須にし、ENTER（空入力）や y 以外は削除しない。
+//
+// 返答だけを消すとユーザー発言が宛先を失って履歴に残り、次の想起や再構築で
+// 「問いかけだけがある往復」として扱われてしまう。RAG の記憶は往復単位で保存する
+// ため、削除も往復単位で揃える。
+// ただし2人だけモードは「お題1つに複数キャラの返答が続く」ので、他の返答がまだ
+// 残る場合はお題を消さない（残った返答が宛先を失うため）。
 deleteMessageButton.addEventListener("click", () => {
   const node = selectedMessageNode;
   if (!node) {
     audioSaveStatus.textContent = "no target";
     return;
   }
-  const answer = window.prompt("本当に削除しますか？ (y/N)", "");
+  const url = node.dataset.audioUrl || "";
+  const entry = findHistoryEntryByAudioUrl(url);
+  const idx = entry ? history.indexOf(entry) : -1;
+
+  // この返答に紐づくユーザー発言（直前の user）と、それを共有する他の返答を調べる。
+  let userIdx = -1;
+  let siblingReplies = 0;
+  if (idx >= 0) {
+    for (let i = idx - 1; i >= 0; i -= 1) {
+      if (history[i] && history[i].role === "user") {
+        userIdx = i;
+        break;
+      }
+    }
+    if (userIdx >= 0) {
+      for (let i = userIdx + 1; i < history.length; i += 1) {
+        if (!history[i] || history[i].role !== "assistant") break;
+        if (i !== idx) siblingReplies += 1;
+      }
+    }
+  }
+  const removeUser = userIdx >= 0 && siblingReplies === 0;
+
+  const answer = window.prompt(
+    removeUser
+      ? "この往復（あなたの発言と返答）を削除しますか？ (y/N)"
+      : "この返答を削除しますか？（お題は他の返答が使うので残します） (y/N)",
+    ""
+  );
   if (answer === null || answer.trim().toLowerCase() !== "y") {
     audioSaveStatus.textContent = "delete canceled";
     return;
   }
-  const url = node.dataset.audioUrl || "";
-  const entry = findHistoryEntryByAudioUrl(url);
-  if (entry) {
-    const idx = history.indexOf(entry);
-    if (idx >= 0) history.splice(idx, 1);
+
+  // DOM から対応するユーザー発言の枠も消す。history とDOMの並びは一致しない場合が
+  // あるため（自動会話のバックグラウンド返答は枠を作らず履歴にだけ積まれる）、
+  // インデックスではなく直前の .msg.user を辿って特定する。
+  if (removeUser) {
+    let prev = node.previousElementSibling;
+    while (prev && !prev.classList.contains("user")) {
+      prev = prev.previousElementSibling;
+    }
+    if (prev) prev.remove();
   }
   node.remove();
+
+  // 大本のログを照合するための本文を、履歴から取り除く前に控えておく。
+  // chat.jsonl は「1行 = ユーザー発言＋返答」なので、返答だけを消す場合でも
+  // 対応する行を特定するにはユーザー発言が必要（お題は他の行にも現れる）。
+  const removedReplyText = entry ? String(entry.content || "") : "";
+  const removedUserText =
+    userIdx >= 0 && history[userIdx] ? String(history[userIdx].content || "") : "";
+
+  // 履歴からも削除する。ユーザー発言を先に消すと返答の位置がずれるので、
+  // 後ろ（返答）から順に取り除く。
+  if (idx >= 0) {
+    history.splice(idx, 1);
+    if (removeUser) history.splice(userIdx, 1);
+  }
+
   // 削除した枠が再生対象だった場合はプレイヤーを空にする。
   if (selectedAudioUrl === url) {
     player.pause();
@@ -2123,8 +2177,48 @@ deleteMessageButton.addEventListener("click", () => {
   selectedMessageNode = null;
   updateSelectionActions();
   updateContextUsage();
-  audioSaveStatus.textContent = "deleted";
+  // 削除を history.json へ即時反映する（保存を待つ間に別の同期や再構築が走ると、
+  // 消したはずの会話が復活する）。
+  autoSaveSession();
+  // 大本の生ログ・感情ログ・RAG検索DB からも取り除く。ここを省くと chat.jsonl に
+  // 残り続け、後日そこから再構築したときに削除した会話が復活する。
+  // 自動保存とは別経路で「削除した」ことだけを伝える（自動保存は現在の会話
+  // コンテキストを書くだけなので、そこから削除を推論すると Clear Context と
+  // 区別できず、残すべき生ログまで消えてしまう）。
+  deleteTurnRecords({
+    userText: removedUserText,
+    replyText: removedReplyText,
+    audioUrl: url,
+  });
+  audioSaveStatus.textContent = removeUser ? "deleted (turn)" : "deleted (reply)";
 });
+
+// 削除した往復を大本のログと検索DBからも消すようサーバへ依頼する。
+// 失敗しても画面と history.json の削除は成立しているので、会話は止めずに警告だけ出す
+// （復旧したいときは tools/sync_memory.py --source history --propagate で追いつける）。
+async function deleteTurnRecords({ userText, replyText, audioUrl }) {
+  if (!userText && !audioUrl) return;
+  try {
+    const res = await fetch("/api/delete-turn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        characterId: activeMainCharacterId,
+        speaker: mainCharacterName,
+        twoOnlyMode: twoPlayerMode.checked && twoOnlyMode.checked,
+        userText: userText || "",
+        replyText: replyText || "",
+        audioUrl: audioUrl || "",
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.statusText);
+    const detail = `log ${data.chatLog} / mem ${data.memories} / fact ${data.facts}`;
+    audioSaveStatus.textContent = `deleted (${detail})`;
+  } catch (error) {
+    audioSaveStatus.textContent = `delete sync failed: ${error.message}`;
+  }
+}
 
 messageInput.addEventListener("compositionstart", () => {
   messageInputComposing = true;

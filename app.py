@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 import warnings
 from collections import deque
+from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import unescape as html_unescape
 from pathlib import Path
@@ -49,6 +50,12 @@ try:
     import rag_memory
 except Exception:  # 予期せぬ import 失敗でも本体は起動させる
     rag_memory = None
+# 事実台帳の抽出器（主客ハイブリッド）。純 stdlib なので通常は失敗しないが、
+# rag_memory と同じ思想で「無くても本体は動く」形にしておく。
+try:
+    import fact_extract
+except Exception:
+    fact_extract = None
 DEFAULT_CONTEXT_LIMIT = int(os.environ.get("LM_STUDIO_CONTEXT_LIMIT", "8200"))
 # キャラクター返答の生成待ち時間（秒）。返答が遅くて "timed out" になる場合はこの値を延ばす。
 LM_STUDIO_TIMEOUT = int(os.environ.get("LM_STUDIO_TIMEOUT", "300"))
@@ -200,6 +207,9 @@ External_speak_lock = threading.Lock()
 External_speak_events = deque(maxlen=80)
 External_speak_next_id = 0
 Codex_inbox_lock = threading.Lock()
+# chat.jsonl / chat_emotion.jsonl の追記と、削除による書き換えを排他する。
+# 削除は読み込み→絞り込み→全書き戻しなので、その途中に追記が入ると行を失う。
+Chat_log_lock = threading.Lock()
 Codex_inbox = deque(maxlen=120)
 Codex_inbox_next_id = 0
 
@@ -1169,8 +1179,164 @@ def save_character_image(payload: dict) -> dict:
 
 def append_chat_log(record: dict) -> None:
     LOG_ROOT.mkdir(parents=True, exist_ok=True)
-    with CHAT_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with Chat_log_lock:
+        with CHAT_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _match_deleted_turn(
+    record: dict, *, user_text: str, reply_text: str, audio_url: str, speaker: str
+) -> bool:
+    """ログ 1 行が「削除された往復」かどうかを判定する。
+
+    照合は確実な順に試す:
+      1) 結合音声の URL（combinedUrl）— 往復ごとに一意なので最も確実
+      2) ユーザー発言＋返答の一致
+    返答は保存場所で形が違う（chat.jsonl は本文のみ、history.json は「話者名: 本文」）ため、
+    どちらの形でも一致するように話者名を付けた形とも比べる。
+    """
+    if audio_url and str(record.get("combinedUrl") or "").strip() == audio_url:
+        return True
+    record_user = str(record.get("user") or "").strip()
+    if not user_text or record_user != user_text:
+        return False
+    record_reply = str(record.get("reply") or "").strip()
+    if not record_reply:
+        return False
+    record_speaker = str(record.get("speaker") or speaker or "").strip()
+    candidates = {record_reply}
+    if record_speaker:
+        candidates.add(f"{record_speaker}: {record_reply}")
+    return reply_text in candidates
+
+
+def delete_turn_records(payload: dict) -> dict:
+    """UI で削除された往復を、記憶系のファイルからまとめて取り除く。
+
+    履歴（history.json）はクライアントの自動保存で更新されるが、それだけでは
+      ・logs/chat.jsonl（一番大本の生ログ）
+      ・logs/chat_emotion.jsonl（感情キャプション付き返答）
+      ・profiles/sessions/<charId>/memory.sqlite3（RAG検索DB＋事実台帳）
+    に残り続ける。特に chat.jsonl に残ると、後日そこから再構築したときに
+    削除した会話が復活してしまうので、削除はこの 3 つまで揃えて初めて完了する。
+
+    生成済みの音声ファイル（static/generated 配下）は消さない。他の履歴から参照されて
+    いる可能性があり、消しても取り返せないため、掃除は別途手動で行う。
+    """
+    char_id = safe_character_id(payload.get("characterId"))
+    user_text = str(payload.get("userText") or "").strip()
+    reply_text = str(payload.get("replyText") or "").strip()
+    audio_url = str(payload.get("audioUrl") or "").strip()
+    speaker = str(payload.get("speaker") or "").strip()
+    two_only = bool(payload.get("twoOnlyMode", False))
+    if not user_text and not audio_url:
+        return {"ok": False, "error": "userText か audioUrl が必要です"}
+
+    result = {
+        "ok": True,
+        "characterId": char_id,
+        "memories": 0,
+        "facts": 0,
+        "chatLog": 0,
+        "emotionLog": 0,
+    }
+
+    # 1) RAG 検索DB（往復と、その往復から抽出した事実）
+    if rag_memory is not None:
+        try:
+            mode = "two_only" if two_only else "normal"
+            targets = [
+                turn["id"]
+                for turn in rag_memory.list_turns(char_id)
+                if str(turn.get("user_text") or "").strip() == user_text
+                and str(turn.get("reply_text") or "").strip() == reply_text
+                and str(turn.get("mode") or "normal") == mode
+            ]
+            if targets:
+                before = rag_memory.facts_stats(char_id)["count"]
+                result["memories"] = rag_memory.delete_memories(char_id, targets)
+                result["facts"] = max(
+                    0, before - rag_memory.facts_stats(char_id)["count"]
+                )
+        except Exception as exc:
+            result["ragError"] = f"{type(exc).__name__}: {exc}"
+
+    # 2) chat.jsonl（大本の生ログ）— 書き換え前に .bak へ退避する
+    with Chat_log_lock:
+        if CHAT_LOG_PATH.exists():
+            kept: list[str] = []
+            removed = 0
+            for line in CHAT_LOG_PATH.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except ValueError:
+                    kept.append(line)  # 壊れた行は判断できないので温存する
+                    continue
+                if isinstance(record, dict) and _match_deleted_turn(
+                    record,
+                    user_text=user_text,
+                    reply_text=reply_text,
+                    audio_url=audio_url,
+                    speaker=speaker,
+                ):
+                    removed += 1
+                    continue
+                kept.append(line)
+            if removed:
+                backup = CHAT_LOG_PATH.with_suffix(CHAT_LOG_PATH.suffix + ".bak")
+                if not backup.exists():
+                    shutil.copyfile(CHAT_LOG_PATH, backup)
+                CHAT_LOG_PATH.write_text(
+                    "\n".join(kept) + ("\n" if kept else ""), encoding="utf-8"
+                )
+            result["chatLog"] = removed
+
+        # 3) chat_emotion.jsonl（返答本文で紐づく）
+        if EMOTION_LOG_PATH.exists():
+            kept_emotion: list[str] = []
+            removed_emotion = 0
+            for line in EMOTION_LOG_PATH.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except ValueError:
+                    kept_emotion.append(line)
+                    continue
+                if isinstance(record, dict) and _match_deleted_turn(
+                    record,
+                    user_text=user_text,
+                    reply_text=reply_text,
+                    audio_url="",  # 感情ログは combinedUrl を持たない
+                    speaker=speaker,
+                ):
+                    removed_emotion += 1
+                    continue
+                kept_emotion.append(line)
+            if removed_emotion:
+                backup = EMOTION_LOG_PATH.with_suffix(EMOTION_LOG_PATH.suffix + ".bak")
+                if not backup.exists():
+                    shutil.copyfile(EMOTION_LOG_PATH, backup)
+                EMOTION_LOG_PATH.write_text(
+                    "\n".join(kept_emotion) + ("\n" if kept_emotion else ""),
+                    encoding="utf-8",
+                )
+            result["emotionLog"] = removed_emotion
+
+    print(
+        f"[delete] {char_id} memories={result['memories']} facts={result['facts']} "
+        f"chat.jsonl={result['chatLog']} emotion={result['emotionLog']} "
+        f"user={compact_text(user_text, 24)!r}"
+    )
+    return result
 
 
 def build_annotated_reply(reply: str, segments: list[dict]) -> str:
@@ -1196,8 +1362,9 @@ def build_annotated_reply(reply: str, segments: list[dict]) -> str:
 
 def append_emotion_log(record: dict) -> None:
     LOG_ROOT.mkdir(parents=True, exist_ok=True)
-    with EMOTION_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with Chat_log_lock:
+        with EMOTION_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def chat_log_summary(limit: int = 20) -> dict:
@@ -1410,6 +1577,28 @@ def _prior_mode_map(history_file: Path) -> dict[tuple[str, str], tuple[str, str]
     return result
 
 
+def _existing_history_keys(history_file: Path) -> set[tuple[str, str]]:
+    """既存 history.json に入っている (role, content) の集合を返す。
+
+    「今回追加された新しいターン」を見分けるために使う。クライアントは全履歴を
+    送り返してくるので、ディスク上に無いエントリだけが新規ターンである。
+    """
+    if not history_file.exists():
+        return set()
+    try:
+        data = json.loads(history_file.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return set()
+    history = data.get("history") if isinstance(data, dict) else data
+    if not isinstance(history, list):
+        return set()
+    return {
+        (str(item.get("role") or ""), str(item.get("content") or "").strip())
+        for item in history
+        if isinstance(item, dict)
+    }
+
+
 def write_character_history(char_id: str, entries: list[dict]) -> Path:
     """1 キャラ分の会話ログを profiles/sessions/<charId>/history.json へ書き出す。"""
     safe_id = safe_character_id(char_id)
@@ -1417,6 +1606,7 @@ def write_character_history(char_id: str, entries: list[dict]) -> Path:
     char_dir.mkdir(parents=True, exist_ok=True)
     history_file = char_dir / "history.json"
 
+    known_keys = _existing_history_keys(history_file)
     sanitized = sanitize_history(entries)
     # クライアントが mode/speaker を送り返さなくても、ディスク上の既存注釈を内容一致で
     # 復元する（手動注釈が自動保存で消えるのを防ぐ）。新規ターンは既存に無いので、
@@ -1435,6 +1625,18 @@ def write_character_history(char_id: str, entries: list[dict]) -> Path:
                 entry["speaker"] = saved_speaker
             if saved_ts and "ts" not in entry:
                 entry["ts"] = saved_ts
+
+    # 新規ターンにだけ現在時刻を刻む。「いつ話したか」を history.json 側にも残すことで、
+    # 履歴から DB を作り直しても時刻が失われない（tools/rebuild_rag_from_history.py）。
+    # 既にディスクにあるエントリには触らない: クライアントは毎回全履歴を送り返すため、
+    # 無条件に刻むと ts の無い過去ターン全部が「今日」に書き換わって時系列が壊れる。
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for entry in sanitized:
+        if entry.get("ts"):
+            continue
+        key = (str(entry.get("role") or ""), str(entry.get("content") or "").strip())
+        if key not in known_keys:
+            entry["ts"] = stamp
 
     payload = {
         "version": 2,
@@ -2495,6 +2697,252 @@ _RECALL_DEDUP = os.environ.get("RAG_RECALL_DEDUP", "1").strip().lower() not in {
 }
 
 
+# --- 時系列・列挙の意図検出 ---------------------------------------------------
+# 時系列想起の候補プール。時系列で選ぶ前に確保する広さで、狭いと最古/最新が
+# cosine 上位枠から溢れて取りこぼす（スコアは狭帯に潰れており順位は当てにならない）。
+_RECALL_TEMPORAL_POOL_K = int(os.environ.get("RAG_TEMPORAL_POOL_K", "64"))
+# 時系列質問で最終的にプロンプトへ載せる件数（年表の行数）。
+_RECALL_TEMPORAL_K = int(os.environ.get("RAG_TEMPORAL_K", "8"))
+# 時系列選抜で「話題の芯」と見なすスコア帯（最高スコアからの許容差）。
+# これが無いと、閾値ぎりぎりの無関係な古い記憶が「一番最初」の座を奪う。
+# 0.02 は実測にもとづく値: e5-small のスコアは 0.80〜0.84 に潰れており、
+# 「本を買った」系の記録が 0.828〜0.841、無関係な「はじめまして」が 0.801 だった。
+# 0.04 だと挨拶まで帯に入り、「一番最初に買ってあげた本」の答えが挨拶にすり替わる。
+_RECALL_TEMPORAL_BAND = float(os.environ.get("RAG_TEMPORAL_BAND", "0.02"))
+# 語彙チャネルから載せる上限。列挙質問では網羅性を優先して広げる。
+_RECALL_LEXICAL_LIMIT = int(os.environ.get("RAG_LEXICAL_LIMIT", "24"))
+_RECALL_LEXICAL_LIMIT_ENUM = int(os.environ.get("RAG_LEXICAL_LIMIT_ENUM", "48"))
+# 語彙一致は独立した証拠なので、ベクトルの閾値より少し緩めて採用する。
+_RECALL_LEXICAL_SLACK = float(os.environ.get("RAG_LEXICAL_SLACK", "0.03"))
+# 台帳から載せる事実の上限（列挙は集計なので既定を広く取る）。
+_RECALL_LEDGER_LIMIT = int(os.environ.get("RAG_LEDGER_LIMIT", "60"))
+# 台帳に載せた事実の出典として、原文の往復を何件まで年表へ含めるか
+# （一覧と年表が食い違わないための裏付け。多すぎると文脈を圧迫する）。
+_RECALL_LEDGER_TURNS = int(os.environ.get("RAG_LEDGER_TURNS", "8"))
+# 事実抽出 LLM の生成上限（短い JSON を返させるだけなので小さく保つ）。
+_FACT_EXTRACT_MAXTOK = int(os.environ.get("RAG_FACT_EXTRACT_MAXTOK", "256"))
+# 質問が時系列・列挙かどうかに関わらず、台帳を常に併用するか（0 なら時系列/列挙時のみ）。
+_LEDGER_ALWAYS = os.environ.get("RAG_LEDGER_ALWAYS", "0").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+# 毎ターンの増分抽出（返答後に今回の往復を台帳へ）。LLM 抽出を含むので必ず別スレッド。
+_LEDGER_LIVE = os.environ.get("RAG_LEDGER_LIVE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+# 増分抽出で LLM を使うか（0 ならルール抽出のみ＝完全にゼロコスト）。
+_LEDGER_LIVE_LLM = os.environ.get("RAG_LEDGER_LIVE_LLM", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+
+# 質問形の目印。時系列の並べ替えは「問われたとき」だけ効かせたいので、
+# 平叙文（「最初は苦手だったけど」等）で誤発火しないよう質問形を要求する。
+_QUESTION_RE = re.compile(
+    r"[?？]|だっけ|だったっけ|かな[?？]?$|覚えてる|おぼえてる|教えて|なんだ|何だ|"
+    r"なに|何|どれ|どっち|いつ|言って|挙げて|あげて$"
+)
+# 「一番最初」系（最古を答えさせる）。
+_FIRST_RE = re.compile(
+    r"(?:一番|いちばん|1番|最も|もっとも)\s*(?:最初|はじめ|初め|古い)|"
+    r"最初に|最初の|初めて|はじめて|初の|初回|最古|"
+    r"出会った(?:頃|ころ|とき|時|ばかり)|知り合った(?:頃|ころ|とき|時)|"
+    r"付き合い始め|一番古い"
+)
+# 「一番最後・最近」系（最新を答えさせる）。
+_LAST_RE = re.compile(
+    r"(?:一番|いちばん|1番)\s*(?:最後|新しい|最近)|最後に|最後の|最新|直近|"
+    r"この前|前回|さっき|最近"
+)
+# 「いつ？」系（日付・経過期間を答えさせる）。
+_WHEN_RE = re.compile(
+    r"いつ|何年|何月|何日|何ヶ月|何か月|どのくらい前|どれくらい前|どれぐらい前|時期|"
+    r"何年前|何日前"
+)
+# 列挙・網羅を求める発話（台帳と語彙チャネルの網羅性を効かせる）。
+_ENUM_RE = re.compile(
+    r"全部|ぜんぶ|すべて|全て|他に|ほかに|他の|いくつ|何個|何品|一覧|"
+    r"思いつく|挙げて|あげて|列挙|残らず|漏れなく"
+)
+# 期間の表現（相対・絶対）。
+_YEAR_RE = re.compile(r"(\d{4})\s*年")
+_MONTH_RE = re.compile(r"(?:(\d{4})\s*年)?\s*(\d{1,2})\s*月")
+_AGO_RE = re.compile(r"(\d+)\s*(日|週間|週|ヶ月|か月|カ月|ケ月|箇月|年)\s*(?:ほど|くらい|ぐらい)?前")
+_SEASONS = (("春", 3, 5), ("夏", 6, 8), ("秋", 9, 11), ("冬", 12, 2))
+
+
+def _month_end(year: int, month: int) -> date:
+    """指定年月の末日を返す（翌月 1 日の前日）。"""
+    if month >= 12:
+        return date(year + 1, 1, 1) - timedelta(days=1)
+    return date(year, month + 1, 1) - timedelta(days=1)
+
+
+def _resolve_period(text: str, today: date) -> tuple[str, str, str]:
+    """発話に含まれる期間表現を (since, until, ラベル) へ解決する。
+
+    粗い絞り込みでよい（記録は会話した日付なので、出来事の日付とは元々ズレる）。
+    解決できなければ空文字を返し、呼び出し側は期間で絞らない。
+    """
+    body = str(text or "")
+    year_offset = None
+    if re.search(r"去年|昨年", body):
+        year_offset = -1
+    elif re.search(r"おととし|一昨年", body):
+        year_offset = -2
+    elif re.search(r"今年", body):
+        year_offset = 0
+    # 「去年の夏」「今年の春」など季節つき
+    for name, start_month, end_month in _SEASONS:
+        if name not in body:
+            continue
+        base_year = today.year + (year_offset if year_offset is not None else 0)
+        if name == "冬":
+            since = date(base_year, 12, 1)
+            until = _month_end(base_year + 1, 2)
+        else:
+            since = date(base_year, start_month, 1)
+            until = _month_end(base_year, end_month)
+        label = ("去年の" if year_offset == -1 else "今年の" if year_offset == 0 else "") + name
+        return since.isoformat(), until.isoformat(), label
+    # 「YYYY年M月」「M月」
+    month_match = _MONTH_RE.search(body)
+    if month_match:
+        month = int(month_match.group(2))
+        if 1 <= month <= 12:
+            if month_match.group(1):
+                year = int(month_match.group(1))
+            else:
+                year = today.year + (year_offset if year_offset is not None else 0)
+                # 年の指定が無く、その月がまだ来ていないなら前年と解釈する。
+                if year_offset is None and month > today.month:
+                    year -= 1
+            return (
+                date(year, month, 1).isoformat(),
+                _month_end(year, month).isoformat(),
+                f"{year}年{month}月",
+            )
+    # 「YYYY年」だけ
+    year_match = _YEAR_RE.search(body)
+    if year_match:
+        year = int(year_match.group(1))
+        return date(year, 1, 1).isoformat(), date(year, 12, 31).isoformat(), f"{year}年"
+    # 「N日前」「Nヶ月前」「N年前」→ その粒度の前後を含む窓にする
+    ago_match = _AGO_RE.search(body)
+    if ago_match:
+        amount = int(ago_match.group(1))
+        unit = ago_match.group(2)
+        if unit == "日":
+            center = today - timedelta(days=amount)
+            return (
+                (center - timedelta(days=3)).isoformat(),
+                (center + timedelta(days=3)).isoformat(),
+                f"{amount}日前ごろ",
+            )
+        if unit in {"週間", "週"}:
+            center = today - timedelta(days=amount * 7)
+            return (
+                (center - timedelta(days=7)).isoformat(),
+                (center + timedelta(days=7)).isoformat(),
+                f"{amount}週間前ごろ",
+            )
+        if unit == "年":
+            year = today.year - amount
+            return (
+                date(year, 1, 1).isoformat(),
+                date(year, 12, 31).isoformat(),
+                f"{amount}年前（{year}年）",
+            )
+        # ヶ月
+        month_index = today.year * 12 + (today.month - 1) - amount
+        year, month = divmod(month_index, 12)
+        month += 1
+        since = date(year, month, 1) - timedelta(days=15)
+        until = _month_end(year, month) + timedelta(days=15)
+        return since.isoformat(), until.isoformat(), f"{amount}ヶ月前ごろ"
+    if year_offset is not None:
+        year = today.year + year_offset
+        label = {0: "今年", -1: "去年", -2: "おととし"}[year_offset]
+        return (
+            date(year, 1, 1).isoformat(),
+            date(year, 12, 31).isoformat(),
+            f"{label}（{year}年）",
+        )
+    if re.search(r"先月", body):
+        month_index = today.year * 12 + (today.month - 1) - 1
+        year, month = divmod(month_index, 12)
+        month += 1
+        return (
+            date(year, month, 1).isoformat(),
+            _month_end(year, month).isoformat(),
+            f"先月（{year}年{month}月）",
+        )
+    if re.search(r"今月", body):
+        return (
+            date(today.year, today.month, 1).isoformat(),
+            _month_end(today.year, today.month).isoformat(),
+            "今月",
+        )
+    if re.search(r"先週", body):
+        return (
+            (today - timedelta(days=14)).isoformat(),
+            (today - timedelta(days=6)).isoformat(),
+            "先週",
+        )
+    return "", "", ""
+
+
+def detect_recall_intent(user_text: str, today: date | None = None) -> dict:
+    """発話から想起の意図（時系列の向き・列挙・期間）を検出する。
+
+    戻り値:
+      ``temporal``  'first'（最古を答える） / 'last'（最新） / 'when'（日付を答える） / ''
+      ``enum``      列挙・網羅を求めているか
+      ``since`` / ``until`` / ``period``  期間の絞り込みとその表示名
+
+    時系列の並べ替えは質問のときだけ効かせる（平叙文で誤発火させない）。判定を外しても
+    壊れないのが前提の設計で、外れた場合は従来どおりスコア順の想起になるだけ。
+    """
+    text = str(user_text or "").strip()
+    # question は台帳の絞り込み（主客・動詞・カテゴリの推定）に使うので原文を持ち回る。
+    result = {
+        "temporal": "",
+        "enum": False,
+        "since": "",
+        "until": "",
+        "period": "",
+        "question": text,
+    }
+    if not text:
+        return result
+    result["enum"] = bool(_ENUM_RE.search(text))
+    since, until, period = _resolve_period(text, today or date.today())
+    result["since"] = since
+    result["until"] = until
+    result["period"] = period
+    if not _QUESTION_RE.search(text):
+        return result
+    # 「一番最初」→「最後」→「いつ」の順に見る（「最初に会ったのはいつ？」は first 優先。
+    # 最古を答えるのが主目的で、日付はそこに添えればよい）。
+    if _FIRST_RE.search(text):
+        result["temporal"] = "first"
+    elif _LAST_RE.search(text):
+        result["temporal"] = "last"
+    elif _WHEN_RE.search(text):
+        result["temporal"] = "when"
+    return result
+
+
 def _recall_dup_signature(mem: dict) -> str:
     """近重複を畳むための集約キー。同一シーンの記録（同じプロンプトが再生成・繰り返し
     プレイで別 ts に複数）を 1 つにまとめるため、user_text（無ければ reply_text）から
@@ -2513,8 +2961,12 @@ def rewrite_recall_queries(
     generation_mode: str = "",
     user_name: str = "",
     char_name: str = "",
-) -> list[str]:
+) -> tuple[list[str], str]:
     """ユーザー発話から、RAG 想起用の検索クエリを LLM で生成する（最大 N 本）。
+
+    戻り値は ``(クエリ列, 意図タグ)``。意図タグは 'first' / 'last' / 'when' / 'enum' を
+    カンマ区切りで含む文字列（不明なら空）。時系列・列挙の判定は正規表現
+    （detect_recall_intent）を主とし、こちらは言い回しの取りこぼしを補うだけの補助。
 
     生の会話発話は挨拶・相槌・依頼の枕詞などの雑音が多く、意味検索（e5）の精度が落ちる
     （例:「それじゃ早速声を聞かせて…質問です…讃岐うどん以外に作った料理を挙げて」）。
@@ -2529,7 +2981,7 @@ def rewrite_recall_queries(
     """
     user_text = str(user_text or "").strip()
     if not _QUERY_REWRITE_ENABLED or not user_text:
-        return []
+        return [], ""
     n = _QUERY_REWRITE_MULTI
     # 主体・客体は発話ごとに変わる（「ナデシコが破壊した」「オサムが作った」等）ので、
     # 上の汎用ルールで明示された主体・客体はそのまま保つ。ただし主語が省略され文脈でも
@@ -2572,7 +3024,15 @@ def rewrite_recall_queries(
         "使わず、日常の具体語（夕飯・晩御飯・おかず・和食・中華・煮物 等）や想定される品目・"
         "食材で角度を変えること。単純な質問なら 1 行でよい。\n"
         + actor_rule
-        + "・説明・引用符・記号・箇条書き番号・思考は出さず、クエリ本文だけを行区切りで返す。/no_think"
+        + "・『いつ』『一番最初』『初めて』『最後』『最近』『去年』『先月』『3月』等、"
+        "時期・順序・日付を尋ねる語や期間の表現はクエリに入れない（時期の絞り込みと"
+        "時系列の並べ替えは検索とは別の仕組みで行うため、クエリには話題の核だけを残す。"
+        "例:『一番最初に買ってあげた本は何だっけ？』→『買った 本 プレゼント』）。\n"
+        "・1 行目に、その発話が何を求めているかのタグを `#intent:` として出す。"
+        "使える値は first（最初・初めてを聞いている）/ last（最後・最近）/ when（いつ・時期）/ "
+        "enum（全部・網羅・列挙）/ none（いずれでもない）で、複数該当ならカンマ区切り"
+        "（例: `#intent: first,when`）。2 行目以降にクエリ本文を書く。\n"
+        + "・説明・引用符・記号・箇条書き番号・思考は出さず、タグ行とクエリ本文だけを行区切りで返す。/no_think"
     )
     parts: list[str] = []
     if str(recent_context or "").strip():
@@ -2611,16 +3071,26 @@ def rewrite_recall_queries(
         )
         content = str(data["choices"][0]["message"].get("content") or "").strip()
     except Exception:
-        return []
+        return [], ""
     if not content:
-        return []
+        return [], ""
     # 各行を独立クエリとして拾い、「検索クエリ:」等のラベル・箇条書き記号・囲みの引用符を
     # 剥がしてから重複を除く（大小無視）。上限 n 本で打ち切る。
+    # `#intent:` 行はクエリではなく意図タグとして取り分ける（出さないモデルもあるので、
+    # 無い場合も正常系として扱い、呼び出し側は正規表現の判定だけで動く）。
     queries: list[str] = []
     seen: set[str] = set()
+    intent = ""
     for line in content.splitlines():
         line = line.strip()
         if not line:
+            continue
+        intent_match = re.match(r"^#?\s*intent\s*[:：]\s*(.+)$", line, flags=re.IGNORECASE)
+        if intent_match:
+            tags = re.split(r"[,、\s/]+", intent_match.group(1).strip().lower())
+            intent = ",".join(
+                tag for tag in tags if tag in {"first", "last", "when", "enum"}
+            )
             continue
         line = re.sub(r"^(検索クエリ|クエリ|query)\s*[:：]\s*", "", line, flags=re.IGNORECASE).strip()
         line = re.sub(r"^(?:[-*・>]+|\d+[.)、])\s*", "", line).strip()
@@ -2634,7 +3104,368 @@ def rewrite_recall_queries(
         queries.append(line)
         if len(queries) >= n:
             break
-    return queries
+    return queries, intent
+
+
+def _merge_recalled(pool: dict, memories: list[dict]) -> None:
+    """想起結果を ts（無ければ本文）キーの辞書へ和集合で畳み込む（最高スコアを採用）。
+
+    同じ往復が複数チャネル・複数クエリから来るので、ここで 1 件へまとめる。
+    語彙チャネル由来（score=0 になり得る）が、ベクトル由来の高スコアを上書きしない
+    ように、スコアは常に大きい方を残し、``via`` は両方を記録する。
+    """
+    for mem in memories:
+        key = str(mem.get("ts") or "") or (
+            f"{mem.get('user_text')}\n{mem.get('reply_text')}"
+        )
+        current = pool.get(key)
+        if current is None:
+            pool[key] = dict(mem)
+            continue
+        if float(mem.get("score") or 0) > float(current.get("score") or 0):
+            merged_via = current.get("via")
+            current.update(mem)
+            if merged_via and merged_via != mem.get("via"):
+                current["via"] = f"{merged_via}+{mem.get('via')}"
+        elif mem.get("via") and mem.get("via") != current.get("via"):
+            current["via"] = f"{current.get('via')}+{mem.get('via')}"
+
+
+def _select_recalled(pool: list[dict], intent: dict) -> list[dict]:
+    """想起プールから、意図に応じて最終的に載せる記憶を選ぶ。
+
+    時系列質問（first/last）では、スコア順に切ってから並べ替えるのでは最古/最新を
+    取りこぼす。逆に、緩い閾値のまま時系列で切ると無関係な古い記憶が「最初」の座を
+    奪う。そこで「話題の芯（最高スコアから _RECALL_TEMPORAL_BAND 以内）」に絞って
+    から時系列で選び、最後にスコア上位も少数だけ足して話題の軸を保つ。
+    """
+    if not pool:
+        return []
+    by_score = sorted(pool, key=lambda mem: -float(mem.get("score") or 0))
+    temporal = str(intent.get("temporal") or "")
+    if temporal not in {"first", "last"}:
+        # when / 期間 / 通常はスコア順（提示側で年表に整形するかどうかが変わるだけ）。
+        limit = _RECALL_TEMPORAL_K if temporal == "when" else _RECALL_TOP_K
+        return by_score[:limit]
+    band = _RECALL_TEMPORAL_BAND
+    # by_score とは別リストにする（下の in-place ソートで by_score の順序が壊れると、
+    # 後段の「スコア上位も少数だけ含める」が実際には最古 2 件を足してしまう）。
+    focused = list(by_score)
+    if band > 0 and by_score:
+        floor = float(by_score[0].get("score") or 0) - band
+        # 語彙チャネル由来でスコアが付いていない行（score=0）は帯で落とさない。
+        # 語の一致という独立した証拠があるため、cosine の帯だけで切ると
+        # 「最古の 1 件」を語彙チャネルで拾った意味が無くなる。
+        focused = [
+            mem
+            for mem in by_score
+            if float(mem.get("score") or 0) >= floor or not mem.get("score")
+        ] or list(by_score)
+    # 主題の直接証拠がある記憶（検索語が実際に本文へ一致した／台帳の出典である）を優先する。
+    # cosine のスコア帯だけには頼れない: e5-small では無関係な挨拶(0.801)と本の記録(0.841)の
+    # 差が帯の幅と同程度しかなく、帯だけで絞ると「一番最初」が挨拶にすり替わる（実測）。
+    # 語の一致は主題の直接証拠なので、こちらがあれば時系列選抜はその中だけで行う。
+    evidenced = [
+        mem
+        for mem in focused
+        if "keyword" in str(mem.get("via") or "") or "ledger" in str(mem.get("via") or "")
+    ]
+    if evidenced:
+        focused = evidenced
+    focused.sort(
+        key=lambda mem: rag_memory.ts_sort_key(mem.get("ts")),
+        reverse=(temporal == "last"),
+    )
+    picked = focused[: _RECALL_TEMPORAL_K]
+    picked_keys = {id(mem) for mem in picked}
+    # 話題の軸を保つため、スコア最上位も 2 件までは必ず含める（年表なので
+    # 追加しても時系列の位置に並ぶだけで「先頭＝最古」は崩れない）。
+    for mem in by_score[:2]:
+        if id(mem) not in picked_keys:
+            picked.append(mem)
+    return picked
+
+
+def recall_for_turn(
+    character_id: str,
+    *,
+    queries: list[str],
+    slot: str,
+    mode: str,
+    intent: dict,
+    recent_user_texts: list,
+    user_name: str = "",
+    char_name: str = "",
+) -> dict:
+    """ベクトル・語彙・台帳の 3 チャネルで想起し、プロンプト用のブロックを組む。
+
+    どのチャネルも「あれば使う」追加レイヤーとして扱い、失敗・0 件でも他が動く。
+    戻り値は ``{"block": str, "mode": str, "stats": dict}``。``mode`` は
+    request_lmstudio へ渡す提示形式（''／'timeline'／'ledger'／'timeline+ledger'）。
+    """
+    result = {"block": "", "mode": "", "stats": {}}
+    if rag_memory is None:
+        return result
+    temporal = str(intent.get("temporal") or "")
+    enum = bool(intent.get("enum"))
+    since = str(intent.get("since") or "")
+    until = str(intent.get("until") or "")
+    order = {"first": "oldest", "last": "newest"}.get(temporal, "score")
+    pool: dict = {}
+    # 台帳を引くための絞り込み条件（主体・行為・向き・カテゴリ）を先に推定する。
+    # 行為を尋ねる質問（verb が取れた質問）は、時系列・列挙でなくても台帳を使う:
+    # 「君が俺に作ってくれた料理は？」は意味検索だと「俺が君に作ってあげた」記憶と
+    # ほぼ同じベクトルになり、主客を取り違えた回答（「私は作っていません」等）の
+    # 原因になる。向きを構造で持つ台帳はここでこそ効く。
+    filters: dict = {}
+    if fact_extract is not None:
+        filters = fact_extract.infer_query_filters(
+            " ".join([str(intent.get("question") or "")] + list(queries)),
+            user_name=user_name,
+            char_name=char_name,
+        )
+    use_ledger = bool(
+        temporal or enum or since or _LEDGER_ALWAYS or filters.get("verb")
+    )
+
+    # 1) ベクトル（意味）チャネル: 従来の想起。時系列質問ではプールを広げて ts で並べ替える。
+    for query in queries:
+        try:
+            hits = rag_memory.recall_memory(
+                character_id,
+                query,
+                k=_RECALL_TEMPORAL_K if order != "score" else _RECALL_TOP_K,
+                slot=slot,
+                mode=mode,
+                recent_user_texts=recent_user_texts,
+                min_score=_RECALL_MIN_SCORE,
+                order=order,
+                pool_k=_RECALL_TEMPORAL_POOL_K,
+                since=since,
+                until=until,
+                score_band=_RECALL_TEMPORAL_BAND if order != "score" else 0.0,
+            )
+        except Exception:
+            hits = []
+        _merge_recalled(pool, hits)
+    result["stats"]["vector"] = len(pool)
+
+    # 2) 語彙チャネル: 件数上限のない一致検索。cosine top-k が構造的に取りこぼす
+    #    「最古の 1 件」「該当の全件」をここで補う。
+    lexical_count = 0
+    if temporal or enum or since or use_ledger:
+        keywords: list[str] = []
+        for query in queries:
+            keywords.extend(rag_memory.normalize_keywords(query))
+        try:
+            lexical = rag_memory.search_lexical(
+                character_id,
+                keywords,
+                slot=slot,
+                mode=mode,
+                since=since,
+                until=until,
+                order={"last": "newest"}.get(temporal, "oldest"),
+                limit=_RECALL_LEXICAL_LIMIT_ENUM if enum else _RECALL_LEXICAL_LIMIT,
+                rescore_query=queries[0] if queries else "",
+                min_score=max(0.0, _RECALL_MIN_SCORE - _RECALL_LEXICAL_SLACK),
+                # 列挙質問では網羅性を優先して 1 語一致でも拾う。既定（3 語以上なら 2 語
+                # 一致を要求）だと、「作った 料理 献立」に対して「肉じゃがを作ってあげた」が
+                # 『作』しか一致せず落ちる＝列挙の主役が全部消える（実測）。
+                # 誤爆は再スコアと台帳・原文の併記で吸収する。
+                min_hits=1 if enum else 0,
+            )
+        except Exception:
+            lexical = []
+        lexical_count = len(lexical)
+        _merge_recalled(pool, lexical)
+    result["stats"]["lexical"] = lexical_count
+
+    # 3) 台帳チャネル: 列挙・時系列は検索ではなく集計。SQL で全件が返るので、
+    #    主客（誰が誰に）を取り違えず、件数の窓による漏れも起きない。
+    facts: list[dict] = []
+    if use_ledger and fact_extract is not None:
+        try:
+            facts = rag_memory.query_facts(
+                character_id,
+                category=filters.get("category", ""),
+                verb=filters.get("verb", ""),
+                direction=filters.get("direction", ""),
+                slot=slot,
+                mode=mode,
+                since=since,
+                until=until,
+                order="newest" if temporal == "last" else "oldest",
+                limit=_RECALL_LEDGER_LIMIT,
+            )
+        except Exception:
+            facts = []
+    result["stats"]["ledger"] = len(facts)
+    result["stats"]["filters"] = filters
+
+    # 台帳に載せる事実の出典（原文の往復）を必ず想起プールへ入れる。
+    # 台帳は索引にすぎないので、一覧だけを見せると LLM は抽出ミスを検証できない。
+    # さらに一覧と年表が別の出来事を指していると（例: 一覧は「星の王子さま」、年表は
+    # 「写真集」）、どちらが最初なのか判断できず誤答の原因になる。
+    ledger_sources = []
+    for fact in facts:
+        source_id = fact.get("source_id")
+        if source_id and source_id not in ledger_sources:
+            ledger_sources.append(source_id)
+    ledger_turns: list[dict] = []
+    if ledger_sources:
+        try:
+            ledger_turns = rag_memory.fetch_turns(
+                character_id,
+                ledger_sources[:_RECALL_LEDGER_TURNS],
+                slot=slot,
+                mode=mode,
+            )
+        except Exception:
+            ledger_turns = []
+        _merge_recalled(pool, ledger_turns)
+    result["stats"]["ledgerTurns"] = len(ledger_turns)
+
+    # 近重複の集約（同一シーンが別 ts で何度も記録されている分を 1 つに畳む）。
+    merged = list(pool.values())
+    if _RECALL_DEDUP:
+        collapsed: dict = {}
+        for mem in merged:
+            signature = _recall_dup_signature(mem)
+            current = collapsed.get(signature)
+            if current is None or float(mem.get("score") or 0) > float(
+                current.get("score") or 0
+            ):
+                collapsed[signature] = mem
+        merged = list(collapsed.values())
+    recalled = _select_recalled(merged, intent)
+    # 台帳の出典は、スコア順の選抜から漏れても必ず載せる（score が付かない経路なので、
+    # そのままでは下位に沈む）。年表は時系列に並べ直されるので、追加しても
+    # 「先頭＝最古」は崩れない。
+    shown_keys = {
+        str(mem.get("ts") or "") or f"{mem.get('user_text')}\n{mem.get('reply_text')}"
+        for mem in recalled
+    }
+    for mem in ledger_turns:
+        key = str(mem.get("ts") or "") or (
+            f"{mem.get('user_text')}\n{mem.get('reply_text')}"
+        )
+        if key not in shown_keys:
+            recalled.append(mem)
+            shown_keys.add(key)
+    result["stats"]["shown"] = len(recalled)
+
+    blocks: list[str] = []
+    block_mode: list[str] = []
+    if recalled:
+        # 列挙質問も年表（古い順・日付つき）で出す。スコア順にバラバラだと LLM が
+        # 重複を畳みにくく、時期の重なりも判断できない。
+        if temporal or since or enum:
+            span = rag_memory.memory_span(character_id, slot=slot, mode=mode)
+            blocks.append(rag_memory.build_timeline_block(recalled, span=span))
+            block_mode.append("timeline")
+        else:
+            blocks.append(rag_memory.build_memory_block(recalled))
+    if facts:
+        ledger_block = rag_memory.build_ledger_block(facts)
+        if ledger_block:
+            blocks.append("【記録から拾った出来事の一覧】\n" + ledger_block)
+            block_mode.append("ledger")
+    result["block"] = "\n\n".join(block for block in blocks if block)
+    result["mode"] = "+".join(block_mode)
+    return result
+
+
+def make_fact_llm(model: str | None = None, generation_mode: str = "") -> object:
+    """fact_extract へ注入する LLM 呼び出し（system, user → 本文）を作る。
+
+    抽出は短い JSON を返させるだけなので上限も小さく、思考は抑止する。
+    失敗時は例外を投げ、呼び出し側（fact_extract.extract）がルール結果へ落ちる。
+    """
+
+    def call(system: str, prompt: str) -> str:
+        payload = {
+            "model": model or DEFAULT_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": _FACT_EXTRACT_MAXTOK,
+            "stream": False,
+        }
+        mode = str(generation_mode or "").strip().lower()
+        if mode not in LM_GENERATION_MODES:
+            mode = DEFAULT_LM_GENERATION_MODE
+        data = _request_lmstudio_content(
+            payload,
+            segmented_mode=False,
+            auto_emoji=False,
+            base_max_tokens=_FACT_EXTRACT_MAXTOK,
+            mode=mode,
+        )
+        return str(data["choices"][0]["message"].get("content") or "")
+
+    return call
+
+
+def extract_facts_for_turn(
+    character_id: str,
+    source_id: int,
+    *,
+    user_text: str,
+    reply_text: str,
+    ts: str = "",
+    slot: str = "main",
+    mode: str = "normal",
+    speaker: str = "",
+    user_name: str = "",
+    char_name: str = "",
+    model: str | None = None,
+    generation_mode: str = "",
+    use_llm: bool = True,
+) -> int:
+    """1 往復を事実台帳へ抽出・保存する（増分抽出。別スレッドから呼ぶ）。
+
+    ルールで主客が確定した往復は LLM を呼ばずに終わる（大半はここで済む）。
+    保存した事実の数を返す。例外は投げず 0 を返す（会話本体に影響させない）。
+    """
+    if rag_memory is None or fact_extract is None:
+        return 0
+    try:
+        llm = make_fact_llm(model, generation_mode) if use_llm else None
+        facts = fact_extract.extract(
+            user_text,
+            reply_text,
+            user_name=user_name,
+            char_name=char_name,
+            mode=mode,
+            speaker=speaker,
+            llm=llm,
+        )
+        if not facts:
+            return 0
+        saved = rag_memory.save_facts(
+            character_id,
+            facts,
+            source_id=source_id,
+            ts=ts,
+            slot=slot,
+            mode=mode,
+        )
+        if saved:
+            print(
+                f"[ledger] +{saved} facts from turn {source_id}: "
+                + " / ".join(
+                    f"{f.get('subject') or '?'}→{f.get('recipient') or '?'} "
+                    f"{f.get('verb')}:{f.get('object')}"
+                    for f in facts[:3]
+                )
+            )
+        return saved
+    except Exception as exc:
+        print(f"[ledger] extract failed: {type(exc).__name__}: {exc}")
+        return 0
 
 
 def _thinking_prefill(segmented_mode: bool, auto_emoji: bool) -> tuple[str, str]:
@@ -2719,6 +3550,7 @@ def request_lmstudio(
     style_guide: str = "",
     generation_mode: str = DEFAULT_LM_GENERATION_MODE,
     memory_block: str = "",
+    memory_mode: str = "",
 ) -> tuple[str, str, str, int, list[dict[str, str]]]:
     if generation_mode not in LM_GENERATION_MODES:
         generation_mode = DEFAULT_LM_GENERATION_MODE
@@ -2761,6 +3593,33 @@ def request_lmstudio(
             "求めた場合に限り、上の記憶から該当する項目を“主なものだけ”に絞らず、思い出せる"
             "限り漏れなく（重複は1つにまとめて）挙げてください。"
         )
+        # 時系列で並べた年表を渡した場合の読み方。日付の差分計算は LLM が苦手なので、
+        # 計算済みの経過期間をそのまま使わせ、記録範囲の外は断定させない。
+        if "timeline" in str(memory_mode or ""):
+            memory_instruction += (
+                "\n上の記憶は日時つきで**古い順**に並んでいます（先頭が最も古く、末尾が最も新しい）。"
+                "『一番最初』『初めて』を訊かれたら該当する最も古い記録を、『最後』『最近』なら"
+                "最も新しい記録を答えてください。日付はその話をした日です。"
+                "『いつ？』には添えてある年月と経過期間（例: 約1年前）をそのまま使い、"
+                "自分で日数を計算し直さないでください。"
+                "『記録の範囲』より前のことは記録が残っていないだけで、"
+                "「そんな出来事は無かった」ことにはなりません。"
+                "該当が無いときや、範囲の先頭に近すぎて本当に最初か確信が持てないときは、"
+                "断定せず『たしか…だったと思う』のように曖昧に答えてください"
+                "（覚えていない事実を作らないこと）。"
+            )
+        # 事実台帳（一覧）を渡した場合の読み方。主客の取り違えを防ぐのが主目的。
+        if "ledger" in str(memory_mode or ""):
+            memory_instruction += (
+                "\n【出来事の一覧】は上の会話記録から機械的に抜き出した索引です。"
+                "各行は「誰が→誰に 何をした: 対象」の形で、誰がした事なのかを必ずその通りに"
+                "扱ってください（あなたがした事とユーザーがした事を絶対に入れ替えないこと）。"
+                "『（主客不明）』と付いた行は、どちらがした事か記録から判別できなかったものなので、"
+                "自分がした事として語らないでください。"
+                "一覧は索引にすぎないので、内容が上の会話記録と食い違うときは会話記録の方を信じてください。"
+                "列挙を求められたら一覧の項目を漏れなく挙げ、求められていなければ一覧を読み上げず、"
+                "会話の流れに合う分だけ自然に触れてください。"
+            )
     # 感情の変化ごとにセグメント分割させる新モード。台詞禁止モード時は挙動維持のため
     # 従来の「返答全体で絵文字1つ」を使う。
     segmented_mode = auto_emoji and not no_dialogue
@@ -3918,6 +4777,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(500, {"error": str(exc)})
             return
 
+        if parsed.path == "/api/delete-turn":
+            # UI で削除した往復を、大本の生ログ・感情ログ・RAG検索DB からも取り除く。
+            # 履歴の自動保存（/api/session）とは別経路にしてある: 自動保存は「いまの会話
+            # コンテキスト」を書くだけなので、そこから削除を推論すると
+            # Clear Context（コンテキストのリセット）と区別できず、生ログを消してしまう。
+            try:
+                self.send_json(200, delete_turn_records(read_json_body(self)))
+            except Exception as exc:
+                self.send_json(500, {"error": str(exc)})
+            return
+
         if parsed.path == "/api/save-audio":
             try:
                 self.send_json(200, save_current_audio(read_json_body(self)))
@@ -4124,6 +4994,7 @@ class Handler(BaseHTTPRequestHandler):
             # 意味的に近い過去ログを裏で top-k 抽出して参考枠として差し込む（併用）。
             # 失敗時・ヒット0件時は memory_block を空にして従来動作へフォールバックする。
             memory_block = ""
+            memory_mode = ""
             if rag_memory is not None:
                 try:
                     # 生発話は会話的な雑音（挨拶・枕詞）が多く意味検索の精度が落ちるため、
@@ -4135,18 +5006,39 @@ class Handler(BaseHTTPRequestHandler):
                         if _m.get("role") == "assistant":
                             recent_ctx = compact_text(_m.get("content"), 200)
                             break
-                    recall_queries = rewrite_recall_queries(
+                    recall_queries, intent_hint = rewrite_recall_queries(
                         user_text,
                         recent_ctx,
                         model=model,
                         generation_mode=generation_mode,
                         user_name=user_address,
                         char_name=speaker,
-                    ) or [user_text]
+                    )
+                    recall_queries = recall_queries or [user_text]
                     if recall_queries != [user_text]:
                         print(
                             "[rag] recall queries rewritten -> "
                             + " | ".join(compact_text(q, 60) for q in recall_queries)
+                        )
+                    # 時系列・列挙・期間の意図を検出する。正規表現を主とし、LLM が返した
+                    # タグ（intent_hint）は正規表現が何も拾えなかったときだけ採用する
+                    # （判定のブレを最小化するため。外しても従来のスコア順想起に落ちるだけ）。
+                    recall_intent = detect_recall_intent(user_text)
+                    if intent_hint:
+                        tags = set(intent_hint.split(","))
+                        if not recall_intent["temporal"]:
+                            for tag in ("first", "last", "when"):
+                                if tag in tags:
+                                    recall_intent["temporal"] = tag
+                                    break
+                        if "enum" in tags:
+                            recall_intent["enum"] = True
+                    if recall_intent["temporal"] or recall_intent["enum"] or recall_intent["period"]:
+                        print(
+                            "[rag] intent temporal="
+                            f"{recall_intent['temporal'] or '-'} enum={recall_intent['enum']}"
+                            f" period={recall_intent['period'] or '-'}"
+                            f" (llm hint={intent_hint or '-'})"
                         )
                     # dedup は「LLM が実際に見る圧縮後 messages」を基準にする。
                     # raw_messages（全履歴）基準にすると、文脈から溢れて要約に畳まれた
@@ -4160,66 +5052,39 @@ class Handler(BaseHTTPRequestHandler):
                     # 2人だけモードのお題と 1P 通常会話の記憶が混ざらないよう、現在の
                     # ターンと同じ会話モードの記憶だけを想起対象にする。
                     recall_mode = "two_only" if two_only_mode else "normal"
-                    # 複数クエリの想起結果を ts で和集合（同一記憶は最高スコアを採用）し、
-                    # スコア降順で top_k に切る。「全部挙げて」等の列挙質問で、1 本のクエリ
-                    # では top-k に埋もれる記憶を、観点違いのクエリで拾い上げるための併合。
-                    merged: dict = {}
-                    for _q in recall_queries:
-                        for _mem in rag_memory.recall_memory(
-                            character_id,
-                            _q,
-                            k=_RECALL_TOP_K,
-                            slot=speaker_slot,
-                            mode=recall_mode,
-                            recent_user_texts=recent_user_texts,
-                            min_score=_RECALL_MIN_SCORE,
-                        ):
-                            _key = str(_mem.get("ts") or "") or (
-                                f"{_mem.get('user_text')}\n{_mem.get('reply_text')}"
-                            )
-                            _cur = merged.get(_key)
-                            if _cur is None or float(_mem.get("score") or 0) > float(
-                                _cur.get("score") or 0
-                            ):
-                                merged[_key] = _mem
-                    # 近重複の集約: 同じ晩御飯シーンが別 ts で何度も記録されている
-                    # （再生成や繰り返しプレイで同一プロンプトが複数日ぶん）と、列挙の
-                    # top_k 枠を同じ料理が食い潰して種類数が伸びない。正規化した署名で
-                    # まとめ、各クラスタは最高スコアの 1 件だけ残してから top_k に切る。
-                    # RAG_RECALL_DEDUP=0 で無効化（切り分け用）。
-                    if _RECALL_DEDUP:
-                        collapsed: dict = {}
-                        for _mem in merged.values():
-                            _sig = _recall_dup_signature(_mem)
-                            _cur = collapsed.get(_sig)
-                            if _cur is None or float(_mem.get("score") or 0) > float(
-                                _cur.get("score") or 0
-                            ):
-                                collapsed[_sig] = _mem
-                        pool = collapsed.values()
-                    else:
-                        pool = merged.values()
-                    recalled = sorted(
-                        pool, key=lambda x: -float(x.get("score") or 0)
-                    )[:_RECALL_TOP_K]
-                    # 想起が「何を」差し込んだかを可視化（想起漏れ/誤想起の切り分け用）。
-                    # 実発話が曖昧（「作った料理」＝誰が作った？）だと、オサムが作った料理の
-                    # 記憶ではなく別の記憶を拾って回答がすり替わることがあるため、件数だけで
-                    # なく上位のスニペットも出す。
-                    if recalled:
+                    # ベクトル（意味）・語彙（全件一致）・台帳（集計）の 3 チャネルで想起し、
+                    # 意図に応じて年表／一覧へ整形する。詳細は recall_for_turn を参照。
+                    recall_result = recall_for_turn(
+                        character_id,
+                        queries=recall_queries,
+                        slot=speaker_slot,
+                        mode=recall_mode,
+                        intent=recall_intent,
+                        recent_user_texts=recent_user_texts,
+                        user_name=user_address,
+                        char_name=speaker,
+                    )
+                    memory_block = recall_result["block"]
+                    memory_mode = recall_result["mode"]
+                    # 想起が「どのチャネルから何件を」差し込んだかを可視化（想起漏れ・
+                    # 誤想起の切り分け用）。実発話が曖昧（「作った料理」＝誰が作った？）だと
+                    # 別の記憶を拾って回答がすり替わるため、件数と内訳を残す。
+                    _stats = recall_result["stats"]
+                    if memory_block:
                         print(
-                            f"[rag] recalled {len(recalled)} memories "
-                            f"(union={len(merged)}, score {recalled[-1].get('score')}"
-                            f"..{recalled[0].get('score')}): "
-                            + " / ".join(
-                                compact_text(m.get("user_text"), 20) for m in recalled[:6]
-                            )
+                            f"[rag] recalled shown={_stats.get('shown', 0)} "
+                            f"(vector={_stats.get('vector', 0)} "
+                            f"lexical={_stats.get('lexical', 0)} "
+                            f"ledger={_stats.get('ledger', 0)}) "
+                            f"mode={memory_mode or 'plain'} "
+                            f"filters={_stats.get('filters') or '-'}"
                         )
                     else:
                         print("[rag] recalled 0 memories")
-                    memory_block = rag_memory.build_memory_block(recalled)
-                except Exception:
+                except Exception as exc:
+                    print(f"[rag] recall failed: {type(exc).__name__}: {exc}")
                     memory_block = ""
+                    memory_mode = ""
             reply, model_used, llm_emoji, chunk_limit, segments = request_lmstudio(
                 messages,
                 model,
@@ -4233,6 +5098,7 @@ class Handler(BaseHTTPRequestHandler):
                 style_guide=style_guide,
                 generation_mode=generation_mode,
                 memory_block=memory_block,
+                memory_mode=memory_mode,
             )
             # 合成部分（感情セグメント→TTS→結合）は /api/regenerate と共通の関数へ委譲する。
             render = render_reply_audio(
@@ -4328,14 +5194,36 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     # 2人だけモードは user_text がお題/進行指示なので mode で区別し、
                     # 想起時に「ユーザー」ではなく「お題＋話者名」で差し込ませる。
-                    rag_memory.save_memory(
+                    turn_mode = "two_only" if two_only_mode else "normal"
+                    source_id = rag_memory.save_turn(
                         character_id,
                         speaker_slot,
                         user_text,
                         reply,
-                        mode="two_only" if two_only_mode else "normal",
+                        mode=turn_mode,
                         speaker=speaker,
                     )
+                    # 事実台帳への増分抽出。LLM 抽出を含みうるので必ず別スレッドへ逃がす
+                    # （返答の応答時間に影響させない）。失敗しても会話には無影響。
+                    if source_id and _LEDGER_LIVE and fact_extract is not None:
+                        threading.Thread(
+                            target=extract_facts_for_turn,
+                            args=(character_id, source_id),
+                            kwargs={
+                                "user_text": user_text,
+                                "reply_text": reply,
+                                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                "slot": speaker_slot,
+                                "mode": turn_mode,
+                                "speaker": speaker,
+                                "user_name": user_address,
+                                "char_name": speaker,
+                                "model": model,
+                                "generation_mode": generation_mode,
+                                "use_llm": _LEDGER_LIVE_LLM,
+                            },
+                            daemon=True,
+                        ).start()
                 except Exception:
                     pass
             self.send_json(

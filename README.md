@@ -49,6 +49,63 @@ focused on higher-quality Japanese character speech and day-to-day usability.
   are listed exhaustively only when explicitly asked; and near-duplicate collapse plus
   `top_k`/`min_score` tuning keep context-dropped memories in reach. Rebuild/diagnose
   helpers: `tools/rebuild_from_chatlog.py`, `tools/diagnose_recall.py`.
+- **Three-channel recall (time, coverage, who-did-what)** — cosine top-k structurally
+  cannot answer some questions: "what was the *first* book you bought me?" ignores time,
+  and "list *every* dish I cooked" overflows the top-k window as soon as there are more
+  matches than slots. Three complementary channels run together:
+  - *Vector* — the usual semantic search for topically close memories.
+  - *Lexical (unbounded)* — SQLite FTS5(trigram) plus `LIKE`, matching by occurrence
+    rather than rank so nothing is lost to a result-count window. Terms of 3+ characters
+    go to FTS5 and 1–2 character terms (e.g. the single kanji 本) to `LIKE`, since trigram
+    never matches shorter queries. Japanese inflection is folded to stems (買った → 買)
+    so a query never misses a differently-conjugated body text.
+  - *Fact ledger (aggregation)* — each turn is distilled into who / to whom / did what /
+    to what in a `facts` table, so enumeration becomes `SELECT DISTINCT` and returns
+    **every** row. The action's **direction** (`user->char` / `char->user`) is stored
+    structurally, which is what keeps "the dish I cooked for you" from being confused with
+    "the dish you cooked for me". Extraction is hybrid: Japanese benefactive forms
+    (〜してあげた = speaker→other, 〜してくれた = other→speaker) combined with the
+    message role settle most turns with no LLM call, and only the undecided ones go to the
+    local LLM. Unresolved fields are kept as "direction unknown" rather than dropped, and
+    the ledger is always presented alongside the **source turns** so the original text
+    remains the ground truth.
+- **Timestamp-aware recall** — asks like "the very first", "the last / lately", "when",
+  "last summer", "in March", "two years ago" are detected by regex (with the rewrite LLM's
+  intent tag as a fallback), a wide candidate pool is gathered and then re-sorted by time.
+  The prompt receives a **chronological timeline** with dates and pre-computed elapsed time
+  ("about 1 year 7 months ago" — the server does the arithmetic, never the LLM), plus the
+  span of what is on record so "no record before this" is not mistaken for "it never
+  happened". Period expressions resolve to `since`/`until` filters.
+  Tools: `tools/build_fact_ledger.py` (bulk ledger build; `--rule-only` needs no LLM,
+  resumes where it stopped), `tools/diagnose_temporal.py` (inspect which channel a
+  temporal/enumeration ask falls through, no LLM needed), `tools/audit_memory.py`
+  (reconcile `chat.jsonl` / `history.json` / `memories` counts to separate *missing saves*
+  — which no retrieval change can fix — from retrieval misses).
+- **Editing history stays in sync** — the log files form a hierarchy: `logs/chat.jsonl` is
+  the root source of truth, and `history.json`, `memory.sqlite3` and `chat_emotion.jsonl`
+  are derived from it. `tools/sync_memory.py` reconciles the downstream files
+  **differentially** (no re-embedding of the whole history, and the ledger survives):
+  removed turns are deleted along with the facts extracted from them, missing turns are
+  added, edited timestamps propagate to the ledger, and facts whose source turn is gone are
+  pruned. Matching is by user text + reply + conversation mode (`ts` is excluded since it
+  may be hand-edited).
+  `--source chatlog` (default) treats `chat.jsonl` as the source and regenerates
+  `history.json`, syncs the database, and reconciles `chat_emotion.jsonl`.
+  `--source history --propagate` covers the reverse direction, pushing deletions back into
+  `chat.jsonl` and `chat_emotion.jsonl` — without that, a conversation removed only
+  downstream reappears the next time a full rebuild runs. A full `--reset` rebuild deletes
+  the database file and therefore the ledger too; `rebuild_rag_from_history.py --extract`
+  rebuilds both.
+- **Deleting in the UI removes the whole turn everywhere** — your message and the reply are
+  dropped from all four places at once (`history.json`, `chat.jsonl`,
+  `chat_emotion.jsonl`, and `memory.sqlite3` including the facts extracted from that turn),
+  with a `.bak` written before the raw logs are rewritten. A prompt shared by several 2P
+  replies is kept while any reply still references it, and generated audio files are left
+  alone since other entries may point at them. This runs through a dedicated
+  `/api/delete-turn` rather than the session auto-save: auto-save only writes the *current*
+  conversation context, so inferring deletions from it could not be told apart from Clear
+  Context and would wipe raw logs that must be kept — `history.json` and `chat.jsonl` are
+  expected to differ.
 - **History foundation** — session history auto-saves on every turn (conversation mode,
   speaker, and timestamp preserved), and speakers are keyed by slot (1P=main / 2P=second)
   so same-named 1P/2P characters never get mixed up in logs or recall.
@@ -205,6 +262,20 @@ Useful environment variables:
 | `RAG_QUERY_REWRITE` | `1` | LLM rewrite of the recall query (`0` uses the raw text) |
 | `RAG_QUERY_REWRITE_MODE` | empty | Generation mode for the rewrite (empty follows the chat; `prefill` is faster) |
 | `RAG_QUERY_REWRITE_MULTI` | `3` | Max recall queries generated for enumeration asks (`1` = single) |
+| `RAG_LEXICAL_ENABLED` | `1` | Enable the lexical channel (FTS5+LIKE); `0` = vector only |
+| `RAG_LEXICAL_LIMIT` | `24` | Max rows taken from the lexical channel |
+| `RAG_LEXICAL_LIMIT_ENUM` | `48` | Lexical limit for enumeration asks |
+| `RAG_LEXICAL_SLACK` | `0.03` | Similarity slack for lexical hits (independent evidence) |
+| `RAG_TEMPORAL_POOL_K` | `64` | Candidate pool gathered before re-sorting by time |
+| `RAG_TEMPORAL_K` | `8` | Timeline rows injected into the prompt |
+| `RAG_TEMPORAL_BAND` | `0.04` | Score band treated as "on topic" for temporal selection |
+| `RAG_LEDGER_ENABLED` | `1` | Enable the fact ledger (`0` disables read/write) |
+| `RAG_LEDGER_LIMIT` | `60` | Max facts injected from the ledger |
+| `RAG_LEDGER_TURNS` | `8` | Source turns included as evidence for the ledger |
+| `RAG_LEDGER_ALWAYS` | `0` | Consult the ledger even for non-temporal/non-enumeration asks |
+| `RAG_LEDGER_LIVE` | `1` | Extract the current turn into the ledger after replying (background) |
+| `RAG_LEDGER_LIVE_LLM` | `1` | Use the LLM for live extraction (`0` = rule-only, free) |
+| `RAG_FACT_EXTRACT_MAXTOK` | `256` | Token cap for the fact-extraction LLM |
 
 ## Character Data
 
