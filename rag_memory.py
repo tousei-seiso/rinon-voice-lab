@@ -200,10 +200,14 @@ def describe_age(value: object, now: float | None = None) -> str:
 
 def _in_range(ts: object, since_key: str, until_key: str) -> bool:
     """ts が [since_key, until_key] の範囲内か（キーは ts_sort_key 済みの 14 桁）。"""
+    return _key_in_range(ts_sort_key(ts), since_key, until_key)
+
+
+def _key_in_range(key: str, since_key: str, until_key: str) -> bool:
+    """正規化済みの 14 桁キーが範囲内か（出来事時刻の判定に使う）。"""
     if not since_key and not until_key:
         return True
-    key = ts_sort_key(ts)
-    if key == TS_KEY_INVALID:
+    if not key or key == TS_KEY_INVALID:
         return False  # 期間を指定された質問に、時刻不明の記録は混ぜない
     if since_key and key < since_key:
         return False
@@ -458,17 +462,34 @@ def _ensure_ledger(conn: sqlite3.Connection) -> bool:
             "object TEXT NOT NULL DEFAULT '', "
             "recipient TEXT NOT NULL DEFAULT '', "
             "direction TEXT NOT NULL DEFAULT 'unknown', "
+            "modality TEXT NOT NULL DEFAULT 'done', "
+            "occurred TEXT NOT NULL DEFAULT '', "
+            "time_hint TEXT NOT NULL DEFAULT '', "
             "confidence REAL NOT NULL DEFAULT 0.0, "
             "extractor TEXT NOT NULL DEFAULT '', "
             "snippet TEXT NOT NULL DEFAULT '', "
             "UNIQUE(source_id, category, subject, verb, object, recipient))"
         )
+        # 既存の台帳へ相・出来事時刻の列を後付けする（作り直さずに段階導入するため）。
+        # 既存行は modality='done' / occurred='' となり、それまでと同じ挙動になる。
+        existing = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(facts)").fetchall()
+        }
+        for column, ddl in (
+            ("modality", "modality TEXT NOT NULL DEFAULT 'done'"),
+            ("occurred", "occurred TEXT NOT NULL DEFAULT ''"),
+            ("time_hint", "time_hint TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in existing:
+                conn.execute(f"ALTER TABLE facts ADD COLUMN {ddl}")
         # 列挙質問は category/direction/verb で絞って ts 順に並べるのが基本形。
+        # 相（modality）はほぼ done なので単独の索引で足りる（絞り込みの主役ではない）。
         conn.execute(
             "CREATE INDEX IF NOT EXISTS facts_lookup "
             "ON facts (category, direction, verb, ts)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS facts_source ON facts (source_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS facts_modality ON facts (modality)")
         conn.commit()
         return True
     except sqlite3.Error:
@@ -495,6 +516,15 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
             (name,),
         ).fetchone()
         return bool(row)
+    except sqlite3.Error:
+        return False
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """テーブルにその列があるか（後付け前の古い DB を読み取り専用で開いたときの判定）。"""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(str(row[1]) == column for row in rows)
     except sqlite3.Error:
         return False
 
@@ -1145,12 +1175,21 @@ def build_timeline_block(
 # direction は「行為の向き」。誰が誰に対してしたことかを構造として保持するための列で、
 # 主客の取り違え（キャラが「私は料理を作っていません」と答える等）を防ぐ核。
 DIRECTIONS = {"user->char", "char->user", "char->char", "self", "unknown"}
+# modality は「実際にしたのか」。予定・願望・否定を「した事」と混ぜないための列で、
+# 主客と並ぶ誤認の柱（実測: 未来に作る予定の料理が「作った料理」として列挙された）。
+MODALITIES = {"done", "plan", "wish", "negated", "unknown"}
+# 相の優先順。同じ往復・同じ行為で相が食い違ったときは、実際に起きた方を残す。
+_MODALITY_RANK = {"done": 4, "negated": 3, "plan": 2, "wish": 1, "unknown": 0}
+_FACT_ROW_MODALITY = 10  # _fact_row が返す組の中の modality の位置（保存順の決定に使う）
 
 
 def _fact_row(fact: dict, *, source_id: int, ts: str, slot: str, mode: str) -> tuple:
     direction = str(fact.get("direction") or "unknown").strip()
     if direction not in DIRECTIONS:
         direction = "unknown"
+    modality = str(fact.get("modality") or "done").strip()
+    if modality not in MODALITIES:
+        modality = "unknown"
     return (
         int(source_id or 0),
         str(ts or ""),
@@ -1162,10 +1201,35 @@ def _fact_row(fact: dict, *, source_id: int, ts: str, slot: str, mode: str) -> t
         str(fact.get("object") or "").strip(),
         str(fact.get("recipient") or "").strip(),
         direction,
+        modality,
+        str(fact.get("occurred") or "").strip(),
+        str(fact.get("time_hint") or "").strip(),
         float(fact.get("confidence") or 0.0),
         str(fact.get("extractor") or "").strip(),
         _compact(fact.get("snippet"), 160),
     )
+
+
+def fact_time(fact: dict) -> str:
+    """その事実の「出来事の時刻」を返す（occurred があれば優先、無ければ ts）。
+
+    ts は*その話をした日*であって出来事の日ではない。回想（「1年前に多摩川の花火大会に
+    行ったよね」）は ts が今日でも出来事は 1 年前なので、並べ替え・期間の判定は
+    occurred を優先する。occurred は前方一致の文字列（'2025' / '2025-07'）なので、
+    比較用に ts_sort_key と同じ 14 桁へ寄せる。
+    """
+    occurred = str(fact.get("occurred") or "").strip()
+    if not occurred:
+        return ts_sort_key(fact.get("ts"))
+    digits = re.sub(r"\D", "", occurred)
+    if len(digits) < 4:
+        return ts_sort_key(fact.get("ts"))
+    # 年だけ・年月だけの粒度は、その期間の先頭に寄せる（'2025' → 2025-01-01 00:00:00）。
+    if len(digits) < 6:
+        digits += "01"
+    if len(digits) < 8:
+        digits += "01"
+    return (digits + "000000")[:14]
 
 
 def save_facts(
@@ -1195,6 +1259,10 @@ def save_facts(
     ]
     if not rows:
         return 0
+    # 相が違うだけの重複は、UNIQUE キー（相を含まない）では 1 行しか残らない。
+    # どれが残るかを挿入順の偶然に任せると「した事」が「予定」に上書きされうるので、
+    # ここで実際に起きた方（done）を先に並べて確定させる。
+    rows.sort(key=lambda row: -_MODALITY_RANK.get(row[_FACT_ROW_MODALITY], 0))
     try:
         conn = _connect(char_id, create=True)
         try:
@@ -1202,8 +1270,8 @@ def save_facts(
             conn.executemany(
                 "INSERT OR IGNORE INTO facts ("
                 "source_id, ts, slot, mode, category, subject, verb, object, recipient, "
-                "direction, confidence, extractor, snippet) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "direction, modality, occurred, time_hint, confidence, extractor, snippet) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
             conn.commit()
@@ -1222,6 +1290,7 @@ def query_facts(
     verb: str = "",
     object_like: str = "",
     direction: str = "",
+    modality: str = "",
     slot: str | None = None,
     mode: str | None = None,
     since: str = "",
@@ -1242,6 +1311,15 @@ def query_facts(
     語彙辞書による推定なので、固有名詞（「星の王子さま」）は本だと判定できず空になる。
     ここで厳格に絞ると「一番最初に買ってあげた本」の正解が落ちて、2 番目の記録が
     「最初」として答えられてしまう。カテゴリは絞り込みの補助であって条件ではない。
+
+    ``modality`` は行為の相での絞り込み。``'done'``（実際にした事）を指定すると
+    ``'unknown'``（相を判定できなかった行）も一緒に返す —— 判定漏れで列挙から
+    落とすのを避けるため。提示側が相を見て「（実行不明）」と明示する。``'plan'`` は
+    予定と願望（``'wish'``）をまとめて返す。空文字なら相で絞らない。
+
+    ``since`` / ``until`` は「出来事の時期」で判定する。回想（「1年前に行った花火大会」）は
+    ts が今日でも出来事は 1 年前なので、``occurred`` と ``ts`` のどちらかが期間に入れば
+    該当とする（片方だけで見ると回想が期間検索から丸ごと漏れる）。
     """
     if not RAG_ENABLED or not LEDGER_ENABLED:
         return []
@@ -1281,13 +1359,34 @@ def query_facts(
         else:
             conditions.append("direction = ?")
         params.append(direction_key)
+    modality_key = str(modality or "").strip()
+    # 相の列が無い古い台帳（このコードで一度も書き込んでいない DB）。読み取り専用で
+    # 開いているので後付けはできない。すべて「した事」として扱い、従来の挙動に落とす。
+    has_modality = _has_column(conn, "facts", "modality")
+    if not has_modality and modality_key == "plan":
+        conn.close()
+        return []  # 予定はまだ 1 件も記録されていない
+    if has_modality and modality_key:
+        if modality_key == "done":
+            # 相を判定できなかった行（unknown）と、列が無かった時代の行（''）も
+            # 「した事」側に含める。落とすと「台帳に無い＝していない」という
+            # 新しい取りこぼしになる。
+            conditions.append("modality IN ('done', 'unknown', '')")
+        elif modality_key == "plan":
+            conditions.append("modality IN ('plan', 'wish')")
+        else:
+            conditions.append("modality = ?")
+            params.append(modality_key)
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    columns_sql = (
+        "id, source_id, ts, slot, mode, category, subject, verb, object, "
+        "recipient, direction, modality, occurred, time_hint, confidence, extractor, snippet"
+        if has_modality
+        else "id, source_id, ts, slot, mode, category, subject, verb, object, "
+        "recipient, direction, 'done', '', '', confidence, extractor, snippet"
+    )
     try:
-        rows = conn.execute(
-            "SELECT id, source_id, ts, slot, mode, category, subject, verb, object, "
-            f"recipient, direction, confidence, extractor, snippet FROM facts{where}",
-            params,
-        ).fetchall()
+        rows = conn.execute(f"SELECT {columns_sql} FROM facts{where}", params).fetchall()
     except sqlite3.Error:
         return []
     finally:
@@ -1306,15 +1405,26 @@ def query_facts(
         "object",
         "recipient",
         "direction",
+        "modality",
+        "occurred",
+        "time_hint",
         "confidence",
         "extractor",
         "snippet",
     )
-    results = [
-        dict(zip(columns, row)) for row in rows if _in_range(row[2], since_key, until_key)
-    ]
+    results = [dict(zip(columns, row)) for row in rows]
+    if since_key or until_key:
+        # 出来事の時期（occurred）と話した日（ts）のどちらかが期間に入れば該当とする。
+        # occurred だけで見ると「1年前に行ったよね」と*今日*語られた出来事が、
+        # 「最近の話」からも「1年前の話」からも漏れる。
+        results = [
+            fact
+            for fact in results
+            if _in_range(fact.get("ts"), since_key, until_key)
+            or _key_in_range(fact_time(fact), since_key, until_key)
+        ]
     results.sort(
-        key=lambda rec: ts_sort_key(rec.get("ts")),
+        key=fact_time,
         reverse=(str(order or "oldest").strip().lower() == "newest"),
     )
     if limit and limit > 0:
@@ -1323,12 +1433,17 @@ def query_facts(
 
 
 def facts_stats(char_id: str) -> dict:
-    """台帳の件数内訳（全体 / 抽出済みソース数 / 方向別）を返す（診断・起動ログ用）。"""
+    """台帳の件数内訳（全体 / 抽出済みソース数 / 方向別 / 相別）を返す（診断・起動ログ用）。
+
+    相別の内訳は、予定や否定を「した事」として記録していないかを一目で確認するため
+    （done ばかりで plan が 0 件なら、相の判定が効いていないか未再構築のどちらか）。
+    """
+    empty = {"count": 0, "sources": 0, "directions": {}, "modalities": {}, "occurred": 0}
     conn = _open_readonly(char_id)
     if conn is None or not _has_table(conn, "facts"):
         if conn is not None:
             conn.close()
-        return {"count": 0, "sources": 0, "directions": {}}
+        return dict(empty)
     try:
         count = int(conn.execute("SELECT count(*) FROM facts").fetchone()[0])
         sources = int(
@@ -1340,9 +1455,29 @@ def facts_stats(char_id: str) -> dict:
                 "SELECT direction, count(*) FROM facts GROUP BY direction"
             )
         }
-        return {"count": count, "sources": sources, "directions": directions}
+        modalities: dict[str, int] = {}
+        occurred = 0
+        if _has_column(conn, "facts", "modality"):
+            modalities = {
+                str(row[0] or "(未設定)"): int(row[1])
+                for row in conn.execute(
+                    "SELECT modality, count(*) FROM facts GROUP BY modality"
+                )
+            }
+            occurred = int(
+                conn.execute(
+                    "SELECT count(*) FROM facts WHERE occurred <> ''"
+                ).fetchone()[0]
+            )
+        return {
+            "count": count,
+            "sources": sources,
+            "directions": directions,
+            "modalities": modalities,
+            "occurred": occurred,
+        }
     except sqlite3.Error:
-        return {"count": 0, "sources": 0, "directions": {}}
+        return dict(empty)
     finally:
         conn.close()
 
@@ -1502,11 +1637,14 @@ def resolve_ledger_conflicts(char_id: str) -> int:
         conn = _connect(char_id, create=True)
         try:
             rows = conn.execute(
-                "SELECT id, source_id, verb, object, direction, confidence FROM facts"
+                "SELECT id, source_id, verb, object, direction, confidence, modality "
+                "FROM facts"
             ).fetchall()
+            # 相（modality）が違う組は矛盾ではない（「前に作った」と「今度も作る」は
+            # 両方正しい）ので、畳む対象は同じ相の中だけに限る。
             groups: dict[tuple, list[tuple]] = {}
             for row in rows:
-                groups.setdefault((row[1], row[2], row[3]), []).append(row)
+                groups.setdefault((row[1], row[2], row[3], row[6]), []).append(row)
             drop: list[int] = []
             to_unknown: list[int] = []
             for items in groups.values():
@@ -1696,6 +1834,12 @@ def update_turn_ts(char_id: str, row_id: int, ts: str) -> bool:
 
     台帳の ts も同じ値へ揃える（facts.ts は往復の時刻の写しなので、片方だけ直すと
     年表と一覧の日付が食い違う）。
+
+    ``occurred``（回想で語られた出来事の時期）は ts を基準日にして解決した値なので、
+    ts を大きく動かしたときはずれたままになる。原文の表現は ``time_hint`` に残っている
+    ので提示は破綻しないが、正確に揃えたいならその往復を再抽出する
+    （``build_fact_ledger.py --redo-verb`` 等）。ここで消さないのは、消すと
+    「出来事の時期が分からない」状態に後退するため。
     """
     stamp = str(ts or "").strip()
     if not stamp:
@@ -1736,48 +1880,117 @@ def rebuild_lexical_index(char_id: str) -> bool:
         return False
 
 
+def describe_occurred(fact: dict) -> str:
+    """事実の「いつの出来事か」を人が読める形で返す（occurred が無ければ空文字）。
+
+    ``occurred`` は粒度つきの前方一致文字列なので、'2025' → 「2025年ごろ」、
+    '2025-07' → 「2025年7月ごろ」、'2025-07-24' → 「2025-07-24」と書き分ける。
+    本人の言い方（``time_hint``）も添える: 抽出が時期を取り違えていても、原文の表現が
+    並んでいれば LLM 側でおかしさに気づける。
+    """
+    occurred = str(fact.get("occurred") or "").strip()
+    hint = str(fact.get("time_hint") or "").strip()
+    if not occurred:
+        return f"本人の話では{hint}" if hint else ""
+    parts = occurred.split("-")
+    if len(parts) == 1:
+        label = f"{parts[0]}年ごろ"
+    elif len(parts) == 2:
+        label = f"{parts[0]}年{int(parts[1])}月ごろ"
+    else:
+        label = occurred
+    return f"{label}（本人の話では{hint}）" if hint else label
+
+
+# 相ごとの提示ラベル。done は無印（大多数なので付けると一覧が読みにくい）。
+_MODALITY_NOTES = {
+    "plan": "（予定・まだしていない）",
+    "wish": "（願望・仮定。していない）",
+    "negated": "（しなかった／できなかった）",
+    "unknown": "（実行したか不明）",
+}
+
+
 def build_ledger_block(facts: list[dict], *, now: float | None = None) -> str:
     """台帳の行を、列挙・時系列に答えさせるための一覧テキストへ整形する。
 
     同じ object（讃岐うどん等）が何度も出てくる場合は初回の日付を代表にし、回数を添える
     （列挙で同じ品が枠を食い潰さないため）。方向が不明な行は明示的に「（主客不明）」と
     出す。黙って混ぜると、主客を取り違えた回答の材料になる。
+
+    実際にあった事（done / 相不明）と、まだしていない事（plan / wish / negated）は
+    別の節に分ける。混ぜると「今度作ってあげるね」と言っただけの料理が「作った料理」と
+    して読まれる。捨てずに節を分けるのは、「今度作ってくれるって言ってたやつ」にも
+    答えられるようにするため。
+
+    日付は出来事の時期を優先して出す（``occurred``）。ts はその話をした日にすぎず、
+    回想（「1年前に行ったよね」）では出来事の時期と一致しない。
     """
     if not facts:
         return ""
     current = time.time() if now is None else now
     grouped: dict[tuple, dict] = {}
     for fact in facts:
+        modality = str(fact.get("modality") or "done").strip() or "done"
+        # done と相不明は同じ節に出すので、まとめる段でも同一視する。
         key = (
             str(fact.get("object") or "").strip(),
             str(fact.get("verb") or "").strip(),
             str(fact.get("direction") or "unknown").strip(),
+            "done" if modality in {"done", "unknown"} else modality,
         )
         entry = grouped.get(key)
         if entry is None:
-            grouped[key] = {"fact": fact, "count": 1}
+            grouped[key] = {"fact": fact, "count": 1, "confirmed": modality == "done"}
             continue
         entry["count"] += 1
-        if ts_sort_key(fact.get("ts")) < ts_sort_key(entry["fact"].get("ts")):
+        # 1 度でも実際に起きているなら「実行したか不明」ではない。
+        entry["confirmed"] = entry["confirmed"] or modality == "done"
+        if fact_time(fact) < fact_time(entry["fact"]):
             entry["fact"] = fact  # 代表は初回（最古）にする
-    ordered = sorted(
-        grouped.values(), key=lambda item: ts_sort_key(item["fact"].get("ts"))
-    )
-    lines: list[str] = []
-    for rank, item in enumerate(ordered, start=1):
+    ordered = sorted(grouped.values(), key=lambda item: fact_time(item["fact"]))
+    done_lines: list[str] = []
+    pending_lines: list[str] = []
+    for item in ordered:
         fact = item["fact"]
-        date = short_date(fact.get("ts")) or "日時不明"
-        age = describe_age(fact.get("ts"), now=current)
+        modality = str(fact.get("modality") or "done").strip() or "done"
+        if modality == "unknown" and item["confirmed"]:
+            modality = "done"
+        pending = modality in {"plan", "wish", "negated"}
+        occurred = describe_occurred(fact)
+        if occurred:
+            # 出来事の時期が分かっている回想。話した日も残す（原文と突き合わせる手掛かり）。
+            spoken = short_date(fact.get("ts"))
+            when = occurred + (f"／この話をしたのは {spoken}" if spoken else "")
+        else:
+            when = short_date(fact.get("ts")) or "日時不明"
+            age = describe_age(fact.get("ts"), now=current)
+            if age:
+                when += f"（{age}）"
         subject = str(fact.get("subject") or "").strip()
         recipient = str(fact.get("recipient") or "").strip()
-        direction = str(fact.get("direction") or "unknown").strip()
         who = subject or "（主体不明）"
         to_whom = f"→{recipient}" if recipient else ""
-        note = "（主客不明）" if direction == "unknown" else ""
+        note = "（主客不明）" if str(fact.get("direction") or "") == "unknown" else ""
+        note += _MODALITY_NOTES.get(modality, "")
         repeat = f" ×{item['count']}" if item["count"] > 1 else ""
-        lines.append(
-            f"{rank}. {date}" + (f"（{age}）" if age else "")
-            + f" {who}{to_whom} が {fact.get('verb') or '?'}: "
-            + f"{fact.get('object') or '?'}{repeat}{note}"
+        body = (
+            f"{when} {who}{to_whom} が {fact.get('verb') or '?'}: "
+            f"{fact.get('object') or '?'}{repeat}{note}"
         )
-    return "\n".join(lines)
+        (pending_lines if pending else done_lines).append(body)
+    if not pending_lines:
+        return "\n".join(
+            f"{rank}. {line}" for rank, line in enumerate(done_lines, start=1)
+        )
+    sections: list[str] = []
+    if done_lines:
+        sections.append(
+            "＜実際にあった出来事＞\n"
+            + "\n".join(f"{rank}. {line}" for rank, line in enumerate(done_lines, start=1))
+        )
+    sections.append(
+        "＜まだしていない事（予定・願望・しなかった事）＞\n"
+        + "\n".join(f"{rank}. {line}" for rank, line in enumerate(pending_lines, start=1))
+    )
+    return "\n\n".join(sections)

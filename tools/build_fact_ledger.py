@@ -41,6 +41,7 @@
   python tools/build_fact_ledger.py --list --char ruri --list-limit 200
   python tools/build_fact_ledger.py --list --char ruri --verb 作る      # 動詞で絞る
   python tools/build_fact_ledger.py --list --char ruri --category 料理  # カテゴリで絞る
+  python tools/build_fact_ledger.py --list --modality plan              # 予定として記録された分だけ
 
 途中で止めても、次回は「まだ抽出していない往復」から再開する
 （facts.source_id の有無で判定するため、何度実行しても重複しない）。
@@ -223,6 +224,7 @@ def build(
                 char_name=who,
                 mode=turn["mode"],
                 speaker=turn["speaker"],
+                ts=turn["ts"],
             )
             used_llm = llm is not None and fx.needs_llm(rule_facts)
             facts = fx.extract(
@@ -232,6 +234,8 @@ def build(
                 char_name=who,
                 mode=turn["mode"],
                 speaker=turn["speaker"],
+                # 回想（「1年前に行ったよね」）の出来事時期を解決する基準日。
+                ts=turn["ts"],
                 llm=llm,
             )
             counts["turns"] += 1
@@ -243,7 +247,10 @@ def build(
                 if facts:
                     head = " / ".join(
                         f"{f.get('subject') or '?'}→{f.get('recipient') or '?'}"
-                        f" {f.get('verb')}:{f.get('object')}[{f.get('direction')}]"
+                        f" {f.get('verb')}:{f.get('object')}"
+                        f"[{f.get('direction')}/{f.get('modality') or 'done'}"
+                        + (f"@{f.get('occurred')}" if f.get("occurred") else "")
+                        + "]"
                         for f in facts[:3]
                     )
                     # 同じ日に何十往復もあるので、日付だけでは行を特定できない。
@@ -297,7 +304,8 @@ def build(
         print(
             f"[{char_id}] 完了: 往復={counts['turns']} 追加した事実={counts['facts']} "
             f"LLM使用={counts['llm']} 事実なし={counts['empty']} / 台帳合計={stats['count']} "
-            f"（方向別: {stats['directions']}）"
+            f"（方向別: {stats['directions']} / 相別: {stats['modalities']} / "
+            f"出来事時刻あり: {stats['occurred']}）"
         )
         if show and not dry_run:
             list_ledger([char_id], limit=40)
@@ -342,12 +350,17 @@ def redo_rule_facts(
                 facts = fx.extract_rule_based(
                     turn["user_text"], turn["reply_text"], user_name=fallback_user,
                     char_name=who, mode=turn["mode"], speaker=turn["speaker"],
+                    ts=turn["ts"],
                 )
                 if facts and sample < 10:
                     sample += 1
                     stamp = rag.format_stamp(turn["ts"], seconds=True) or "(日時不明)"
                     head = " / ".join(
-                        f"{f['verb']}:{f['object']}[{f['direction']}]" for f in facts[:3]
+                        f"{f['verb']}:{f['object']}"
+                        f"[{f['direction']}/{f['modality']}"
+                        + (f"@{f['occurred']}" if f["occurred"] else "")
+                        + "]"
+                        for f in facts[:3]
                     )
                     print(f"  {stamp} {head}")
             print("  (dry-run: 削除も保存もしていません)")
@@ -358,6 +371,7 @@ def redo_rule_facts(
             facts = fx.extract_rule_based(
                 turn["user_text"], turn["reply_text"], user_name=fallback_user,
                 char_name=who, mode=turn["mode"], speaker=turn["speaker"],
+                ts=turn["ts"],
             )
             if facts:
                 added += rag.save_facts(
@@ -371,7 +385,8 @@ def redo_rule_facts(
         print(
             f"  → ルール由来を {removed} 件削除 / {added} 件を作り直し "
             f"/ 食い違う向きを {conflicts} 件整理 "
-            f"（台帳 {before['count']} → {after['count']} 事実。LLM 呼び出しなし）"
+            f"（台帳 {before['count']} → {after['count']} 事実 / "
+            f"相別 {after['modalities']}。LLM 呼び出しなし）"
         )
 
 
@@ -387,7 +402,14 @@ def fix_conflicts(char_ids: list[str]) -> None:
         )
 
 
-def list_ledger(char_ids: list[str], *, limit: int = 40, verb: str = "", category: str = "") -> None:
+def list_ledger(
+    char_ids: list[str],
+    *,
+    limit: int = 40,
+    verb: str = "",
+    category: str = "",
+    modality: str = "",
+) -> None:
     """台帳の中身を一覧表示する（抽出はしない読み取り専用）。
 
     構築の途中でも呼べる（読み取り専用で開くので、実行中の抽出を邪魔しない）。
@@ -397,22 +419,28 @@ def list_ledger(char_ids: list[str], *, limit: int = 40, verb: str = "", categor
         stats = rag.facts_stats(char_id)
         print(
             f"\n[{char_id}] 台帳={stats['count']} 事実 / 抽出済み往復={stats['sources']} "
-            f"/ 方向別={stats['directions']}"
+            f"/ 方向別={stats['directions']} / 相別={stats['modalities']}"
         )
         if not stats["count"]:
             print("  (空) tools/build_fact_ledger.py で構築してください。")
             continue
-        facts = rag.query_facts(char_id, verb=verb, category=category, limit=limit)
+        facts = rag.query_facts(
+            char_id, verb=verb, category=category, modality=modality, limit=limit
+        )
         if not facts:
-            print("  該当なし（--verb / --category の指定を確認してください）")
+            print("  該当なし（--verb / --category / --modality の指定を確認してください）")
             continue
         # 抽出元と主客を追えるよう、日時つき・古い順で 1 行 1 事実を出す。
         for fact in facts:
             stamp = rag.format_stamp(fact["ts"], seconds=True) or "(日時不明)"
+            # 相と出来事時刻も出す（予定が「した事」として入っていないかの確認に使う）。
+            when = f" 出来事={fact['occurred']}" if fact["occurred"] else ""
+            if fact["time_hint"]:
+                when += f"（{fact['time_hint']}）"
             print(
-                f"  {stamp} {fact['direction']:11} "
+                f"  {stamp} {fact['direction']:11} {fact['modality']:8} "
                 f"{fact['subject'] or '(不明)'}→{fact['recipient'] or '(不明)'} "
-                f"{fact['verb']}: {fact['object']} [{fact['category'] or '-'}] "
+                f"{fact['verb']}: {fact['object']} [{fact['category'] or '-'}]{when} "
                 f"by={fact['extractor']} src={fact['source_id']}"
             )
         if stats["count"] > len(facts):
@@ -441,6 +469,11 @@ def main() -> None:
     parser.add_argument("--list-limit", type=int, default=40, help="--list で表示する件数")
     parser.add_argument("--verb", default="", help="--list の絞り込み（例: 作る）")
     parser.add_argument("--category", default="", help="--list の絞り込み（例: 料理）")
+    parser.add_argument(
+        "--modality",
+        default="",
+        help="--list の絞り込み（done=した事 / plan=予定・願望 / negated=しなかった事）",
+    )
     parser.add_argument("--since", default="", help="この日付以降の往復だけを対象にする（YYYY-MM-DD）")
     parser.add_argument("--until", default="", help="この日付までの往復だけを対象にする（YYYY-MM-DD）")
     parser.add_argument(
@@ -473,7 +506,11 @@ def main() -> None:
     if args.list:
         # 表示だけなので抽出も埋め込みも不要。構築中でも安全に覗ける。
         list_ledger(
-            char_ids, limit=args.list_limit, verb=args.verb, category=args.category
+            char_ids,
+            limit=args.list_limit,
+            verb=args.verb,
+            category=args.category,
+            modality=args.modality,
         )
         return
     if args.fix_conflicts:

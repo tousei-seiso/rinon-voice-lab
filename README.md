@@ -77,6 +77,19 @@ focused on higher-quality Japanese character speech and day-to-day usability.
     did for you" never pulls in acts aimed at someone else. Measured over 771 turns, ~87%
     of turns need the LLM pass, so build the ledger with LM Studio running rather than
     `--rule-only`.
+    Alongside direction, every fact carries its **modality** and its **event time**, because
+    Japanese verbs keep the same stem while only tense and mood change — read by surface
+    pattern alone, "next time I'll cook you a udon carbonara" was recorded as a dish that
+    *was* cooked, and "we went to the Tamagawa fireworks a year ago" as something done on
+    the day it was *mentioned*. So `modality` (`done` / `plan` / `wish` / `negated` /
+    `unknown`) is decided from the tail of that specific verb — non-past benefactives
+    (〜てあげる) are offers, not completions — and `occurred` holds the event's own time
+    resolved from expressions like 1年前 / 去年の夏 against the turn's timestamp
+    (`ts` is only the day it was talked about). Enumeration defaults to `done` (plus
+    `unknown`, so a missed call never drops a real fact), plans are shown in their own
+    section rather than discarded, and period filters match on either time so a
+    reminiscence is not lost. `tools/check_fact_modality.py` pins these judgements down
+    with example sentences.
 - **Timestamp-aware recall** — asks like "the very first", "the last / lately", "when",
   "last summer", "in March", "two years ago" are detected by regex (with the rewrite LLM's
   intent tag as a fallback), a wide candidate pool is gathered and then re-sorted by time.
@@ -85,7 +98,9 @@ focused on higher-quality Japanese character speech and day-to-day usability.
   span of what is on record so "no record before this" is not mistaken for "it never
   happened". Period expressions resolve to `since`/`until` filters.
   Tools: `tools/build_fact_ledger.py` (bulk ledger build; `--rule-only` needs no LLM,
-  resumes where it stopped), `tools/diagnose_temporal.py` (inspect which channel a
+  resumes where it stopped, `--list --modality plan` reviews what was filed as a plan),
+  `tools/check_fact_modality.py` (regression check for the tense / event-time rules, no LLM
+  or DB needed), `tools/diagnose_temporal.py` (inspect which channel a
   temporal/enumeration ask falls through, no LLM needed), `tools/audit_memory.py`
   (reconcile `chat.jsonl` / `history.json` / `memories` counts to separate *missing saves*
   — which no retrieval change can fix — from retrieval misses).
@@ -110,6 +125,11 @@ focused on higher-quality Japanese character speech and day-to-day usability.
   downstream reappears the next time a full rebuild runs. A full `--reset` rebuild deletes
   the database file and therefore the ledger too; `rebuild_rag_from_history.py --extract`
   rebuilds both.
+  The `modality` / `occurred` columns are added to an existing ledger automatically, but rows
+  already stored as "done" stay that way — re-extract to fix them:
+  `build_fact_ledger.py --redo-rule` (seconds, no LLM, rule-derived facts only) and, if the
+  LLM-derived ones matter too, `--redo-verb 作る` or `--redo --since <date>` with LM Studio
+  running.
 - **Deleting in the UI removes the whole turn everywhere** — your message and the reply are
   dropped from all four places at once (`history.json`, `chat.jsonl`,
   `chat_emotion.jsonl`, and `memory.sqlite3` including the facts extracted from that turn),
@@ -286,6 +306,7 @@ Useful environment variables:
 | `RAG_LEDGER_ENABLED` | `1` | Enable the fact ledger (`0` disables read/write) | — | ✅ |
 | `RAG_LEDGER_LIMIT` | `60` | Max facts injected from the ledger | — | ✅ |
 | `RAG_LEDGER_TURNS` | `8` | Source turns included as evidence for the ledger | — | ✅ |
+| `RAG_LEDGER_PLANS` | `12` | Plans/wishes listed as explicit counter-evidence when asked what was actually done (`0` disables) | — | ✅ |
 | `RAG_LEDGER_ALWAYS` | `0` | Consult the ledger even for non-temporal/non-enumeration asks | — | ✅ |
 | `RAG_LEDGER_LIVE` | `1` | Extract the current turn into the ledger after replying (background) | — | ✅ |
 | `RAG_LEDGER_LIVE_LLM` | `1` | Use the LLM for live extraction (`0` = rule-only, free) | — | ✅ |

@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 import warnings
 from collections import deque
-from datetime import date, timedelta
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html import unescape as html_unescape
 from pathlib import Path
@@ -2702,6 +2702,10 @@ _RECALL_LEDGER_LIMIT = int(os.environ.get("RAG_LEDGER_LIMIT", "60"))
 # 台帳に載せた事実の出典として、原文の往復を何件まで年表へ含めるか
 # （一覧と年表が食い違わないための裏付け。多すぎると文脈を圧迫する）。
 _RECALL_LEDGER_TURNS = int(os.environ.get("RAG_LEDGER_TURNS", "8"))
+# 「した事」を訊かれたときに、予定・願望を**打ち消し材料として**何件まで併記するか。
+# 黙って落とすと、年表に残る原文（「次は〜作ってあげるね」）だけを見た LLM が
+# 「作った料理」として挙げてしまう。0 で併記しない。
+_RECALL_LEDGER_PLANS = int(os.environ.get("RAG_LEDGER_PLANS", "12"))
 # 事実抽出 LLM の生成上限（短い JSON を返させるだけなので小さく保つ）。
 _FACT_EXTRACT_MAXTOK = int(os.environ.get("RAG_FACT_EXTRACT_MAXTOK", "256"))
 # 質問が時系列・列挙かどうかに関わらず、台帳を常に併用するか（0 なら時系列/列挙時のみ）。
@@ -2757,132 +2761,21 @@ _ENUM_RE = re.compile(
     r"全部|ぜんぶ|すべて|全て|他に|ほかに|他の|いくつ|何個|何品|一覧|"
     r"思いつく|挙げて|あげて|列挙|残らず|漏れなく"
 )
-# 期間の表現（相対・絶対）。
-_YEAR_RE = re.compile(r"(\d{4})\s*年")
-_MONTH_RE = re.compile(r"(?:(\d{4})\s*年)?\s*(\d{1,2})\s*月")
-_AGO_RE = re.compile(r"(\d+)\s*(日|週間|週|ヶ月|か月|カ月|ケ月|箇月|年)\s*(?:ほど|くらい|ぐらい)?前")
-_SEASONS = (("春", 3, 5), ("夏", 6, 8), ("秋", 9, 11), ("冬", 12, 2))
-
-
-def _month_end(year: int, month: int) -> date:
-    """指定年月の末日を返す（翌月 1 日の前日）。"""
-    if month >= 12:
-        return date(year + 1, 1, 1) - timedelta(days=1)
-    return date(year, month + 1, 1) - timedelta(days=1)
 
 
 def _resolve_period(text: str, today: date) -> tuple[str, str, str]:
     """発話に含まれる期間表現を (since, until, ラベル) へ解決する。
 
-    粗い絞り込みでよい（記録は会話した日付なので、出来事の日付とは元々ズレる）。
-    解決できなければ空文字を返し、呼び出し側は期間で絞らない。
+    実装は fact_extract 側にある（抽出でも同じ時間表現を「出来事の時期」へ解決するので、
+    2 か所に同じ規則を持つと必ず食い違う）。fact_extract が読めない環境では期間で
+    絞らないだけで、想起そのものは従来どおり動く。
     """
-    body = str(text or "")
-    year_offset = None
-    if re.search(r"去年|昨年", body):
-        year_offset = -1
-    elif re.search(r"おととし|一昨年", body):
-        year_offset = -2
-    elif re.search(r"今年", body):
-        year_offset = 0
-    # 「去年の夏」「今年の春」など季節つき
-    for name, start_month, end_month in _SEASONS:
-        if name not in body:
-            continue
-        base_year = today.year + (year_offset if year_offset is not None else 0)
-        if name == "冬":
-            since = date(base_year, 12, 1)
-            until = _month_end(base_year + 1, 2)
-        else:
-            since = date(base_year, start_month, 1)
-            until = _month_end(base_year, end_month)
-        label = ("去年の" if year_offset == -1 else "今年の" if year_offset == 0 else "") + name
-        return since.isoformat(), until.isoformat(), label
-    # 「YYYY年M月」「M月」
-    month_match = _MONTH_RE.search(body)
-    if month_match:
-        month = int(month_match.group(2))
-        if 1 <= month <= 12:
-            if month_match.group(1):
-                year = int(month_match.group(1))
-            else:
-                year = today.year + (year_offset if year_offset is not None else 0)
-                # 年の指定が無く、その月がまだ来ていないなら前年と解釈する。
-                if year_offset is None and month > today.month:
-                    year -= 1
-            return (
-                date(year, month, 1).isoformat(),
-                _month_end(year, month).isoformat(),
-                f"{year}年{month}月",
-            )
-    # 「YYYY年」だけ
-    year_match = _YEAR_RE.search(body)
-    if year_match:
-        year = int(year_match.group(1))
-        return date(year, 1, 1).isoformat(), date(year, 12, 31).isoformat(), f"{year}年"
-    # 「N日前」「Nヶ月前」「N年前」→ その粒度の前後を含む窓にする
-    ago_match = _AGO_RE.search(body)
-    if ago_match:
-        amount = int(ago_match.group(1))
-        unit = ago_match.group(2)
-        if unit == "日":
-            center = today - timedelta(days=amount)
-            return (
-                (center - timedelta(days=3)).isoformat(),
-                (center + timedelta(days=3)).isoformat(),
-                f"{amount}日前ごろ",
-            )
-        if unit in {"週間", "週"}:
-            center = today - timedelta(days=amount * 7)
-            return (
-                (center - timedelta(days=7)).isoformat(),
-                (center + timedelta(days=7)).isoformat(),
-                f"{amount}週間前ごろ",
-            )
-        if unit == "年":
-            year = today.year - amount
-            return (
-                date(year, 1, 1).isoformat(),
-                date(year, 12, 31).isoformat(),
-                f"{amount}年前（{year}年）",
-            )
-        # ヶ月
-        month_index = today.year * 12 + (today.month - 1) - amount
-        year, month = divmod(month_index, 12)
-        month += 1
-        since = date(year, month, 1) - timedelta(days=15)
-        until = _month_end(year, month) + timedelta(days=15)
-        return since.isoformat(), until.isoformat(), f"{amount}ヶ月前ごろ"
-    if year_offset is not None:
-        year = today.year + year_offset
-        label = {0: "今年", -1: "去年", -2: "おととし"}[year_offset]
-        return (
-            date(year, 1, 1).isoformat(),
-            date(year, 12, 31).isoformat(),
-            f"{label}（{year}年）",
-        )
-    if re.search(r"先月", body):
-        month_index = today.year * 12 + (today.month - 1) - 1
-        year, month = divmod(month_index, 12)
-        month += 1
-        return (
-            date(year, month, 1).isoformat(),
-            _month_end(year, month).isoformat(),
-            f"先月（{year}年{month}月）",
-        )
-    if re.search(r"今月", body):
-        return (
-            date(today.year, today.month, 1).isoformat(),
-            _month_end(today.year, today.month).isoformat(),
-            "今月",
-        )
-    if re.search(r"先週", body):
-        return (
-            (today - timedelta(days=14)).isoformat(),
-            (today - timedelta(days=6)).isoformat(),
-            "先週",
-        )
-    return "", "", ""
+    if fact_extract is None:
+        return "", "", ""
+    try:
+        return fact_extract.resolve_period(str(text or ""), today)
+    except Exception:
+        return "", "", ""
 
 
 def detect_recall_intent(user_text: str, today: date | None = None) -> dict:
@@ -3281,6 +3174,9 @@ def recall_for_turn(
                 category=filters.get("category", ""),
                 verb=filters.get("verb", ""),
                 direction=filters.get("direction", ""),
+                # 相の絞り込み（既定 'done'）。これが無いと「今度作ってあげるね」と
+                # 言っただけの料理が「作った料理」として列挙に混ざる。
+                modality=filters.get("modality", ""),
                 slot=slot,
                 mode=mode,
                 since=since,
@@ -3290,7 +3186,31 @@ def recall_for_turn(
             )
         except Exception:
             facts = []
+    # 「した事」を訊かれたときは、同じ行為の**予定・願望も打ち消し材料として**添える。
+    # 一覧から黙って落とすと、年表に残る原文（「次はうどんなカルボナーラを作ってあげるね」）
+    # だけを読んだ LLM が「作った料理」として挙げてしまう。一覧では別の節に分かれ、
+    # 「まだしていない」と明示されるので、混ざるのではなく打ち消しとして働く。
+    plans: list[dict] = []
+    if facts and _RECALL_LEDGER_PLANS > 0 and filters.get("modality") == "done":
+        try:
+            plans = rag_memory.query_facts(
+                character_id,
+                category=filters.get("category", ""),
+                verb=filters.get("verb", ""),
+                direction=filters.get("direction", ""),
+                modality="plan",
+                slot=slot,
+                mode=mode,
+                since=since,
+                until=until,
+                order="newest",
+                limit=_RECALL_LEDGER_PLANS,
+            )
+        except Exception:
+            plans = []
+        facts = facts + plans
     result["stats"]["ledger"] = len(facts)
+    result["stats"]["ledgerPlans"] = len(plans)
     result["stats"]["filters"] = filters
 
     # 台帳に載せる事実の出典（原文の往復）を必ず想起プールへ入れる。
@@ -3431,6 +3351,7 @@ def extract_facts_for_turn(
             char_name=char_name,
             mode=mode,
             speaker=speaker,
+            ts=ts,
             llm=llm,
         )
         if not facts:
@@ -3449,6 +3370,9 @@ def extract_facts_for_turn(
                 + " / ".join(
                     f"{f.get('subject') or '?'}→{f.get('recipient') or '?'} "
                     f"{f.get('verb')}:{f.get('object')}"
+                    f"[{f.get('modality') or 'done'}"
+                    + (f"@{f.get('occurred')}" if f.get("occurred") else "")
+                    + "]"
                     for f in facts[:3]
                 )
             )
@@ -3589,7 +3513,8 @@ def request_lmstudio(
             memory_instruction += (
                 "\n上の記憶は日時つきで**古い順**に並んでいます（先頭が最も古く、末尾が最も新しい）。"
                 "『一番最初』『初めて』を訊かれたら該当する最も古い記録を、『最後』『最近』なら"
-                "最も新しい記録を答えてください。日付はその話をした日です。"
+                "最も新しい記録を答えてください。日付はその話をした日です"
+                "（過去を振り返って話した記録では、出来事そのものはもっと前に起きています）。"
                 "『いつ？』には添えてある年月と経過期間（例: 約1年前）をそのまま使い、"
                 "自分で日数を計算し直さないでください。"
                 "『記録の範囲』より前のことは記録が残っていないだけで、"
@@ -3606,6 +3531,12 @@ def request_lmstudio(
                 "扱ってください（あなたがした事とユーザーがした事を絶対に入れ替えないこと）。"
                 "『（主客不明）』と付いた行は、どちらがした事か記録から判別できなかったものなので、"
                 "自分がした事として語らないでください。"
+                "『＜まだしていない事＞』の節にある行は、**まだ実際にはしていない**"
+                "予定・約束・願望や、しなかった事です。『作った物』『行った場所』を訊かれたときに"
+                "そこから挙げてはいけません（訊かれたら「今度〜する約束」として話してください）。"
+                "『（実行したか不明）』と付いた行も、実際にしたと断定しないでください。"
+                "各行の日付は、時期が分かっているものは**出来事そのものの時期**、"
+                "分からないものはその話をした日です。"
                 "一覧は索引にすぎないので、内容が上の会話記録と食い違うときは会話記録の方を信じてください。"
                 "列挙を求められたら一覧の項目を漏れなく挙げ、求められていなければ一覧を読み上げず、"
                 "会話の流れに合う分だけ自然に触れてください。"

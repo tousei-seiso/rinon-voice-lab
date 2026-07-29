@@ -61,7 +61,19 @@ def diagnose(
     if span["count"] and not span["oldest"]:
         print("  警告: ts を解釈できる記録がありません（時系列想起は機能しません）。")
     stats = rag.facts_stats(char_id)
-    print(f"  台帳: {stats['count']} 事実 / 抽出済み往復 {stats['sources']} / 方向別 {stats['directions']}")
+    print(
+        f"  台帳: {stats['count']} 事実 / 抽出済み往復 {stats['sources']} / "
+        f"方向別 {stats['directions']}"
+    )
+    print(
+        f"        相別 {stats['modalities'] or '(相の列なし: 未再構築)'} / "
+        f"出来事時刻あり {stats['occurred']} 件"
+    )
+    if stats["count"] and not stats["modalities"]:
+        print(
+            "  → 相（予定・否定）の列がまだありません。tools/build_fact_ledger.py "
+            "--redo-rule で作り直すと、予定が「した事」に混ざらなくなります。"
+        )
     if not stats["count"]:
         print("  → 台帳が空です。tools/build_fact_ledger.py で構築すると列挙・主客が安定します。")
 
@@ -103,6 +115,7 @@ def diagnose(
         category=filters["category"],
         verb=filters["verb"],
         direction=filters["direction"],
+        modality=filters["modality"],
         slot=slot,
         mode=mode,
         since=intent["since"],
@@ -110,12 +123,17 @@ def diagnose(
         order="newest" if intent["temporal"] == "last" else "oldest",
         limit=30,
     )
-    print(f"\n  台帳チャネル: {len(facts)} 件（古い順、上位30件まで）")
+    print(f"\n  台帳チャネル: {len(facts)} 件"
+        f"（相={filters['modality'] or 'すべて'} / 古い順、上位30件まで）")
     for fact in facts:
+        when = f" 出来事={fact['occurred']}" if fact["occurred"] else ""
+        if fact["time_hint"]:
+            when += f"（{fact['time_hint']}）"
         print(
-            f"    {rag.format_stamp(fact['ts'], seconds=True) or '(日時不明)':19} {fact['direction']:11} "
+            f"    {rag.format_stamp(fact['ts'], seconds=True) or '(日時不明)':19} "
+            f"{fact['direction']:11} {fact['modality']:8} "
             f"{fact['subject'] or '(不明)'}→{fact['recipient'] or '(不明)'} "
-            f"{fact['verb']}: {fact['object']} [{fact['category'] or '-'}] "
+            f"{fact['verb']}: {fact['object']} [{fact['category'] or '-'}]{when} "
             f"conf={fact['confidence']:.2f} by={fact['extractor']}"
         )
 

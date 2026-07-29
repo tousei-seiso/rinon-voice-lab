@@ -165,6 +165,15 @@ def audit(char_ids: list[str]) -> None:
             f"  facts 台帳   : {facts['count']} 事実 / 抽出済み往復 {facts['sources']}"
             f"（未抽出 {max(0, rows - facts['sources'])}）"
         )
+        print(
+            f"  facts の相   : {facts['modalities'] or '(相の列なし)'}"
+            f" / 出来事時刻あり {facts['occurred']}"
+        )
+        if facts["count"] and not facts["modalities"]:
+            print(
+                "  ⚠ 相（done/plan/…）の列がありません。予定・否定が「した事」として"
+                "列挙に混ざります。tools/build_fact_ledger.py --redo-rule で作り直してください。"
+            )
         # --- 警告 ---
         if rows and db.get("with_ts", 0) < rows:
             print(
