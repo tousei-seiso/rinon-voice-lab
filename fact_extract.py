@@ -295,10 +295,12 @@ def extract_rule_based(
         # 同じ客体が両経路で取れることがあるので、順序を保って重複を除く。
         objects = list(dict.fromkeys(objects))
         for verb in verbs:
-            targets = objects or [""]
-            for obj in targets:
-                if not obj and direction == "unknown":
-                    continue  # 客体も向きも無い＝情報が無いので台帳へ入れない
+            for obj in objects:
+                # 客体が取れなかった事実は台帳へ入れない。「言う: （空）」「行く: （空）」では
+                # 後から何があったかを思い出せず、列挙の枠を食い潰すだけ。
+                # 向きが確定していても、客体が無い行為は記録する価値が無い。
+                if not obj:
+                    continue
                 facts.append(
                     {
                         "category": _guess_category(obj, verb),
@@ -466,6 +468,22 @@ def parse_llm_facts(content: str, *, user_name: str = "", char_name: str = "") -
         # 動詞だけの事実は「何があったか」を示せないため台帳に入れない。
         if not obj:
             continue
+        # 受け手が第三者（ユーザーでもこのキャラでもない）なら向きは unknown にする。
+        # 「オサム→ナデシコ 届ける」を user->char のままにすると、「俺が君にした事」の
+        # 絞り込みに第三者への行為が混ざる。事実自体は有用なので捨てず、主客不明として
+        # 残す（提示時に「（主客不明）」と明示される）。
+        known_names = {
+            name
+            for name in (str(user_name or "").strip(), str(char_name or "").strip())
+            if name
+        }
+        if direction in {"user->char", "char->user"} and known_names:
+            involved = {name for name in (subject, recipient) if name}
+            if involved and not involved <= known_names:
+                direction = "unknown"
+        # self（自分自身のこと）に受け手がいるのは矛盾なので受け手を落とす。
+        if direction == "self":
+            recipient = ""
         try:
             confidence = float(item.get("confidence") or 0.6)
         except (TypeError, ValueError):

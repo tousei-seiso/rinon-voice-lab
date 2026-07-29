@@ -1186,10 +1186,12 @@ def save_facts(
     """
     if not RAG_ENABLED or not LEDGER_ENABLED or not facts:
         return 0
+    # 客体の無い事実は保存しない（「言う: （空）」では何があったか分からず、列挙の
+    # 邪魔になるだけ）。抽出側でも落としているが、台帳の入口でも守る。
     rows = [
         _fact_row(fact, source_id=source_id, ts=ts, slot=slot, mode=mode)
         for fact in facts
-        if str(fact.get("object") or "").strip() or str(fact.get("verb") or "").strip()
+        if str(fact.get("object") or "").strip()
     ]
     if not rows:
         return 0
