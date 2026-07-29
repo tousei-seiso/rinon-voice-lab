@@ -151,15 +151,22 @@ def short_date(value: object) -> str:
     return f"{match.group(1)}-{match.group(2)}-{match.group(3)}" if match else ""
 
 
-def format_stamp(value: object) -> str:
-    """ts を "YYYY-MM-DD hh:mm" へ整形する（時刻が無ければ日付だけ）。"""
+def format_stamp(value: object, *, seconds: bool = False) -> str:
+    """ts を "YYYY-MM-DD hh:mm" へ整形する（時刻が無ければ日付だけ）。
+
+    ``seconds=True`` で秒まで出す。同じ分に複数の往復が並ぶ場面（診断出力で
+    1 往復ずつ確認するとき）は、秒まで無いと行の区別がつかない。
+    """
     match = _TS_RE.search(str(value or ""))
     if not match:
         return ""
     date = f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
     if match.group(4) is None:
         return date
-    return f"{date} {match.group(4)}:{match.group(5)}"
+    stamp = f"{date} {match.group(4)}:{match.group(5)}"
+    if seconds:
+        stamp += f":{match.group(6) or '00'}"
+    return stamp
 
 
 def describe_age(value: object, now: float | None = None) -> str:

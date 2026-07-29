@@ -161,7 +161,10 @@ def build(
                         f" {f.get('verb')}:{f.get('object')}[{f.get('direction')}]"
                         for f in facts[:3]
                     )
-                    print(f"  {rag.short_date(turn['ts']) or '----------'} {head}")
+                    # 同じ日に何十往復もあるので、日付だけでは行を特定できない。
+                    # 秒まで出して元の往復を追えるようにする。
+                    stamp = rag.format_stamp(turn["ts"], seconds=True) or "(日時不明)"
+                    print(f"  {stamp} {head}")
                 continue
             saved = rag.save_facts(
                 char_id,

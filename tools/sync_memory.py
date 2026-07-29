@@ -230,7 +230,8 @@ def _sync_db(
         "orphan": 0,
     }
     for pair in to_add[:5]:
-        print(f"    + {rag.short_date(pair['ts']) or '----------'} {_norm(pair['user_text'])[:40]}")
+        stamp = rag.format_stamp(pair["ts"], seconds=True) or "(日時不明)"
+        print(f"    + {stamp} {_norm(pair['user_text'])[:40]}")
     if len(to_add) > 5:
         print(f"    + …ほか {len(to_add) - 5} 件")
     for row_id in to_delete[:5]:
@@ -238,7 +239,9 @@ def _sync_db(
     if len(to_delete) > 5:
         print(f"    - …ほか {len(to_delete) - 5} 件")
     for row_id, old_ts, new_ts in to_retime[:5]:
-        print(f"    ~ id={row_id} {rag.short_date(old_ts) or '?'} → {rag.short_date(new_ts)}")
+        before = rag.format_stamp(old_ts, seconds=True) or "(日時不明)"
+        after = rag.format_stamp(new_ts, seconds=True) or "(日時不明)"
+        print(f"    ~ id={row_id} {before} → {after}")
     if len(to_retime) > 5:
         print(f"    ~ …ほか {len(to_retime) - 5} 件")
     if dry_run:

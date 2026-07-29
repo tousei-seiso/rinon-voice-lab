@@ -113,7 +113,7 @@ def diagnose(
     print(f"\n  台帳チャネル: {len(facts)} 件（古い順、上位30件まで）")
     for fact in facts:
         print(
-            f"    {rag.short_date(fact['ts']) or '----------'} {fact['direction']:11} "
+            f"    {rag.format_stamp(fact['ts'], seconds=True) or '(日時不明)':19} {fact['direction']:11} "
             f"{fact['subject'] or '(不明)'}→{fact['recipient'] or '(不明)'} "
             f"{fact['verb']}: {fact['object']} [{fact['category'] or '-'}] "
             f"conf={fact['confidence']:.2f} by={fact['extractor']}"
