@@ -125,6 +125,37 @@ def _make_llm(model: str, generation_mode: str):
     return app.make_fact_llm(model or None, generation_mode)
 
 
+class _LlmGuard:
+    """LLM 呼び出しの連続失敗を数え、続きそうなら中断を知らせるラッパー。
+
+    長時間の構築を放置して走らせるとき、LM Studio が途中で落ちても
+    ``fact_extract.extract`` は例外を飲んでルール抽出の結果だけを返すため、
+    **抽出は止まらず残りすべてが LLM なしの低品質な台帳になる**。
+    それに気付けないのが一番困るので、連続失敗が閾値を超えたら中断する。
+    """
+
+    def __init__(self, call, limit: int = 10) -> None:
+        self._call = call
+        self._limit = max(1, int(limit))
+        self.failures = 0
+        self.total_failures = 0
+        self.aborted = False
+        self.last_error = ""
+
+    def __call__(self, system: str, prompt: str) -> str:
+        try:
+            result = self._call(system, prompt)
+        except Exception as exc:
+            self.failures += 1
+            self.total_failures += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            if self.failures >= self._limit:
+                self.aborted = True
+            raise
+        self.failures = 0
+        return result
+
+
 def build(
     char_ids: list[str],
     *,
@@ -145,7 +176,9 @@ def build(
 ) -> None:
     names = _char_name_map()
     fallback_user = user_name or _default_user_name()
-    llm = None if rule_only else _make_llm(model, generation_mode)
+    # LM Studio が途中で落ちたら気付けるようにラップする（放置実行の保険）。
+    guard = None if rule_only else _LlmGuard(_make_llm(model, generation_mode))
+    llm = guard
     grand = {"turns": 0, "facts": 0, "llm": 0, "empty": 0}
     for char_id in char_ids:
         who = char_name or names.get(char_id) or char_id
@@ -227,15 +260,39 @@ def build(
                 mode=turn["mode"],
             )
             counts["facts"] += saved
-            # 進捗（LLM 抽出が混ざると時間がかかるので定期的に出す）。
+            # 進捗（LLM 抽出が混ざると時間がかかるので定期的に出す）。放置して走らせる
+            # ことを想定し、経過だけでなく残り時間の目安も出す。
             if index % 25 == 0 or index == len(turns):
                 elapsed = time.time() - started
+                eta = (elapsed / index) * (len(turns) - index) if index else 0
                 print(
                     f"  {index}/{len(turns)} 往復 / 事実 {counts['facts']} 件 / "
-                    f"LLM {counts['llm']} 回 / {elapsed:.1f}s"
+                    f"LLM {counts['llm']} 回 / {elapsed / 60:.1f}分経過"
+                    + (f" / 残り約{eta / 60:.0f}分" if eta > 60 else "")
+                    + (
+                        f" / ⚠ LLM 失敗 {guard.total_failures} 回"
+                        if guard is not None and guard.total_failures
+                        else ""
+                    ),
+                    flush=True,
                 )
+            # LM Studio が落ちたまま走り続けると、残り全部が LLM なしの低品質な台帳に
+            # なる。連続失敗が続いたら止めて、原因を直してから再開させる
+            # （未抽出分から再開できるので、ここまでの成果は無駄にならない）。
+            if guard is not None and guard.aborted:
+                print(
+                    f"\n[{char_id}] ⚠ LLM 呼び出しが {guard.failures} 回連続で失敗したため中断します。"
+                    f"\n  最後のエラー: {guard.last_error}"
+                    f"\n  LM Studio が起動しているか確認し、同じコマンドを --reset 無しで"
+                    f"再実行してください（未抽出の往復から再開します）。",
+                    flush=True,
+                )
+                break
         for key in grand:
             grand[key] += counts[key]
+        if guard is not None and guard.aborted:
+            # 次のキャラへ進んでも同じ理由で失敗するので、ここで打ち切る。
+            break
         stats = rag.facts_stats(char_id)
         print(
             f"[{char_id}] 完了: 往復={counts['turns']} 追加した事実={counts['facts']} "
