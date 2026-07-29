@@ -3224,7 +3224,14 @@ def recall_for_turn(
             user_name=user_name,
             char_name=char_name,
         )
-    use_ledger = bool(
+    # 台帳は「絞り込める」ときだけ使う。動詞・カテゴリ・向きのどれも決まらない質問で
+    # 引くと、質問と無関係な最古の事実から順に上限件数ぶん並べるだけになり
+    # （実測: 「マリンタワーに登ったのはいつ？」で無関係な60件が混入した）、
+    # 出典として年表へ持ち込む原文まで無関係なもので埋まる。
+    has_ledger_filter = any(
+        str(filters.get(key) or "").strip() for key in ("verb", "category", "direction")
+    )
+    use_ledger = has_ledger_filter and bool(
         temporal or enum or since or _LEDGER_ALWAYS or filters.get("verb")
     )
 
