@@ -71,13 +71,21 @@ _VERB_PATTERNS: tuple[tuple[str, str], ...] = (
 # （カテゴリは絞り込みの補助であって、無くても object/verb/direction で引ける）。
 _CATEGORY_HINTS: tuple[tuple[str, str], ...] = (
     ("本", r"本|小説|漫画|マンガ|雑誌|写真集|図鑑|絵本|文庫|新書|詩集"),
+    # 衣類は料理より前に置く。日本語には語境界が無いため「パンツ」が料理側の「パン」に
+    # 部分一致して [料理] と判定される（実測）。先にここで拾って打ち切る。
+    (
+        "衣類",
+        r"パンツ|下着|パンティ|ブラ|服|シャツ|ズボン|スカート|ドレス|コート|上着|"
+        r"靴下|靴|帽子|水着|手袋|マフラー|エプロン|制服|着替え",
+    ),
     (
         "料理",
+        # 「パン」は「パンツ」「パンティ」に誤爆するので否定先読みで守る。
         r"料理|ご飯|ごはん|飯|おかず|晩御飯|晩ごはん|夕飯|朝食|昼食|弁当|"
         r"うどん|そば|ラーメン|カレー|シチュー|パスタ|スパゲ|餃子|チャーハン|"
         r"味噌汁|スープ|サラダ|煮物|炒め|天ぷら|唐揚げ|卵焼き|オムレツ|ハンバーグ|"
         r"肉じゃが|麻婆|丼|寿司|刺身|焼き魚|塩じゃけ|鮭|さけ|たたき|鍋|おでん|"
-        r"ケーキ|クッキー|プリン|パン|ピザ|グラタン|コロッケ|春巻|パエリア",
+        r"ケーキ|クッキー|プリン|パン(?![ツち])|ピザ|グラタン|コロッケ|春巻|パエリア",
     ),
     ("飲み物", r"コーヒー|紅茶|お茶|ジュース|ココア|ミルク|ビール|ワイン|水|スムージー"),
     ("贈り物", r"プレゼント|贈り物|花束|指輪|ネックレス|ぬいぐるみ|人形|服|靴|鞄|かばん"),
@@ -89,6 +97,11 @@ _CATEGORY_HINTS: tuple[tuple[str, str], ...] = (
 # 「〜てあげる／やる」は発話者→相手、「〜てくれる／もらう／いただく」は相手→発話者。
 _GIVE_RE = re.compile(r"(?:て|で)(?:あげ|やっ|やる|あげる)|してあげ|プレゼントし")
 _RECEIVE_RE = re.compile(r"(?:て|で)(?:くれ|もらっ|もらう|いただ)|してくれ|もらった")
+# 場所へ向かう／場所で行う動詞。これらの客体は「を」ではなく「に」「へ」を伴う
+# （「マリンタワーに登った」「展望室へ行った」）ので、客体の抽出で助詞を広げる。
+_LOCATIVE_VERBS = {"行く", "登る", "泊まる", "会う"}
+# 客体と動詞の間に別の動詞が挟まっていないかを見るための全動詞パターン。
+_ANY_VERB_RE = re.compile("|".join(pattern for _verb, pattern in _VERB_PATTERNS))
 # 客体（何を）の抽出。助詞「を」の直前の名詞句を拾う素朴な規則。
 # 20 文字までに制限し、句読点・助詞境界で切る（文全体を客体にしない）。
 _OBJECT_RE = re.compile(r"([^、。！？\n\s「」『』]{1,20}?)を(?=[^、。]{0,12}?(?:%s))" % "|".join(
@@ -220,7 +233,7 @@ def _guess_category(object_text: str, verb: str) -> str:
 
 
 def _find_verbs(text: str) -> list[str]:
-    """本文に現れる行為の動詞（正規化後）を出現順で返す。"""
+    """本文に現れる行為の動詞（正規化後）を出現順で返す（質問側の絞り込み推定に使う）。"""
     found: list[tuple[int, str]] = []
     for verb, pattern in _VERB_PATTERNS:
         match = re.search(pattern, text)
@@ -228,6 +241,47 @@ def _find_verbs(text: str) -> list[str]:
             found.append((match.start(), verb))
     found.sort()
     return [verb for _pos, verb in found]
+
+
+def _find_verb_object_pairs(text: str) -> list[tuple[str, str]]:
+    """「客体＋を＋動詞」の係り受けを保ったまま (動詞, 客体) の組を返す。
+
+    動詞と客体をそれぞれ独立に集めて総当たりで組み合わせてはいけない。1 つの往復に
+    複数の動詞があるだけで誤った事実が量産される（実測: 「パンツ」1 語に対して
+    食べる/作る/買う/行く の 4 件が生成された）。客体は、その動詞に係っているものだけを取る。
+    """
+    pairs: list[tuple[str, str]] = []
+    for verb, pattern in _VERB_PATTERNS:
+        # 場所へ向かう動詞は「〜に登る」「〜へ行く」の形を取るので助詞を広げる。
+        particle = "[をにへ]" if verb in _LOCATIVE_VERBS else "を"
+        # 「〜を（間に最大12文字）＋その動詞」。句読点は越えない。
+        for match in re.finditer(
+            r"([^、。！？\n\s「」『』]{1,20}?)"
+            + particle
+            + r"([^、。！？\n]{0,12}?)(?:"
+            + pattern
+            + ")",
+            text,
+        ):
+            # 客体と動詞の間に別の動詞があれば、客体はそちらに係っている。
+            # 「パンツを買いに行った」を「行く: パンツ」にしないため
+            # （実測で「パンツ」に 食べる/作る/買う/行く の 4 件が付いた名残）。
+            if _ANY_VERB_RE.search(match.group(2)):
+                continue
+            obj = _clean_object(match.group(1))
+            if obj:
+                pairs.append((verb, obj))
+        # 「作ってくれたオムライス」のように、その動詞＋授受表現の直後に客体が来る形。
+        for match in re.finditer(
+            r"(?:" + pattern + r")[^、。！？\n]{0,4}?"
+            r"(?:くれた|あげた|もらった|くれて|あげて|もらって)([一-鿿ァ-ヴー]{2,12})",
+            text,
+        ):
+            obj = _clean_object(match.group(1))
+            if obj:
+                pairs.append((verb, obj))
+    # 同じ (動詞, 客体) は 1 つに畳む（出現順を保つ）。
+    return list(dict.fromkeys(pairs))
 
 
 def _direction_from_giving(text: str, role: str) -> str:
@@ -282,8 +336,9 @@ def extract_rule_based(
     for role, text in sides:
         if not text:
             continue
-        verbs = _find_verbs(text)
-        if not verbs:
+        # 動詞と客体は係り受けを保った組で取る（総当たりの組み合わせは誤りを量産する）。
+        pairs = _find_verb_object_pairs(text)
+        if not pairs:
             continue
         direction = _direction_from_giving(text, role)
         if two_only:
@@ -301,34 +356,51 @@ def extract_rule_based(
                     candidate = _TIME_PREFIX_RE.sub("", match.group(1)).strip()
                     if candidate and candidate not in _GENERIC_NAMES:
                         subject = candidate
-        objects = [_clean_object(m) for m in _OBJECT_RE.findall(text)]
-        # 「作ってくれたオムライス」のように「を」を伴わない客体も拾う。
-        objects += [_clean_object(m) for m in _OBJECT_AFTER_RE.findall(text)]
-        objects = [obj for obj in objects if obj]
-        # 同じ客体が両経路で取れることがあるので、順序を保って重複を除く。
-        objects = list(dict.fromkeys(objects))
-        for verb in verbs:
-            for obj in objects:
-                # 客体が取れなかった事実は台帳へ入れない。「言う: （空）」「行く: （空）」では
-                # 後から何があったかを思い出せず、列挙の枠を食い潰すだけ。
-                # 向きが確定していても、客体が無い行為は記録する価値が無い。
-                if not obj:
-                    continue
-                facts.append(
-                    {
-                        "category": _guess_category(obj, verb),
-                        "subject": subject,
-                        "verb": verb,
-                        "object": obj,
-                        "recipient": recipient,
-                        "direction": direction,
-                        # ルールの確信度: 授受表現で向きが取れた行を高くする。
-                        "confidence": 0.85 if direction != "unknown" else 0.4,
-                        "extractor": "rule",
-                        "snippet": text,
-                    }
-                )
-    return _dedupe(facts)
+        for verb, obj in pairs:
+            facts.append(
+                {
+                    "category": _guess_category(obj, verb),
+                    "subject": subject,
+                    "verb": verb,
+                    "object": obj,
+                    "recipient": recipient,
+                    "direction": direction,
+                    # ルールの確信度: 授受表現で向きが取れた行を高くする。
+                    "confidence": 0.85 if direction != "unknown" else 0.4,
+                    "extractor": "rule",
+                    "snippet": text,
+                }
+            )
+    return _resolve_conflicts(_dedupe(facts))
+
+
+def _resolve_conflicts(facts: list[dict]) -> list[dict]:
+    """同じ（動詞・客体）に食い違う向きが付いた組を 1 件へ畳む。
+
+    LLM は同じ出来事を両方向で返すことがある（実測: 「お嫁さんの役割を引き受ける」が
+    オサム→ルリ と ルリ→オサム の 2 件で入った）。同じ往復の中で向きが矛盾しているなら
+    少なくとも一方は誤りなので、確信度の高い方だけを残す。優劣が付かないときは
+    どちらとも言えないので `unknown`（主客不明）へ落とす —— 誤った向きを残して
+    「俺が君にした事」の絞り込みに混ぜるより、不明として提示する方が安全。
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for fact in facts:
+        key = (str(fact.get("verb") or ""), str(fact.get("object") or ""))
+        groups.setdefault(key, []).append(fact)
+    result: list[dict] = []
+    for items in groups.values():
+        directions = {str(item.get("direction") or "unknown") for item in items}
+        if len(directions) <= 1:
+            result.extend(items)
+            continue
+        best = max(items, key=lambda item: float(item.get("confidence") or 0))
+        top = float(best.get("confidence") or 0)
+        if sum(1 for item in items if float(item.get("confidence") or 0) == top) > 1:
+            best = dict(best)
+            best["direction"] = "unknown"
+            best["recipient"] = ""
+        result.append(best)
+    return result
 
 
 def _dedupe(facts: list[dict]) -> list[dict]:
@@ -425,6 +497,13 @@ def build_llm_prompt(
         "その内容を object にして書く（例: 約束する→新婚旅行 / 打ち明ける→昔の失敗）。\n"
         "・誰がしたことなのかを絶対に取り違えない。分からなければ subject を空文字、"
         'direction を "unknown" にする（推測で埋めない）。\n'
+        "・direction は「誰のためにした行為か」で決める。**相手のために／相手に対してした**と"
+        "本文に書かれている場合だけ user->char・char->user にする。自分のためにした行為"
+        "（自分の下着を買った、自分が走った、自分が風呂に入った）は必ず self にし、"
+        "recipient は空にする。相手が同席していただけの行為を「相手にしてあげた」に"
+        "しないこと。判断できないなら unknown。\n"
+        "・同じ出来事を両方向で二重に出さない（user->char と char->user を同時に書かない）。"
+        "どちらか一方に決められないなら unknown を 1 件だけ出す。\n"
         "・1 つの発話に複数の事実があれば複数要素にする。何も無ければ [] を返す。\n"
         "・object は「讃岐うどん」「星の王子さま」のように短い名詞にする。文をそのまま入れない。\n"
         "・説明・前置き・コードブロックは出さず、JSON 配列だけを返す。/no_think"
@@ -519,7 +598,7 @@ def parse_llm_facts(content: str, *, user_name: str = "", char_name: str = "") -
                 "snippet": "",
             }
         )
-    return _dedupe(facts)
+    return _resolve_conflicts(_dedupe(facts))
 
 
 def infer_query_filters(
@@ -621,4 +700,4 @@ def extract(
     strong_rule = [
         fact for fact in facts if str(fact.get("direction") or "unknown") != "unknown"
     ]
-    return _dedupe(llm_facts + strong_rule)
+    return _resolve_conflicts(_dedupe(llm_facts + strong_rule))

@@ -18,6 +18,16 @@
   python tools/build_fact_ledger.py --char ruri --reset          # 台帳を作り直す
   python tools/build_fact_ledger.py --char ruri --show           # 構築後に一覧を表示
 
+抽出の規則を直したあと、**一部だけ**作り直す（全件やり直すと LLM 抽出で数十分かかる）:
+  # 7月以降の往復だけをやり直す
+  python tools/build_fact_ledger.py --redo --since 2026-07-01
+  # 「登る」に関わる事実を含む往復だけをやり直す（動詞辞書や係り受けを直したとき）
+  python tools/build_fact_ledger.py --redo-verb 登る
+  # 「料理」カテゴリだけ、しかも7月以降に限る
+  python tools/build_fact_ledger.py --redo-category 料理 --since 2026-07-01
+  # 期間を絞って未抽出分だけ進める（やり直しはしない）
+  python tools/build_fact_ledger.py --since 2026-07-20
+
 台帳の中身だけを後から見る（抽出しない読み取り専用。**構築の途中でも使える**）:
   python tools/build_fact_ledger.py --list
   python tools/build_fact_ledger.py --list --char ruri --list-limit 200
@@ -119,6 +129,11 @@ def build(
     model: str,
     generation_mode: str,
     show: bool,
+    since: str = "",
+    until: str = "",
+    redo: bool = False,
+    redo_verb: str = "",
+    redo_category: str = "",
 ) -> None:
     names = _char_name_map()
     fallback_user = user_name or _default_user_name()
@@ -129,7 +144,30 @@ def build(
         if reset and not dry_run:
             removed = rag.clear_facts(char_id)
             print(f"[{char_id}] 台帳を消去: {removed} 行")
-        turns = rag.iter_unextracted_turns(char_id, limit=limit)
+        # 部分的な作り直し: 対象の往復の事実を先に消すと「未抽出」として拾われ、
+        # 再抽出される。抽出の規則を直したときに全件やり直さずに済む。
+        if (redo or redo_verb or redo_category) and not dry_run and not reset:
+            targets = rag.facts_source_ids(
+                char_id, verb=redo_verb, category=redo_category, since=since, until=until
+            )
+            if targets:
+                removed = rag.delete_facts_by_sources(char_id, targets)
+                label = " / ".join(
+                    part
+                    for part in (
+                        f"動詞={redo_verb}" if redo_verb else "",
+                        f"カテゴリ={redo_category}" if redo_category else "",
+                        f"{since or '最初'}〜{until or '最後'}" if (since or until) else "",
+                    )
+                    if part
+                ) or "全期間"
+                print(
+                    f"[{char_id}] やり直し対象（{label}）: {len(targets)} 往復 / "
+                    f"事実 {removed} 件を削除しました"
+                )
+            else:
+                print(f"[{char_id}] やり直し対象の事実はありません")
+        turns = rag.iter_unextracted_turns(char_id, limit=limit, since=since, until=until)
         print(
             f"\n[{char_id}] 未抽出の往復: {len(turns)} 件"
             f"（ユーザー名={fallback_user or '(未設定)'} / キャラ名={who}）"
@@ -258,6 +296,19 @@ def main() -> None:
     parser.add_argument("--list-limit", type=int, default=40, help="--list で表示する件数")
     parser.add_argument("--verb", default="", help="--list の絞り込み（例: 作る）")
     parser.add_argument("--category", default="", help="--list の絞り込み（例: 料理）")
+    parser.add_argument("--since", default="", help="この日付以降の往復だけを対象にする（YYYY-MM-DD）")
+    parser.add_argument("--until", default="", help="この日付までの往復だけを対象にする（YYYY-MM-DD）")
+    parser.add_argument(
+        "--redo",
+        action="store_true",
+        help="抽出済みの往復もやり直す（対象範囲の事実を消してから再抽出。--since/--until で範囲指定）",
+    )
+    parser.add_argument(
+        "--redo-verb", default="", help="この動詞の事実を含む往復だけをやり直す（例: 登る）"
+    )
+    parser.add_argument(
+        "--redo-category", default="", help="このカテゴリの事実を含む往復だけをやり直す（例: 料理）"
+    )
     args = parser.parse_args()
 
     char_ids = _target_char_ids(args.char)
@@ -285,6 +336,11 @@ def main() -> None:
         model=args.model,
         generation_mode=args.generation_mode,
         show=args.show,
+        since=args.since,
+        until=args.until,
+        redo=args.redo,
+        redo_verb=args.redo_verb,
+        redo_category=args.redo_category,
     )
 
 

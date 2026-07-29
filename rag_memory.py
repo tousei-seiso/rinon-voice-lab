@@ -1364,17 +1364,99 @@ def clear_facts(char_id: str) -> int:
         return 0
 
 
+def facts_source_ids(
+    char_id: str,
+    *,
+    verb: str = "",
+    category: str = "",
+    direction: str = "",
+    since: str = "",
+    until: str = "",
+) -> list[int]:
+    """条件に合う事実を持つ往復の id を返す（部分的な作り直しの対象特定に使う）。
+
+    抽出の規則を直したとき、全往復をやり直すと LLM 抽出で数十分かかる。
+    「登る に関わる事実だけ」「7月以降だけ」を直したいときは、ここで対象の往復を
+    特定してから ``delete_facts_by_sources`` で消し、再抽出すればよい。
+    """
+    if not LEDGER_ENABLED:
+        return []
+    conn = _open_readonly(char_id)
+    if conn is None or not _has_table(conn, "facts"):
+        if conn is not None:
+            conn.close()
+        return []
+    conditions: list[str] = []
+    params: list[str] = []
+    for column, value in (("verb", verb), ("category", category), ("direction", direction)):
+        text = str(value or "").strip()
+        if text:
+            conditions.append(f"{column} = ?")
+            params.append(text)
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    try:
+        rows = conn.execute(f"SELECT source_id, ts FROM facts{where}", params).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    since_key = ts_sort_key(since) if str(since or "").strip() else ""
+    until_key = ts_sort_key(until, end=True) if str(until or "").strip() else ""
+    ids: list[int] = []
+    for source_id, ts in rows:
+        if not source_id:
+            continue
+        if not _in_range(ts, since_key, until_key):
+            continue
+        if int(source_id) not in ids:
+            ids.append(int(source_id))
+    return ids
+
+
+def delete_facts_by_sources(char_id: str, source_ids: list) -> int:
+    """指定した往復から抽出した事実だけを削除する（往復そのものは残す）。
+
+    部分的な作り直しの前段。その往復の事実を**すべて**消すので、
+    ``iter_unextracted_turns`` から再び「未抽出」として返り、再抽出の対象になる
+    （一部の動詞だけ残すと、抽出済み判定に引っかかって再抽出されない）。
+    """
+    if not LEDGER_ENABLED:
+        return 0
+    wanted = [
+        int(value) for value in (source_ids or []) if str(value or "").strip().isdigit()
+    ]
+    if not wanted:
+        return 0
+    try:
+        conn = _connect(char_id, create=True)
+        try:
+            placeholders = ",".join("?" for _ in wanted)
+            cursor = conn.execute(
+                f"DELETE FROM facts WHERE source_id IN ({placeholders})", wanted
+            )
+            removed = int(cursor.rowcount or 0)
+            conn.commit()
+            return removed
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
 def iter_unextracted_turns(
     char_id: str,
     *,
     slot: str | None = None,
     mode: str | None = None,
     limit: int = 0,
+    since: str = "",
+    until: str = "",
 ) -> list[dict]:
     """まだ台帳へ抽出していない往復を古い順に返す（バッチ抽出の入力）。
 
     抽出済みかどうかは facts.source_id の有無で判定する。中断・追記しても続きから
     再開できるので、数千往復を数回に分けて処理できる。
+    ``since``/``until`` で期間を絞れる（抽出の規則を直したあと、一部だけ作り直す用）。
     """
     conn = _open_readonly(char_id)
     if conn is None:
@@ -1404,6 +1486,10 @@ def iter_unextracted_turns(
         conn.close()
     columns = ("id", "ts", "slot", "mode", "speaker", "user_text", "reply_text")
     turns = [dict(zip(columns, row)) for row in rows]
+    since_key = ts_sort_key(since) if str(since or "").strip() else ""
+    until_key = ts_sort_key(until, end=True) if str(until or "").strip() else ""
+    if since_key or until_key:
+        turns = [turn for turn in turns if _in_range(turn.get("ts"), since_key, until_key)]
     turns.sort(key=lambda rec: ts_sort_key(rec.get("ts")))
     if limit and limit > 0:
         return turns[: int(limit)]
