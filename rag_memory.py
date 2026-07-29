@@ -1443,6 +1443,104 @@ def delete_facts_by_sources(char_id: str, source_ids: list) -> int:
         return 0
 
 
+def delete_facts_by_extractor(
+    char_id: str, extractor: str, *, since: str = "", until: str = ""
+) -> int:
+    """指定した抽出器（'rule' / 'llm'）が作った事実だけを削除する。
+
+    抽出規則（係り受け・カテゴリ辞書・客体フィルタ）を直したとき、**ルール由来の分
+    だけ**をやり直せば LLM 呼び出しはゼロで済む。LLM 由来の事実は文全体を読んで
+    判断しているため、正規表現の規則を直しても影響を受けないので残してよい
+    （実測: 578 件のうち LLM 由来が 495 件。全件を LLM に投げ直すと 2 時間かかる）。
+    """
+    if not LEDGER_ENABLED:
+        return 0
+    key = str(extractor or "").strip()
+    if not key:
+        return 0
+    since_key = ts_sort_key(since) if str(since or "").strip() else ""
+    until_key = ts_sort_key(until, end=True) if str(until or "").strip() else ""
+    try:
+        conn = _connect(char_id, create=True)
+        try:
+            if since_key or until_key:
+                rows = conn.execute(
+                    "SELECT id, ts FROM facts WHERE extractor = ?", (key,)
+                ).fetchall()
+                targets = [
+                    int(row[0]) for row in rows if _in_range(row[1], since_key, until_key)
+                ]
+                if not targets:
+                    return 0
+                placeholders = ",".join("?" for _ in targets)
+                cursor = conn.execute(
+                    f"DELETE FROM facts WHERE id IN ({placeholders})", targets
+                )
+            else:
+                cursor = conn.execute("DELETE FROM facts WHERE extractor = ?", (key,))
+            removed = int(cursor.rowcount or 0)
+            conn.commit()
+            return removed
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
+def resolve_ledger_conflicts(char_id: str) -> int:
+    """台帳に残った「同じ出来事に食い違う向き」を 1 件へ畳む。削除した行数を返す。
+
+    抽出時にも矛盾は解消しているが、それより前に作られた台帳や、ルール由来と LLM 由来が
+    別々に入った組では食い違いが残る（実測: 「飲む: トマトジュース」が user->char と
+    char->user の 2 件）。確信度の高い方を残し、優劣が付かなければ `unknown` に落とす
+    —— 誤った向きを残して「俺が君にした事」の絞り込みへ混ぜるより安全。
+    LLM 呼び出しは不要なので数秒で終わる。
+    """
+    if not LEDGER_ENABLED:
+        return 0
+    try:
+        conn = _connect(char_id, create=True)
+        try:
+            rows = conn.execute(
+                "SELECT id, source_id, verb, object, direction, confidence FROM facts"
+            ).fetchall()
+            groups: dict[tuple, list[tuple]] = {}
+            for row in rows:
+                groups.setdefault((row[1], row[2], row[3]), []).append(row)
+            drop: list[int] = []
+            to_unknown: list[int] = []
+            for items in groups.values():
+                if len({str(item[4]) for item in items}) <= 1:
+                    continue
+                best = max(items, key=lambda item: float(item[5] or 0))
+                top = float(best[5] or 0)
+                tied = [item for item in items if float(item[5] or 0) == top]
+                keep = best[0]
+                if len(tied) > 1:
+                    to_unknown.append(keep)
+                drop.extend(int(item[0]) for item in items if int(item[0]) != int(keep))
+            if to_unknown:
+                placeholders = ",".join("?" for _ in to_unknown)
+                conn.execute(
+                    f"UPDATE facts SET direction = 'unknown', recipient = '' "
+                    f"WHERE id IN ({placeholders})",
+                    to_unknown,
+                )
+            removed = 0
+            if drop:
+                placeholders = ",".join("?" for _ in drop)
+                cursor = conn.execute(
+                    f"DELETE FROM facts WHERE id IN ({placeholders})", drop
+                )
+                removed = int(cursor.rowcount or 0)
+            conn.commit()
+            return removed
+        finally:
+            conn.close()
+    except Exception:
+        return 0
+
+
 def iter_unextracted_turns(
     char_id: str,
     *,

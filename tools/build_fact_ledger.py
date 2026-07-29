@@ -18,6 +18,14 @@
   python tools/build_fact_ledger.py --char ruri --reset          # 台帳を作り直す
   python tools/build_fact_ledger.py --char ruri --show           # 構築後に一覧を表示
 
+抽出の規則を直したあと、**LLM 呼び出しなしで**直せる範囲を直す（数秒で終わる）:
+  # 正規表現の規則（係り受け・カテゴリ辞書・客体フィルタ）を直したとき。
+  # LLM 由来の事実は文全体を読んで判断しているので影響を受けず、そのまま残る。
+  python tools/build_fact_ledger.py --redo-rule
+  python tools/build_fact_ledger.py --redo-rule --dry-run   # 何が入るか先に見る
+  # 「同じ出来事に食い違う向き」が残っている分を畳む
+  python tools/build_fact_ledger.py --fix-conflicts
+
 抽出の規則を直したあと、**一部だけ**作り直す（全件やり直すと LLM 抽出で数十分かかる）:
   # 7月以降の往復だけをやり直す
   python tools/build_fact_ledger.py --redo --since 2026-07-01
@@ -242,6 +250,86 @@ def build(
     )
 
 
+def redo_rule_facts(
+    char_ids: list[str],
+    *,
+    since: str = "",
+    until: str = "",
+    user_name: str = "",
+    char_name: str = "",
+    dry_run: bool = False,
+) -> None:
+    """ルール抽出由来の事実だけを作り直す（**LLM 呼び出しゼロ**）。
+
+    係り受け・カテゴリ辞書・客体フィルタといった正規表現の規則を直したときに使う。
+    LLM 由来の事実は文全体を読んで判断しているため規則変更の影響を受けないので、
+    そのまま残す。全往復を LLM に投げ直すと数時間かかるが、これは数秒で終わる。
+    """
+    names = _char_name_map()
+    fallback_user = user_name or _default_user_name()
+    for char_id in char_ids:
+        who = char_name or names.get(char_id) or char_id
+        before = rag.facts_stats(char_id)
+        turns = rag.list_turns(char_id)
+        if since or until:
+            since_key = rag.ts_sort_key(since) if since else ""
+            until_key = rag.ts_sort_key(until, end=True) if until else ""
+            turns = [t for t in turns if rag._in_range(t.get("ts"), since_key, until_key)]
+        print(
+            f"\n[{char_id}] ルール抽出のやり直し: 対象 {len(turns)} 往復 "
+            f"（現在の台帳 {before['count']} 事実 / ユーザー名={fallback_user or '(未設定)'} / キャラ名={who}）"
+        )
+        if dry_run:
+            sample = 0
+            for turn in turns:
+                facts = fx.extract_rule_based(
+                    turn["user_text"], turn["reply_text"], user_name=fallback_user,
+                    char_name=who, mode=turn["mode"], speaker=turn["speaker"],
+                )
+                if facts and sample < 10:
+                    sample += 1
+                    stamp = rag.format_stamp(turn["ts"], seconds=True) or "(日時不明)"
+                    head = " / ".join(
+                        f"{f['verb']}:{f['object']}[{f['direction']}]" for f in facts[:3]
+                    )
+                    print(f"  {stamp} {head}")
+            print("  (dry-run: 削除も保存もしていません)")
+            continue
+        removed = rag.delete_facts_by_extractor(char_id, "rule", since=since, until=until)
+        added = 0
+        for turn in turns:
+            facts = fx.extract_rule_based(
+                turn["user_text"], turn["reply_text"], user_name=fallback_user,
+                char_name=who, mode=turn["mode"], speaker=turn["speaker"],
+            )
+            if facts:
+                added += rag.save_facts(
+                    char_id, facts, source_id=turn["id"], ts=turn["ts"],
+                    slot=turn["slot"], mode=turn["mode"],
+                )
+        # 作り直したルール由来の事実が、既存の LLM 由来と食い違うことがある
+        # （同じ出来事に user->char と char->user が並ぶ）。ここで必ず畳んでおく。
+        conflicts = rag.resolve_ledger_conflicts(char_id)
+        after = rag.facts_stats(char_id)
+        print(
+            f"  → ルール由来を {removed} 件削除 / {added} 件を作り直し "
+            f"/ 食い違う向きを {conflicts} 件整理 "
+            f"（台帳 {before['count']} → {after['count']} 事実。LLM 呼び出しなし）"
+        )
+
+
+def fix_conflicts(char_ids: list[str]) -> None:
+    """台帳に残った「同じ出来事に食い違う向き」を畳む（LLM 呼び出しなし）。"""
+    for char_id in char_ids:
+        before = rag.facts_stats(char_id)
+        removed = rag.resolve_ledger_conflicts(char_id)
+        after = rag.facts_stats(char_id)
+        print(
+            f"[{char_id}] 食い違う向きを整理: {removed} 件削除 "
+            f"（台帳 {before['count']} → {after['count']} 事実 / 方向別 {after['directions']}）"
+        )
+
+
 def list_ledger(char_ids: list[str], *, limit: int = 40, verb: str = "", category: str = "") -> None:
     """台帳の中身を一覧表示する（抽出はしない読み取り専用）。
 
@@ -309,6 +397,16 @@ def main() -> None:
     parser.add_argument(
         "--redo-category", default="", help="このカテゴリの事実を含む往復だけをやり直す（例: 料理）"
     )
+    parser.add_argument(
+        "--redo-rule",
+        action="store_true",
+        help="ルール抽出由来の事実だけを作り直す（LLM 呼び出しなし・数秒。正規表現の規則を直したとき）",
+    )
+    parser.add_argument(
+        "--fix-conflicts",
+        action="store_true",
+        help="台帳に残った食い違う向きを畳む（LLM 呼び出しなし・即座）",
+    )
     args = parser.parse_args()
 
     char_ids = _target_char_ids(args.char)
@@ -319,6 +417,20 @@ def main() -> None:
         # 表示だけなので抽出も埋め込みも不要。構築中でも安全に覗ける。
         list_ledger(
             char_ids, limit=args.list_limit, verb=args.verb, category=args.category
+        )
+        return
+    if args.fix_conflicts:
+        fix_conflicts(char_ids)
+        return
+    if args.redo_rule:
+        # LLM を使わないので LM Studio は不要。数秒で終わる。
+        redo_rule_facts(
+            char_ids,
+            since=args.since,
+            until=args.until,
+            user_name=args.user_name,
+            char_name=args.char_name,
+            dry_run=args.dry_run,
         )
         return
     if not args.rule_only and not rag.is_ready():
