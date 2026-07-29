@@ -243,14 +243,19 @@ def _find_verbs(text: str) -> list[str]:
     return [verb for _pos, verb in found]
 
 
-def _find_verb_object_pairs(text: str) -> list[tuple[str, str]]:
-    """「客体＋を＋動詞」の係り受けを保ったまま (動詞, 客体) の組を返す。
+def _find_verb_object_pairs(text: str) -> list[tuple[str, str, str]]:
+    """「客体＋を＋動詞」の係り受けを保ったまま (動詞, 客体, 授受のヒント) の組を返す。
 
     動詞と客体をそれぞれ独立に集めて総当たりで組み合わせてはいけない。1 つの往復に
     複数の動詞があるだけで誤った事実が量産される（実測: 「パンツ」1 語に対して
     食べる/作る/買う/行く の 4 件が生成された）。客体は、その動詞に係っているものだけを取る。
+
+    授受のヒント（'give' / 'receive' / ''）も動詞ごとに返す。文全体で授受表現を探すと、
+    別の行為に係る向きを持ち込んでしまう（実測: 「何でも喜んで食べて**くれる**から、
+    …パンツを買いに行ってくるね」で、買う行為が「ルリが買った」になった）。
+    向きの手掛かりは、その動詞の直後にある授受表現だけに限る。
     """
-    pairs: list[tuple[str, str]] = []
+    pairs: list[tuple[str, str, str]] = []
     for verb, pattern in _VERB_PATTERNS:
         # 場所へ向かう動詞は「〜に登る」「〜へ行く」の形を取るので助詞を広げる。
         particle = "[をにへ]" if verb in _LOCATIVE_VERBS else "を"
@@ -270,18 +275,33 @@ def _find_verb_object_pairs(text: str) -> list[tuple[str, str]]:
                 continue
             obj = _clean_object(match.group(1))
             if obj:
-                pairs.append((verb, obj))
+                pairs.append((verb, obj, _giving_hint(text, match.end())))
         # 「作ってくれたオムライス」のように、その動詞＋授受表現の直後に客体が来る形。
         for match in re.finditer(
             r"(?:" + pattern + r")[^、。！？\n]{0,4}?"
-            r"(?:くれた|あげた|もらった|くれて|あげて|もらって)([一-鿿ァ-ヴー]{2,12})",
+            r"(くれた|あげた|もらった|くれて|あげて|もらって)([一-鿿ァ-ヴー]{2,12})",
             text,
         ):
-            obj = _clean_object(match.group(1))
+            obj = _clean_object(match.group(2))
             if obj:
-                pairs.append((verb, obj))
-    # 同じ (動詞, 客体) は 1 つに畳む（出現順を保つ）。
+                hint = "give" if match.group(1).startswith("あげ") else "receive"
+                pairs.append((verb, obj, hint))
+    # 同じ (動詞, 客体, ヒント) は 1 つに畳む（出現順を保つ）。
     return list(dict.fromkeys(pairs))
+
+
+def _giving_hint(text: str, position: int) -> str:
+    """指定位置（動詞の直後）にある授受表現から向きの手掛かりを返す。
+
+    「作ってあげた」「買ってくれた」のように、授受表現はその行為の直後に付く。
+    離れた位置の授受表現は別の行為に係っているので見ない。
+    """
+    tail = text[position : position + 10]
+    if _GIVE_RE.search(tail):
+        return "give"
+    if _RECEIVE_RE.search(tail):
+        return "receive"
+    return ""
 
 
 def _direction_from_giving(text: str, role: str) -> str:
@@ -340,23 +360,33 @@ def extract_rule_based(
         pairs = _find_verb_object_pairs(text)
         if not pairs:
             continue
-        direction = _direction_from_giving(text, role)
-        if two_only:
-            # 2人だけモードにユーザーは存在しない。向きはキャラ間なので、
-            # ユーザー主体の向きを持ち込まない（幻のユーザーを台帳へ作らない）。
-            direction = "char->char" if direction != "unknown" else "unknown"
-            subject = str(speaker or "").strip() if role == "assistant" else ""
-            recipient = ""
-        else:
-            subject, recipient = _names_for(direction, user_name, char_name)
-            if not subject:
-                # 向きが不明でも、主体が本文に明示されていれば拾う（「ナデシコが壊した」）。
-                match = _SUBJECT_RE.search(text)
-                if match:
-                    candidate = _TIME_PREFIX_RE.sub("", match.group(1)).strip()
-                    if candidate and candidate not in _GENERIC_NAMES:
-                        subject = candidate
-        for verb, obj in pairs:
+        # 本文に明示された主体（「ナデシコが壊した」）。向きが取れないときの手掛かり。
+        named_subject = ""
+        match = _SUBJECT_RE.search(text)
+        if match:
+            candidate = _TIME_PREFIX_RE.sub("", match.group(1)).strip()
+            if candidate and candidate not in _GENERIC_NAMES:
+                named_subject = candidate
+        # 向きは行為ごとに決める。文全体で1つに決めてしまうと、別の行為に係る
+        # 授受表現の向きを持ち込む（実測: 「食べてくれるから…パンツを買いに行く」で
+        # 買う行為が「ルリが買った」になった）。
+        for verb, obj, hint in pairs:
+            if not hint:
+                direction = "unknown"
+            elif role == "user":
+                direction = "user->char" if hint == "give" else "char->user"
+            else:
+                direction = "char->user" if hint == "give" else "user->char"
+            if two_only:
+                # 2人だけモードにユーザーは存在しない。向きはキャラ間なので、
+                # ユーザー主体の向きを持ち込まない（幻のユーザーを台帳へ作らない）。
+                direction = "char->char" if direction != "unknown" else "unknown"
+                subject = str(speaker or "").strip() if role == "assistant" else ""
+                recipient = ""
+            else:
+                subject, recipient = _names_for(direction, user_name, char_name)
+                if not subject:
+                    subject = named_subject
             facts.append(
                 {
                     "category": _guess_category(obj, verb),
@@ -365,7 +395,7 @@ def extract_rule_based(
                     "object": obj,
                     "recipient": recipient,
                     "direction": direction,
-                    # ルールの確信度: 授受表現で向きが取れた行を高くする。
+                    # ルールの確信度: その行為に係る授受表現で向きが取れた行を高くする。
                     "confidence": 0.85 if direction != "unknown" else 0.4,
                     "extractor": "rule",
                     "snippet": text,
@@ -477,7 +507,9 @@ def build_llm_prompt(
         "あなたは会話ログから事実を抽出する抽出器です。JSON 配列だけを出力します。\n"
         f"{world}\n"
         "各要素は次のキーを持つオブジェクトにしてください:\n"
-        '  {"category": "料理|本|贈り物|場所|音楽|飲み物|出来事など", '
+        "・category は物の種類で決める。『贈り物』は**相手に渡した物**にだけ使い、"
+        "自分のために買った物は『衣類』『本』のように物の種類を書く。\n"
+        '  {"category": "料理|本|衣類|贈り物|場所|音楽|飲み物|出来事など", '
         '"subject": "行為をした人の名前", "verb": "作る|買う|渡す|行く|言う|壊す など辞書形", '
         '"object": "行為の対象（何を）", "recipient": "相手の名前", '
         '"direction": "user->char|char->user|char->char|self|unknown", '
