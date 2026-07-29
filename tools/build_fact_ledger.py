@@ -18,6 +18,12 @@
   python tools/build_fact_ledger.py --char ruri --reset          # 台帳を作り直す
   python tools/build_fact_ledger.py --char ruri --show           # 構築後に一覧を表示
 
+台帳の中身だけを後から見る（抽出しない読み取り専用。**構築の途中でも使える**）:
+  python tools/build_fact_ledger.py --list
+  python tools/build_fact_ledger.py --list --char ruri --list-limit 200
+  python tools/build_fact_ledger.py --list --char ruri --verb 作る      # 動詞で絞る
+  python tools/build_fact_ledger.py --list --char ruri --category 料理  # カテゴリで絞る
+
 途中で止めても、次回は「まだ抽出していない往復」から再開する
 （facts.source_id の有無で判定するため、何度実行しても重複しない）。
 
@@ -191,11 +197,43 @@ def build(
             f"（方向別: {stats['directions']}）"
         )
         if show and not dry_run:
-            print(rag.build_ledger_block(rag.query_facts(char_id, limit=40)) or "  (空)")
+            list_ledger([char_id], limit=40)
     print(
         f"\n== 台帳構築{'(dry-run)' if dry_run else '完了'}: "
         f"往復={grand['turns']} 事実={grand['facts']} LLM={grand['llm']} =="
     )
+
+
+def list_ledger(char_ids: list[str], *, limit: int = 40, verb: str = "", category: str = "") -> None:
+    """台帳の中身を一覧表示する（抽出はしない読み取り専用）。
+
+    構築の途中でも呼べる（読み取り専用で開くので、実行中の抽出を邪魔しない）。
+    件数が多いので既定は先頭 limit 件。動詞やカテゴリで絞り込める。
+    """
+    for char_id in char_ids:
+        stats = rag.facts_stats(char_id)
+        print(
+            f"\n[{char_id}] 台帳={stats['count']} 事実 / 抽出済み往復={stats['sources']} "
+            f"/ 方向別={stats['directions']}"
+        )
+        if not stats["count"]:
+            print("  (空) tools/build_fact_ledger.py で構築してください。")
+            continue
+        facts = rag.query_facts(char_id, verb=verb, category=category, limit=limit)
+        if not facts:
+            print("  該当なし（--verb / --category の指定を確認してください）")
+            continue
+        # 抽出元と主客を追えるよう、日時つき・古い順で 1 行 1 事実を出す。
+        for fact in facts:
+            stamp = rag.format_stamp(fact["ts"], seconds=True) or "(日時不明)"
+            print(
+                f"  {stamp} {fact['direction']:11} "
+                f"{fact['subject'] or '(不明)'}→{fact['recipient'] or '(不明)'} "
+                f"{fact['verb']}: {fact['object']} [{fact['category'] or '-'}] "
+                f"by={fact['extractor']} src={fact['source_id']}"
+            )
+        if stats["count"] > len(facts):
+            print(f"  …ほか {stats['count'] - len(facts)} 件（--list-limit で増やせます）")
 
 
 def main() -> None:
@@ -212,16 +250,30 @@ def main() -> None:
         "--generation-mode", default="prefill", help="抽出時の生成モード（既定 prefill＝高速）"
     )
     parser.add_argument("--show", action="store_true", help="構築後に台帳の一覧を表示")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="抽出せず、既にある台帳の中身だけを表示する（構築の途中でも使える）",
+    )
+    parser.add_argument("--list-limit", type=int, default=40, help="--list で表示する件数")
+    parser.add_argument("--verb", default="", help="--list の絞り込み（例: 作る）")
+    parser.add_argument("--category", default="", help="--list の絞り込み（例: 料理）")
     args = parser.parse_args()
 
-    if not args.rule_only and not rag.is_ready():
-        # LLM 抽出自体は埋め込み不要だが、保存（save_facts→_connect）は DB を触るので
-        # rag_memory が無効化されていないかは確認しておく。
-        print("警告: rag_memory の埋め込みバックエンドが無効です（台帳の保存自体は可能）。")
     char_ids = _target_char_ids(args.char)
     if not char_ids:
         print("対象キャラが見つかりません（profiles/sessions/<charId>/memory.sqlite3 が必要）。")
         return
+    if args.list:
+        # 表示だけなので抽出も埋め込みも不要。構築中でも安全に覗ける。
+        list_ledger(
+            char_ids, limit=args.list_limit, verb=args.verb, category=args.category
+        )
+        return
+    if not args.rule_only and not rag.is_ready():
+        # LLM 抽出自体は埋め込み不要だが、保存（save_facts→_connect）は DB を触るので
+        # rag_memory が無効化されていないかは確認しておく。
+        print("警告: rag_memory の埋め込みバックエンドが無効です（台帳の保存自体は可能）。")
     build(
         char_ids,
         dry_run=args.dry_run,
