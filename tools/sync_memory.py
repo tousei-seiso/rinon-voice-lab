@@ -12,9 +12,11 @@
 
 ``--source chatlog``（既定 / chat.jsonl を手修正したとき）
     chat.jsonl を正本として下流をすべて揃える。従来の rebuild_from_chatlog と同じ系統。
-      1) history.json を再生成（感情キャプション付きの display も復元）
+      1) history.json を再生成（感情キャプション付きの display も各ターンの segments
+         から組み直す）
       2) memory.sqlite3 を差分同期（消えた往復を削除／無い往復を追加／時刻を更新）
-      3) chat_emotion.jsonl を chat.jsonl に残る返答だけへ整合（--filter-emotion）
+      3) chat_emotion.jsonl を chat.jsonl から作り直す（--sync-emotion。消えた返答を
+         落とすだけでなく、欠けている行の追加と注釈文の組み直しも行う）
       4) 出典を失った事実を掃除し、追加分を台帳へ抽出（--extract）
 
 ``--source history``（history.json を手修正したとき）
@@ -31,7 +33,7 @@
 使い方（app.py を動かす Python 環境 / .venv 有効、リポジトリ直下から）:
   # chat.jsonl を手修正した後（下流をすべて揃える）
   python tools/sync_memory.py --dry-run
-  python tools/sync_memory.py --filter-emotion --extract --rule-only
+  python tools/sync_memory.py --sync-emotion --extract --rule-only
 
   # UI で会話を削除した後（大本まで消して整合させる）
   python tools/sync_memory.py --source history --propagate --dry-run
@@ -319,7 +321,9 @@ def _propagate_deletions(
             stats["chat_kept"] += 1
         else:
             stats["chat_removed"] += 1
-            removed_replies.add(bare)
+            # chat_emotion.jsonl は返答本文で紐づくので、消した返答を覚えておく
+            # （下の突き合わせと同じ正規化・接頭辞なしの形で持つ）。
+            removed_replies.add(_norm(rfc._strip_speaker(reply_text, names)))
     print(
         f"  chat.jsonl: 残す={stats['chat_kept']} 削除={stats['chat_removed']}"
         + ("  (dry-run)" if dry_run else "")
@@ -348,7 +352,7 @@ def _propagate_deletions(
                 stats["emotion_kept"] += 1
                 continue
             bare = _norm(rfc._strip_speaker(record.get("reply"), names))
-            if bare and bare not in surviving and bare in {_norm(r) for r in removed_replies}:
+            if bare and bare not in surviving and bare in removed_replies:
                 stats["emotion_removed"] += 1
             else:
                 kept_emotion.append(line)
@@ -440,13 +444,10 @@ def sync_from_chatlog(options: argparse.Namespace) -> None:
         if options.extract and not options.dry_run:
             _extract_ledger(char_id, options)
 
-    # 4) chat_emotion.jsonl の整合（chat.jsonl に残る返答だけ残す）
-    if options.filter_emotion:
-        if options.dry_run:
-            print("\nchat_emotion.jsonl: 整合予定 (dry-run)")
-        else:
-            valid = {turn["reply"] for turns in grouped.values() for turn in turns}
-            rfc._filter_emotion(valid)
+    # 4) chat_emotion.jsonl を chat.jsonl から作り直す（欠けた行の追加・注釈の組み直しも行う）
+    if options.sync_emotion:
+        print()
+        rfc._sync_emotion_log(records, dry_run=options.dry_run)
     _summary("chatlog", grand, options.dry_run)
 
 
@@ -544,9 +545,12 @@ def main() -> int:
         help="--source history のとき、削除を chat.jsonl / chat_emotion.jsonl へも反映",
     )
     parser.add_argument(
+        "--sync-emotion",
         "--filter-emotion",
+        dest="sync_emotion",
         action="store_true",
-        help="--source chatlog のとき、chat_emotion.jsonl も整合させる",
+        help="--source chatlog のとき、chat_emotion.jsonl も chat.jsonl から作り直す"
+        "（--filter-emotion は旧名）",
     )
     parser.add_argument(
         "--map", action="append", default=[], help="speaker表示名=charId（例 ルリ=ruri）"

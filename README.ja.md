@@ -85,7 +85,7 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
   - ユーザー発話をそのまま検索せず、LLM で焦点を絞った検索クエリへ書き換え（挨拶・依頼の枕詞を除去、「〜以外」などの否定語を排除、行為の主体・客体を保持し、主語省略時のみユーザーを主体に補完）
   - 「全部挙げて」等の列挙・網羅質問では観点違いの複数クエリを生成して和集合で取得し、ユーザーが明示的に求めたときだけ記憶を漏れなく列挙
   - 近重複の集約、`top_k` / `min_score` の調整、圧縮後コンテキスト基準の重複除去により、長い履歴で文脈から溢れた過去も取りこぼさない
-- 再構築・診断ツール: `tools/rebuild_from_chatlog.py`（`logs/chat.jsonl` を正本に履歴と記憶DBを元の時刻付きで再生成）、`tools/diagnose_recall.py`（想起スコアを一覧して当たり外れを診断）
+- 再構築・診断ツール: `tools/rebuild_from_chatlog.py`（`logs/chat.jsonl` を正本に履歴と記憶DBを元の時刻付きで再生成。感情キャプションも各ターンの `segments` から組み直す）、`tools/diagnose_recall.py`（想起スコアを一覧して当たり外れを診断）
 
 ### 9. 3チャネル想起（時系列・網羅・主客）
 意味検索（cosine top-k）だけでは構造的に答えられない質問があります。「一番最初に買ってあげた本は？」は時間を見ないので最古の1件を保証できず、「作った料理を全部」は該当が上位k件を超えた時点で必ず溢れます。そこで用途の違う3つのチャネルを併用します。
@@ -115,6 +115,7 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
 **ツール**
 - `tools/build_fact_ledger.py`: 既存ログから台帳を一括構築（`--rule-only` でLLM不使用、`--dry-run` で確認、中断しても未抽出分から再開）
 - `tools/sync_memory.py`: 履歴を編集したあとに記憶系ファイルを**差分同期**（下記）
+- `tools/repair_chatlog_segments.py`: `chat.jsonl` の `segments` に欠けた分割本文を `chunks`/`audios` から復元（感情セグメント導入当日のごく一部のターンが対象。裏付けが取れたターンだけ書き込む）
 - `tools/diagnose_temporal.py`: 時系列・列挙の想起を LLM 抜きで検証し、意図検出／ベクトル／語彙／台帳のどこで落ちているかを切り分け
 - `tools/audit_memory.py`: `chat.jsonl`・`history.json`・`memories` の件数を突き合わせ、**保存漏れ**（何をしても答えられない漏れ）と ts の健全性、孤児事実、台帳の抽出率を監査
 
@@ -133,20 +134,22 @@ logs/chat.jsonl                                ← 一番大本の正本（全�
 | 編集した場所 | コマンド | 揃える対象 |
 |---|---|---|
 | **UIから会話を削除** | **不要（削除時に自動で全系統へ反映）** | 4系統すべて |
-| `chat.jsonl` を手修正 | `sync_memory.py --filter-emotion --extract` | history.json / memory.sqlite3 / chat_emotion.jsonl / 台帳 |
+| `chat.jsonl` を手修正 | `sync_memory.py --sync-emotion --extract` | history.json / memory.sqlite3 / chat_emotion.jsonl / 台帳 |
 | `history.json` を手修正 | `sync_memory.py --source history --propagate --extract` | memory.sqlite3 / 台帳 ＋ **大本の chat.jsonl と chat_emotion.jsonl へ削除を逆伝播** |
-| 全部作り直す（chat.jsonl が正本） | `rebuild_from_chatlog.py --reset` → `build_fact_ledger.py` | 全部 |
+| 全部作り直す（chat.jsonl が正本） | `rebuild_from_chatlog.py --reset --sync-emotion` → `build_fact_ledger.py` | 全部 |
 | 全部作り直す（履歴が正本） | `rebuild_rag_from_history.py --reset --extract` | memory.sqlite3 / 台帳 |
 
 ```bash
 python tools/sync_memory.py --dry-run                                   # まず差分の確認
-python tools/sync_memory.py --filter-emotion --extract --rule-only      # chat.jsonl を正本に同期
+python tools/sync_memory.py --sync-emotion --extract --rule-only        # chat.jsonl を正本に同期
 
 python tools/sync_memory.py --source history --propagate --dry-run      # UI削除後の確認
 python tools/sync_memory.py --source history --propagate --extract --rule-only
 ```
 
 差分同期がすること: 正本に無い往復をDBから削除（**その往復から抽出した事実も一緒に削除**）／DBに無い往復を追加（埋め込み計算は差分だけ）／時刻の変更を反映（台帳の日付も揃える）／出典を失った事実（孤児）を掃除。照合は「ユーザー発言＋返答＋会話モード」の一致で行います（`ts` は手修正されうるので照合キーに含めません）。
+
+> **感情キャプションも `chat.jsonl` だけから復元されます**: `chat.jsonl` の各ターンは `segments`（`{style, emoji, text}` の並び）を持つため、表示用の注釈文「（😊嬉しそうに…）本文」は `emotion_caption.build_annotated_reply` で組み直せます。`chat_emotion.jsonl` の `annotatedReply` はこの関数の出力そのもので、キャプションの独立した情報源ではありません（実測で全件一致）。そのため `--sync-emotion` は「残る返答だけへ絞る」のではなく **`chat.jsonl` から作り直します**（消えた行を落とすだけでなく、欠けている行を足し、注釈文を組み直す）。例外は感情セグメント導入当日のごく一部のターンで `segments` に `text` が無く、これは `tools/repair_chatlog_segments.py` で補修できます。
 
 > **UIの削除について**: 削除は往復単位（あなたの発言＋返答）で行われ、その場で **4系統すべて**（`history.json` / `chat.jsonl` / `chat_emotion.jsonl` / `memory.sqlite3` と事実台帳）から取り除かれます。同期スクリプトを流す必要はありません。生ログの書き換え前には `.bak` へ退避します。2人だけモードで同じお題に他の返答が残る場合は、お題を残して返答だけを消します。生成済みの音声ファイル（`static/generated`）は他から参照される可能性があるため消しません。
 >

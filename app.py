@@ -24,6 +24,10 @@ from html import unescape as html_unescape
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
+# 感情キャプション付き返答の整形は tools/ の再生成とも共有する（食い違うと再生成で
+# 注釈文が変わってしまうため、実装は emotion_caption.py の一箇所に置く）。
+from emotion_caption import build_annotated_reply
+
 
 APP_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = APP_ROOT / "static"
@@ -1337,27 +1341,6 @@ def delete_turn_records(payload: dict) -> dict:
         f"user={compact_text(user_text, 24)!r}"
     )
     return result
-
-
-def build_annotated_reply(reply: str, segments: list[dict]) -> str:
-    """返答テキストの各セグメント先頭へ「（絵文字＋感情キャプション全文）」を挿入する。
-
-    フロント表示 (buildAnnotatedReply) と同じ整形をサーバ側でも行い、感情キャプション付き
-    履歴に記録するために使う。感情情報が無ければ元の ``reply`` をそのまま返す。
-    """
-    have_texts = bool(segments) and all(isinstance(seg.get("text"), str) for seg in segments)
-    has_marker = any(
-        (str(seg.get("style") or "").strip() or str(seg.get("emoji") or "").strip())
-        for seg in segments
-    )
-    if not have_texts or not has_marker:
-        return reply
-    parts: list[str] = []
-    for seg in segments:
-        marker = f"{str(seg.get('emoji') or '').strip()}{str(seg.get('style') or '').strip()}"
-        text = str(seg.get("text") or "")
-        parts.append(f"（{marker}）{text}" if marker else text)
-    return "".join(parts)
 
 
 def append_emotion_log(record: dict) -> None:

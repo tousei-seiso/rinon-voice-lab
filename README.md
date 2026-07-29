@@ -98,7 +98,13 @@ focused on higher-quality Japanese character speech and day-to-day usability.
   pruned. Matching is by user text + reply + conversation mode (`ts` is excluded since it
   may be hand-edited).
   `--source chatlog` (default) treats `chat.jsonl` as the source and regenerates
-  `history.json`, syncs the database, and reconciles `chat_emotion.jsonl`.
+  `history.json`, syncs the database, and rebuilds `chat_emotion.jsonl` (`--sync-emotion`).
+  Emotion captions come from `chat.jsonl` alone: every turn carries `segments`
+  (`{style, emoji, text}`), so the annotated display text is reassembled with
+  `emotion_caption.build_annotated_reply` — `chat_emotion.jsonl`'s `annotatedReply` is that
+  function's output, not an independent source. The handful of turns from the day segment
+  captions shipped lack `segments[].text`; `tools/repair_chatlog_segments.py` restores those
+  from the recorded `chunks`/`audios`.
   `--source history --propagate` covers the reverse direction, pushing deletions back into
   `chat.jsonl` and `chat_emotion.jsonl` — without that, a conversation removed only
   downstream reappears the next time a full rebuild runs. A full `--reset` rebuild deletes

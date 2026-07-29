@@ -4,16 +4,25 @@
   tools/rebuild_from_chatlog.py で history.json を chat.jsonl から再生成した際、
   display.text に「素の返答（reply）」をそのまま入れてしまい、各セグメント先頭に
   付いていた感情キャプション「（😊嬉しそうに…）」が丸ごと失われた。
-  chat.jsonl の segments には style/emoji しか無く分割本文(text)が無いため、
-  そこからは注釈文を再構成できない（これが取りこぼしの根本原因）。
 
-  一方、注釈済みの完全な返答文は次のファイルに残っている:
+  当時これを「chat.jsonl からは復元できない」と判断したが、それは誤りだった。
+  chat.jsonl の segments は ``{style, emoji, text}`` を持つので、注釈文は
+  ``emotion_caption.build_annotated_reply`` で組み直せる（例外は感情セグメント
+  導入当日のごく一部で、そこだけ text が欠けている）。**現在の
+  rebuild_from_chatlog.py / sync_memory.py はこの経路で復元するため、
+  同じ取りこぼしは起きない。**
+
+  そのため本ツールは、その事故で注釈を失った history.json を後から救済するための
+  使い切りツールとして残している。注釈済みの完全な返答文は次のファイルにある:
     - logs/chat_emotion.jsonl        … reply(素) と annotatedReply(注釈付き) の対応
     - profiles/sessions/<char>/history.json.regen.bak … 再生成直前（注釈あり）
     - profiles/sessions/<char>/history.json.bak       … mode 付与直前（注釈あり）
 
   本ツールはこれらを「素の返答テキスト → 注釈付きテキスト」の対応表として使い、
   現行 history.json の各アシスタント返答の display.text に注釈を復元する。
+  なお、いま history.json をまるごと作り直すなら chat.jsonl を正本にした
+  ``tools/sync_memory.py`` / ``tools/rebuild_from_chatlog.py`` の方が確実
+  （ターン単位で対応するため、返答本文が重複していても取り違えない）。
 
 やること:
   - 各アシスタント entry の content から話者接頭辞（例「ユリカ: 」）を外して素の
