@@ -1989,6 +1989,29 @@ def build_ledger_block(facts: list[dict], *, now: float | None = None) -> str:
         entry["confirmed"] = entry["confirmed"] or modality == "done"
         if fact_time(fact) < fact_time(entry["fact"]):
             entry["fact"] = fact  # 代表は初回（最古）にする
+    # 同じ行為に「向き不明」と「向きの分かっている行」が並んだら、不明な方は畳む。
+    # 抽出経路が違うだけで同じ出来事なので（実測: ルール由来の `行く: マリンタワー`＝主客不明
+    # と、LLM 由来の `オサム 行く: マリンタワー` が 2 行並んだ）、両方見せると
+    # 「同じ場所に 2 回行った」とも読めてしまう。件数は残す方へ寄せる。
+    for key in [key for key in grouped if key[2] == "unknown"]:
+        known = [
+            other
+            for other in grouped
+            if other[2] != "unknown" and other[0] == key[0] and other[1] == key[1]
+            and other[3] == key[3]
+        ]
+        if not known:
+            continue
+        entry = grouped.pop(key)
+        target = grouped[known[0]]
+        target["count"] += entry["count"]
+        target["confirmed"] = target["confirmed"] or entry["confirmed"]
+        if fact_time(entry["fact"]) < fact_time(target["fact"]):
+            # 代表は向きの分かっている行のまま（主客を不明へ戻さない）。日付だけ古い方へ。
+            merged = dict(target["fact"])
+            for field in ("ts", "occurred", "time_hint"):
+                merged[field] = entry["fact"].get(field)
+            target["fact"] = merged
     ordered = sorted(grouped.values(), key=lambda item: fact_time(item["fact"]))
     done_lines: list[str] = []
     pending_lines: list[str] = []

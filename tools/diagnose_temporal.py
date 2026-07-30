@@ -169,8 +169,16 @@ def main() -> None:
     )
     parser.add_argument("--slot", default="main", help="話者スロット（main/second）")
     parser.add_argument("--mode", default="normal", help="会話モード（normal/two_only）")
-    parser.add_argument("--user-name", default="", help="ユーザーの呼び名（主客判定に使う）")
-    parser.add_argument("--char-name", default="", help="キャラクター名（主客判定に使う）")
+    parser.add_argument(
+        "--user-name",
+        default="",
+        help="ユーザーの呼び名（省略時は profiles/latest_session.json から）",
+    )
+    parser.add_argument(
+        "--char-name",
+        default="",
+        help="キャラクター名（省略時は profiles/characters.json から）",
+    )
     parser.add_argument("--show-block", action="store_true", help="LLM へ渡るブロックを表示")
     args = parser.parse_args()
 
@@ -186,6 +194,13 @@ def main() -> None:
         print("対象キャラが見つかりません（profiles/sessions/<charId>/memory.sqlite3 が必要）。")
         return
     queries = [str(q).strip() for q in args.query if str(q).strip()] or [args.question]
+    # 名前はアプリ本体と同じ既定（セッション/キャラのプロファイル）で補う。ここが空だと
+    # 「俺がした事」の絞り込みで自分の行為（direction='self'）を拾えず、本番と違う結果に
+    # なって診断が誤誘導する（実測: self_subject='' で self の 165 件が全部落ちた）。
+    import build_fact_ledger as bfl  # 同じ tools/ 配下。プロファイル読み取りを再利用する
+
+    default_user = args.user_name or bfl._default_user_name()
+    char_names = bfl._char_name_map()
     for char_id in char_ids:
         diagnose(
             char_id,
@@ -193,8 +208,8 @@ def main() -> None:
             queries,
             slot=args.slot,
             mode=args.mode,
-            user_name=args.user_name,
-            char_name=args.char_name,
+            user_name=default_user,
+            char_name=args.char_name or char_names.get(char_id) or char_id,
             show_block=args.show_block,
         )
 
