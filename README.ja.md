@@ -59,6 +59,31 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
 - structured output（json_schema）に対応し、失敗時は安全にフォールバック
 - assistant プレフィルで reasoning を抑制し、空応答を回避
 - 生成モード設定を追加（prefill / original / quality_guard / unlimited）
+- 推論サーバの KV キャッシュを毎ターン解放し、VRAM を会話前の水準へ巻き戻す（下記）
+
+#### 推論サーバの VRAM を毎ターン巻き戻す
+
+LM Studio / llama-server はリクエストごとに「スロット」（＝1 本のコンテキスト）を使い、
+応答後もプロンプトの KV キャッシュを VRAM に載せたまま抱えます。さらに**同時リクエストが
+来ると並列用のスロットを追加確保し、空いても手放しません**。返答を返したあとに走る RAG 処理
+（検索クエリの書き換え・事実台帳の抽出）はバックグラウンドスレッドから飛ぶため、次の発言の
+本文生成と重なりやすく、実測で 10.8GB → 12.4GB へ増えたまま戻らない状態になりました。
+
+対策は 3 段構えで、いずれも「サーバが非対応なら黙って諦める」層に留めています。
+
+1. **直列化**（`LM_SERIALIZE_REQUESTS=1`）… 補助生成が本文生成へ割り込まないようにし、
+   そもそも 2 本目のスロットを確保させない。居残り VRAM の主因はここ。
+2. **キャッシュ無効化**（`LM_CACHE_PROMPT=aux`）… 補助生成のリクエストへ
+   `cache_prompt=false` を付け、プロンプト KV を残させない。補助生成のプロンプトは毎回
+   中身が違って再利用が効かないうえ、載ると返答本文が使いたい履歴の接頭辞を追い出します。
+   サーバが未知フィールドを 400 で弾いたら自動で外して再送し、以後は付けません。
+3. **明示解放**（`LM_KV_CACHE_RELEASE=idle`）… リクエストが途切れて
+   `LM_KV_CACHE_RELEASE_DELAY` 秒静まったら、`POST /slots/{id}?action=erase` で全スロットの
+   KV キャッシュを捨てさせる。llama-server は `/slots` を有効にしておく必要があります
+   （この API を持たないサーバでは 1 度試して以後黙り、1 と 2 だけが効きます）。
+
+解放したターンの次の返答はプロンプトを再評価するぶんだけ待ちが増えます。速度優先なら
+`LM_KV_CACHE_RELEASE_DELAY` を伸ばす（連投中はキャッシュを温存）か `off` にしてください。
 
 ### 5. 分割音声の1本化
 - Irodori-TTS が分割生成した音声を1つの WAV に結合
@@ -336,6 +361,11 @@ Irodori-TTS の依存関係は次のどちらかで入れてください。
 | `LM_MEMORY_DIGEST` | `1` | 記憶ブロックが枠を超えたとき、別呼び出しで要点メモへ圧縮する（`0` なら行単位の間引きだけ） | — | ✅ |
 | `LM_MEMORY_DIGEST_MAXTOK` | `700` | 要点メモ 1 回ぶんの生成上限 | — | ✅ |
 | `LM_MEMORY_DIGEST_CHUNKS` | `4` | 記憶が文脈に収まらないときの分割要約の最大チャンク数 | — | ✅ |
+| `LM_SERIALIZE_REQUESTS` | `1` | 推論サーバへのリクエストを 1 本ずつに直列化（`0` で従来どおり並行）。VRAM 対策 | — | ✅ |
+| `LM_CACHE_PROMPT` | `aux` | `cache_prompt=false` を付ける範囲。`aux`＝補助生成だけ / `all`＝返答本文も / `off`＝付けない | — | ✅ |
+| `LM_KV_CACHE_RELEASE` | `idle` | KV キャッシュの明示解放。`idle`＝リクエストが途切れたら / `each`＝毎回 / `off`＝しない | — | ✅ |
+| `LM_KV_CACHE_RELEASE_DELAY` | `2` | `idle` で解放するまでの待ち秒数。伸ばすと連投中はキャッシュを温存する | — | ✅ |
+| `LM_KV_CACHE_RELEASE_TIMEOUT` | `5` | 解放 API の待ち時間（秒） | — | ✅ |
 | `IRODORI_TORCH_EXTRA` | `cu128` | Irodori-TTS インストール時の torch extra | ✅ | ✅ |
 | `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS のモデル実行デバイス。`auto`, `cuda`, `mps`, `cpu`, `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_PRECISION` | `auto` | モデル精度。`auto`, `fp32`, `bf16` | ✅ | ✅ |

@@ -70,6 +70,60 @@ LM_STUDIO_TIMEOUT = int(os.environ.get("LM_STUDIO_TIMEOUT", "300"))
 LM_STRUCTURED_OUTPUT = os.environ.get("LM_STRUCTURED_OUTPUT", "auto").strip().lower()
 # 実行中にサーバが response_format を拒否したら True にし、auto では以後付けない（プロセス内メモ）。
 _lm_structured_output_unsupported = False
+
+# --- 推論サーバの KV キャッシュ解放（毎ターン VRAM を巻き戻す） -----------------
+# LM Studio / llama-server はリクエストごとに「スロット」（＝1 本のコンテキスト）を
+# 使い、応答を返した後もプロンプトの KV キャッシュを VRAM に載せたまま保持する。
+# さらに同時リクエストが来ると並列用のスロットを追加確保し、空いても解放しない。
+# 実測: 1 往復の会話は 10.8GB だが、返答後に走る RAG 処理（クエリ書き換え・事実抽出）
+# が本文生成と重なった直後から 12.4GB に増え、そのまま戻らなかった。
+# 対策は 3 段。いずれも「無くても動く」層に留め、サーバが非対応なら黙って諦める。
+#   1) 直列化   : 補助生成が本文生成へ割り込まないようにし、スロットを増やさせない。
+#   2) リクエスト: cache_prompt=false を付け、プロンプト KV を残させない。
+#   3) 明示解放 : 全リクエストが捌けた時点で /slots?action=erase を叩いて捨てさせる。
+# LM Studio へ送るリクエストを 1 本ずつに直列化する（VRAM 目的。速度目的ではない）。
+# 事実抽出はバックグラウンドスレッドから飛ぶため、切ると本文生成と重なり得る。
+LM_SERIALIZE_REQUESTS = os.environ.get("LM_SERIALIZE_REQUESTS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+# cache_prompt=false（llama.cpp のプロンプトキャッシュ無効化）を付ける範囲。
+#   aux(既定): 補助生成（クエリ書き換え・事実抽出・要点メモ）だけに付ける。返答本文は
+#             履歴の共通接頭辞を再利用できた方が速いので、そちらのキャッシュは残す。
+#   all      : 返答本文にも付ける（毎回プロンプトを再評価するので遅くなる）。
+#   off      : 一切付けない（従来動作）。
+LM_CACHE_PROMPT = os.environ.get("LM_CACHE_PROMPT", "aux").strip().lower()
+if LM_CACHE_PROMPT not in {"aux", "all", "off"}:
+    LM_CACHE_PROMPT = "aux"
+# サーバが cache_prompt を 400 で拒否したら True にし、以後付けない（プロセス内メモ）。
+_lm_cache_prompt_unsupported = False
+# KV キャッシュの明示解放をいつ行うか。
+#   idle(既定): 進行中の LM リクエストが 0 になった瞬間（＝ターンの後処理まで終わった時点）。
+#   each      : 1 リクエストごと（補助生成の合間も毎回解放する。最も強いが最も遅い）。
+#   off       : 解放しない（従来動作）。
+LM_KV_CACHE_RELEASE = os.environ.get("LM_KV_CACHE_RELEASE", "idle").strip().lower()
+if LM_KV_CACHE_RELEASE not in {"idle", "each", "off"}:
+    LM_KV_CACHE_RELEASE = "idle"
+# 解放 API の待ち時間（秒）。会話のあとの掃除なので短く切り上げる。
+LM_KV_CACHE_RELEASE_TIMEOUT = float(os.environ.get("LM_KV_CACHE_RELEASE_TIMEOUT", "5"))
+# idle 判定から実際に解放するまでの待ち（秒）。返答本文と補助生成の間には TTS 合成ぶんの
+# 空白が空くため、0 にすると 1 ターンで何度も解放してしまう。ここで一拍待ち、その間に
+# 次のリクエストが来たら予約を取り消して数え直す（＝ターンの後処理まで終わってから 1 回）。
+# 長くすると「短い間隔で連投するあいだはプロンプトキャッシュを温存する」挙動になる。
+LM_KV_CACHE_RELEASE_DELAY = float(os.environ.get("LM_KV_CACHE_RELEASE_DELAY", "2"))
+# /slots を持たないサーバでは 1 度試して以後黙る（毎ターン失敗ログを出さないため）。
+_lm_kv_release_unsupported = False
+# リクエストの直列化と「いま何本走っているか」の計数。RLock は同一スレッドからの
+# 入れ子（空返答のリトライ等）で自分を待たないようにするため。
+_lm_request_lock = threading.RLock()
+_lm_inflight_lock = threading.Lock()
+_lm_inflight = 0
+# 遅延解放の予約（1 本だけ持ち、新しいリクエストが来たら取り消して張り直す）。
+_lm_release_lock = threading.Lock()
+_lm_release_timer: threading.Timer | None = None
 # LLM 生成モード（思考モデルでの空返答対策と品質/速度のトレードオフを切り替える）。
 #   prefill       : アシスタント・プリフィルで思考を抑止（高速・低品質）。
 #   original      : 従来仕様。reply_length 由来の max_tokens をそのまま使う（思考モデルでは空になり得る）。
@@ -2685,6 +2739,17 @@ def _model_id_matches(requested: str, listed: str) -> bool:
     return left == right or left.startswith(right) or right.startswith(left)
 
 
+def _lm_server_root() -> str:
+    """OpenAI 互換の ``/v1`` を除いた推論サーバのルート URL を返す。
+
+    ``/api/v0/models``（LM Studio）や ``/slots``（llama-server）はルート直下にあり、
+    ``/v1`` 配下には無い。両方を叩くのでここで 1 箇所にまとめる。
+    """
+    if LM_STUDIO_URL.endswith("/v1"):
+        return LM_STUDIO_URL[: -len("/v1")]
+    return LM_STUDIO_URL
+
+
 def lm_loaded_context_length(model: str | None = None) -> int:
     """いまロードされているモデルの文脈長（トークン）を返す。分からなければ 0。
 
@@ -2702,9 +2767,7 @@ def lm_loaded_context_length(model: str | None = None) -> int:
         return cached[1]
     value = 0
     try:
-        base = (
-            LM_STUDIO_URL[: -len("/v1")] if LM_STUDIO_URL.endswith("/v1") else LM_STUDIO_URL
-        )
+        base = _lm_server_root()
         with urllib.request.urlopen(f"{base}/api/v0/models", timeout=5) as res:
             entries = json.loads(res.read().decode("utf-8")).get("data") or []
         loaded = [
@@ -2759,6 +2822,180 @@ def _choice_content(data: dict) -> str:
         return ""
 
 
+def _lm_slot_ids() -> list[int] | None:
+    """``GET /slots`` でスロット番号の一覧を取る。取れなければ None。
+
+    llama-server は ``[{"id":0,...},...]`` を返す（ビルドによっては
+    ``{"slots":[...]}``）。LM Studio の内蔵エンジンはこの API を持たないので
+    None になり、呼び出し側は id=0 だけを当てに行く。
+    """
+    try:
+        url = f"{_lm_server_root()}/slots"
+        with urllib.request.urlopen(url, timeout=LM_KV_CACHE_RELEASE_TIMEOUT) as res:
+            payload = json.loads(res.read().decode("utf-8"))
+    except Exception:
+        return None
+    entries = payload if isinstance(payload, list) else None
+    if entries is None and isinstance(payload, dict):
+        entries = payload.get("slots")
+    if not isinstance(entries, list):
+        return None
+    ids: list[int] = []
+    for item in entries:
+        if isinstance(item, dict) and item.get("id") is not None:
+            with contextlib.suppress(Exception):
+                ids.append(int(item["id"]))
+    return ids or None
+
+
+def _lm_erase_slot(slot_id: int) -> bool:
+    """``POST /slots/{id}?action=erase`` でスロットの KV キャッシュを捨てさせる。
+
+    llama.cpp の save/restore は ``--slot-save-path`` が要るが、erase は不要。
+    使用中のスロットは 4xx で断られる（直列化していれば通常起きない）。
+    """
+    req = urllib.request.Request(
+        f"{_lm_server_root()}/slots/{slot_id}?action=erase",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=LM_KV_CACHE_RELEASE_TIMEOUT) as res:
+            res.read()
+        return True
+    except urllib.error.HTTPError as err:
+        print(
+            f"[lm] slot {slot_id} erase failed: http {err.code} "
+            f"{compact_text(_read_http_error(err), 160)}"
+        )
+        return False
+    except Exception as exc:
+        print(f"[lm] slot {slot_id} erase failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def release_lm_kv_cache(reason: str = "") -> bool:
+    """推論サーバが抱えたプロンプト KV キャッシュを明示的に解放させる。
+
+    ここまで来る時点で進行中のリクエストは無い（直列化＋在庫数 0 で呼ばれる）ので、
+    全スロットを erase して VRAM を会話前の水準へ巻き戻す。1 つも解放できなければ
+    「このサーバは非対応」と記録し、以後は毎ターン試さない（ログを汚さないため）。
+    例外は投げない。戻り値は 1 つ以上解放できたか。
+    """
+    global _lm_kv_release_unsupported
+    if LM_KV_CACHE_RELEASE == "off" or _lm_kv_release_unsupported:
+        return False
+    # 一覧が取れないビルド（`--slots` 無効など）でも erase だけは通ることがあるので、
+    # 既定スロット 0 を当てに行ってから諦める。
+    slot_ids = _lm_slot_ids() or [0]
+    erased = sum(1 for slot_id in slot_ids if _lm_erase_slot(slot_id))
+    if not erased:
+        _lm_kv_release_unsupported = True
+        print(
+            "[lm] KV cache release unavailable on this server -> give up "
+            "(enable the /slots endpoint on llama-server, or set LM_KV_CACHE_RELEASE=off)"
+        )
+        return False
+    print(f"[lm] KV cache released: {erased} slot(s)" + (f" ({reason})" if reason else ""))
+    return True
+
+
+def _cancel_lm_kv_release() -> None:
+    """予約済みの遅延解放を取り消す（新しいリクエストが始まったとき）。"""
+    global _lm_release_timer
+    with _lm_release_lock:
+        if _lm_release_timer is not None:
+            _lm_release_timer.cancel()
+            _lm_release_timer = None
+
+
+def _schedule_lm_kv_release() -> None:
+    """LM_KV_CACHE_RELEASE_DELAY 秒後に 1 回だけ解放するよう予約し直す。"""
+    global _lm_release_timer
+    with _lm_release_lock:
+        if _lm_release_timer is not None:
+            _lm_release_timer.cancel()
+        timer = threading.Timer(max(0.0, LM_KV_CACHE_RELEASE_DELAY), _deferred_lm_kv_release)
+        timer.daemon = True
+        _lm_release_timer = timer
+        timer.start()
+
+
+def _deferred_lm_kv_release() -> None:
+    """静まったあとに 1 度だけ KV キャッシュを解放する（タイマースレッドから呼ばれる）。
+
+    掃除中に次のリクエストが割り込むと「使用中スロット」を erase しようとして断られる
+    ので、直列化ロックを取ってから叩く。取れなければ既に次が走っているということなので
+    何もしない（そのリクエストの終了時に改めて予約される）。
+    """
+    global _lm_release_timer
+    with _lm_release_lock:
+        _lm_release_timer = None
+    if not LM_SERIALIZE_REQUESTS:
+        with _lm_inflight_lock:
+            if _lm_inflight > 0:
+                return
+        release_lm_kv_cache("idle")
+        return
+    if not _lm_request_lock.acquire(timeout=0.2):
+        return
+    try:
+        with _lm_inflight_lock:
+            if _lm_inflight > 0:
+                return
+        release_lm_kv_cache("idle")
+    finally:
+        _lm_request_lock.release()
+
+
+@contextlib.contextmanager
+def _lm_request_slot():
+    """LM Studio への 1 リクエストを囲み、直列化と終了後の KV 解放を担う。
+
+    直列化の狙いは速度ではなく VRAM。サーバは同時リクエストのぶんだけスロット
+    （＝別の KV キャッシュ）を確保し、空いても手放さない。返答本文の生成中に
+    バックグラウンドの事実抽出が飛び込むと 2 本目が居残る（実測 +1.6GB）。
+    each は即時解放、idle はタイマーで一拍置いてから解放する（返答本文と補助生成の
+    間には TTS 合成ぶんの空白があり、即時だと 1 ターンで何度も掃除してしまう）。
+    """
+    global _lm_inflight
+    _cancel_lm_kv_release()
+    if LM_SERIALIZE_REQUESTS:
+        _lm_request_lock.acquire()
+    with _lm_inflight_lock:
+        _lm_inflight += 1
+    try:
+        yield
+    finally:
+        with _lm_inflight_lock:
+            _lm_inflight -= 1
+            idle = _lm_inflight <= 0
+        try:
+            if LM_KV_CACHE_RELEASE == "each":
+                release_lm_kv_cache("each")
+        finally:
+            if LM_SERIALIZE_REQUESTS:
+                _lm_request_lock.release()
+        if LM_KV_CACHE_RELEASE == "idle" and idle:
+            _schedule_lm_kv_release()
+
+
+def _disable_prompt_cache(aux: bool) -> bool:
+    """このリクエストに cache_prompt=false を付けるか判定する。
+
+    ``aux`` は返答本文ではない補助生成（クエリ書き換え・事実抽出・要点メモ）。
+    既定 ``aux`` では補助生成だけキャッシュを無効化する。補助生成のプロンプトは
+    毎回中身が違って再利用が効かないうえ、スロットに載ると返答本文が再利用したい
+    履歴の接頭辞を追い出してしまうため、残す価値がそもそも無い。
+    """
+    if LM_CACHE_PROMPT == "off" or _lm_cache_prompt_unsupported:
+        return False
+    if LM_CACHE_PROMPT == "all":
+        return True
+    return aux
+
+
 def _use_structured_output(segmented_mode: bool) -> bool:
     """このリクエストで response_format(json_schema) を付けるか判定する。
 
@@ -2772,47 +3009,72 @@ def _use_structured_output(segmented_mode: bool) -> bool:
     return not _lm_structured_output_unsupported  # auto
 
 
-def _post_lmstudio_chat(payload: dict, use_structured: bool) -> dict:
+def _post_lmstudio_chat(payload: dict, use_structured: bool, aux: bool = False) -> dict:
     """chat/completions に POST し、レスポンス JSON を返す。
 
     ``use_structured`` が True のときだけ response_format(json_schema) を付ける。
-    サーバ/モデルが response_format を受け付けず HTTP 4xx を返したら、response_format を
-    外して 1 度だけ再送し、以後 auto では付けないようプロセス内に記録する（3層フォールバックの2層目）。
-    プロンプトが文脈長を超えた 400 は response_format とは無関係なので
-    LMContextOverflowError として区別する（混ぜると構造化出力が以後ずっと外れてしまう）。
+    ``aux`` が True（返答本文ではない補助生成）なら cache_prompt=false を付け、
+    プロンプトの KV キャッシュをサーバに残させない（LM_CACHE_PROMPT で範囲を変更可）。
+    どちらも非対応サーバがあり得るため、HTTP 4xx なら該当フィールドを外して 1 度だけ
+    再送し、以後は付けないようプロセス内に記録する。どちらが原因かはエラー本文に出た
+    フィールド名で切り分け、分からなければ拒否例の多い response_format から疑う。
+    プロンプトが文脈長を超えた 400 はどちらとも無関係なので LMContextOverflowError と
+    して区別する（混ぜると構造化出力やキャッシュ制御が以後ずっと外れてしまう）。
+    リクエストは _lm_request_slot() で囲む（直列化＋捌け際の KV 解放）。
     """
-    global _lm_structured_output_unsupported
+    global _lm_structured_output_unsupported, _lm_cache_prompt_unsupported
+
+    last_detail = ""
 
     def _send(body: dict) -> dict:
+        nonlocal last_detail
         req = urllib.request.Request(
             f"{LM_STUDIO_URL}/chat/completions",
             data=json_bytes(body),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=LM_STUDIO_TIMEOUT) as res:
-                return json.loads(res.read().decode("utf-8"))
-        except urllib.error.HTTPError as err:
-            detail = _read_http_error(err)
-            print(f"[lm] http {err.code}: {compact_text(detail, 300)}")
-            if err.code == 400 and _looks_like_context_overflow(detail):
-                raise LMContextOverflowError(compact_text(detail, 300)) from err
-            raise
+        last_detail = ""
+        with _lm_request_slot():
+            try:
+                with urllib.request.urlopen(req, timeout=LM_STUDIO_TIMEOUT) as res:
+                    return json.loads(res.read().decode("utf-8"))
+            except urllib.error.HTTPError as err:
+                last_detail = _read_http_error(err)
+                print(f"[lm] http {err.code}: {compact_text(last_detail, 300)}")
+                if err.code == 400 and _looks_like_context_overflow(last_detail):
+                    raise LMContextOverflowError(compact_text(last_detail, 300)) from err
+                raise
 
-    if not use_structured:
-        return _send(payload)
-
-    structured_body = dict(payload)
-    structured_body["response_format"] = LM_SEGMENT_RESPONSE_FORMAT
+    no_cache = _disable_prompt_cache(aux)
+    body = dict(payload)
+    if use_structured:
+        body["response_format"] = LM_SEGMENT_RESPONSE_FORMAT
+    if no_cache:
+        # llama.cpp 系の拡張フィールド。OpenAI 互換の /v1 でもそのまま受け取る。
+        body["cache_prompt"] = False
+    if not use_structured and not no_cache:
+        return _send(body)
     try:
-        return _send(structured_body)
+        return _send(body)
     except urllib.error.HTTPError as err:
-        # 非対応サーバ/モデルは 4xx で弾く。response_format 無しで再送し、以後は付けない。
-        if 400 <= err.code < 500:
+        if not (400 <= err.code < 500):
+            raise
+        detail = str(last_detail).lower()
+        retry = dict(body)
+        if no_cache and "cache_prompt" in detail:
+            _lm_cache_prompt_unsupported = True
+            print("[lm] server rejected cache_prompt -> stop sending it")
+            retry.pop("cache_prompt", None)
+            return _send(retry)
+        if use_structured:
             _lm_structured_output_unsupported = True
-            return _send(payload)
-        raise
+            retry.pop("response_format", None)
+            return _send(retry)
+        _lm_cache_prompt_unsupported = True
+        print("[lm] server rejected the request body -> stop sending cache_prompt")
+        retry.pop("cache_prompt", None)
+        return _send(retry)
 
 
 # RAG 想起クエリの LLM 書き換え設定（環境変数で調整可）。
@@ -3587,6 +3849,7 @@ def _request_lmstudio_content(
     base_max_tokens: int,
     mode: str,
     cap_to_base_max_tokens: bool = False,
+    aux: bool | None = None,
 ) -> dict:
     """生成モードに応じて LM Studio へチャットし、本文入りの data を返す。
 
@@ -3605,7 +3868,12 @@ def _request_lmstudio_content(
       上書きされ、2300 トークン超を生成して後処理だけで数分 GPU を占有していた。True の
       間は呼び出し側が申告した base_max_tokens を上限として守る（枠不足で本文が空に
       なった場合は、下の救済がプリフィルで撮り直すので黙って失敗はしない）。
+
+    aux: この呼び出しを補助生成として扱うか（プロンプト KV キャッシュを残させない）。
+      None なら cap_to_base_max_tokens に追従する。プリフィル固定の要点メモのように
+      枠の頭打ちが要らない補助生成では True を明示する。
     """
+    is_aux = cap_to_base_max_tokens if aux is None else bool(aux)
     if mode == "prefill":
         prefill_content, reattach = _thinking_prefill(segmented_mode, auto_emoji)
         # プリフィル（構造化出力は役割が重複し競合しうるので付けない）。
@@ -3614,7 +3882,7 @@ def _request_lmstudio_content(
             prefilled["messages"] = list(payload["messages"]) + [
                 {"role": "assistant", "content": prefill_content}
             ]
-            data = _post_lmstudio_chat(prefilled, use_structured=False)
+            data = _post_lmstudio_chat(prefilled, use_structured=False, aux=is_aux)
             msg = data["choices"][0]["message"]
             content = str(msg.get("content") or "")
             if content.strip():
@@ -3631,7 +3899,7 @@ def _request_lmstudio_content(
             pass
         body = dict(payload)
         body["max_tokens"] = base_max_tokens
-        return _post_lmstudio_chat(body, _use_structured_output(segmented_mode))
+        return _post_lmstudio_chat(body, _use_structured_output(segmented_mode), aux=is_aux)
 
     body = dict(payload)
     if cap_to_base_max_tokens:
@@ -3643,7 +3911,7 @@ def _request_lmstudio_content(
         body["max_tokens"] = LM_QUALITY_GUARD_MAX_TOKENS
     else:  # "original"
         body["max_tokens"] = base_max_tokens
-    data = _post_lmstudio_chat(body, _use_structured_output(segmented_mode))
+    data = _post_lmstudio_chat(body, _use_structured_output(segmented_mode), aux=is_aux)
     if _choice_content(data).strip():
         return data
     # ここから空返答の救済。典型は「文脈の残り枠を思考が食い切った」ケースで、
@@ -3653,7 +3921,7 @@ def _request_lmstudio_content(
     #    （実測: 同じプロンプトで reasoning 209tok→0tok、本文 0字→53字）。
     with contextlib.suppress(Exception):
         retry = _request_lmstudio_content(
-            payload, segmented_mode, auto_emoji, base_max_tokens, "prefill"
+            payload, segmented_mode, auto_emoji, base_max_tokens, "prefill", aux=is_aux
         )
         if _choice_content(retry).strip():
             print("[lm] empty content -> prefill retry succeeded")
@@ -3830,7 +4098,11 @@ def digest_memory_block(
         # 要約側は思考させない（prefill）。ここで思考させると本体と同じ枠不足を招くうえ、
         # 要点メモに思考の独白が混ざる。プリフィルは HTTP 400 時の従来仕様フォールバック付き。
         try:
-            data = _request_lmstudio_content(payload, False, False, max_tokens, "prefill")
+            # 補助生成なのでプロンプト KV は残させない（記憶ブロックは毎回中身が変わり
+            # 再利用が効かないのに、載ると返答本文が使いたい履歴の接頭辞を追い出す）。
+            data = _request_lmstudio_content(
+                payload, False, False, max_tokens, "prefill", aux=True
+            )
         except LMContextOverflowError:
             # 概算より実トークンが多くて弾かれた。黙って記録を捨てないよう、半分に
             # 割って撮り直す（記憶ブロックは日付・番号の密度で実トークンが揺れる）。

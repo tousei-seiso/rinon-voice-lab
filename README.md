@@ -292,6 +292,11 @@ Useful environment variables:
 | `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | LM Studio OpenAI-compatible endpoint | ✅ | ✅ |
 | `LM_STUDIO_MODEL` | `gemma-4-12b-it` | Preferred model name | ✅ | ✅ |
 | `LM_STUDIO_CONTEXT_LIMIT` | `8200` | Visible context budget | ✅ | ✅ |
+| `LM_SERIALIZE_REQUESTS` | `1` | Send one request at a time so the server never opens a second slot (`0` allows overlap) | — | ✅ |
+| `LM_CACHE_PROMPT` | `aux` | Where to send `cache_prompt=false`: `aux` (helper generations only), `all`, or `off` | — | ✅ |
+| `LM_KV_CACHE_RELEASE` | `idle` | Explicit KV-cache release: `idle` (once traffic settles), `each` (every request), or `off` | — | ✅ |
+| `LM_KV_CACHE_RELEASE_DELAY` | `2` | Seconds to wait before an `idle` release; raise it to keep the cache warm across quick turns | — | ✅ |
+| `LM_KV_CACHE_RELEASE_TIMEOUT` | `5` | Timeout for the release API (seconds) | — | ✅ |
 | `IRODORI_TORCH_EXTRA` | `cu128` | Installer torch extra: `cu128`, `cpu`, `rocm`, or `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS model device: `auto`, `cuda`, `mps`, `cpu`, or `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_PRECISION` | `auto` | Model precision: `auto`, `fp32`, or `bf16` | ✅ | ✅ |
