@@ -70,7 +70,13 @@ _VERB_PATTERNS: tuple[tuple[str, str], ...] = (
     # 出かけた先での体験は「いつ・どこで何をしたか」の中心なので拾う。
     # ここに動詞が無いと質問側でも verb を検出できず、台帳の絞り込みが効かない
     # （実測: 「マリンタワーに登ったのはいつ？」で絞り込めず無関係な事実が並んだ）。
-    ("登る", r"登(?:っ|る|り|ろ)|上が(?:っ|る|ろ)"),
+    # 「上がる」は複合動詞の後半に化けやすい。「立ち上がって」を『登る』として拾うと、
+    # 「〜に登った」の絞り込みに無関係な事実が混ざる（実測: `登る: 翌朝`）。
+    (
+        "登る",
+        r"登(?:っ|る|り|ろ)|"
+        r"(?<!立ち)(?<!起き)(?<!盛り)(?<!出来)(?<!舞い)(?<!膨れ)(?<!せり)上が(?:っ|る|ろ)",
+    ),
     ("泊まる", r"泊(?:まっ|まる|まろ|めた)|宿泊"),
     ("撮る", r"撮(?:っ|る|り|ろ)"),
     ("会う", r"会(?:っ|う|お)|出会(?:っ|う|お)|待ち合わせ"),
@@ -131,8 +137,21 @@ _OBJECT_RE = re.compile(r"([^、。！？\n\s「」『』]{1,20}?)を(?=[^、。
 # 「の」は対象にしない: 連体修飾として名詞句の一部になることが多く、落とすと
 # 「星の王子さま」が「王子さま」に削れて書名が壊れる。
 _OBJECT_TRIM_RE = re.compile(r"^.*?(?:は|も|が|に|で|と|、)(?=[^はもがにでと]{1,20}$)")
-# 客体の頭に付いた連体修飾を落とす（「焼いたクッキー」→「クッキー」）。
-_OBJECT_MODIFIER_RE = re.compile(r"^[^、。]*?(?:った|って|いた|えた|べた|した|める|ける)(?=.{2,12}$)")
+# 客体の頭に付いた「主体＋が／は／も」を落とす（「ナデシコが肉じゃが」→「肉じゃが」）。
+# _OBJECT_TRIM_RE は助詞の後ろに「は・も・が…」が無いことを条件にするため、「肉じゃが」の
+# ように「が」を含む語では効かない（実測）。名前として通る表記（カタカナ・漢字のみ）に
+# 限って剥がす: 「肉じゃがとご飯」の「肉じゃ」を主体と誤認しないため。
+_OBJECT_SUBJECT_PREFIX_RE = re.compile(
+    r"^(?:[ァ-ヴー]{2,8}|[一-鿿々]{2,4})(?:が|は|も)(?=.{2,})"
+)
+# 客体の頭に付いた連体修飾・連用の節を落とす（「焼いたクッキー」→「クッキー」）。
+# 実測で落とせていなかった形を追加: 「薬局に行って薬を買った」→『買う: 行って薬』、
+# 「倒れて不調なままネパールの病院」、「そのまま空港」。残りは漢字・カタカナ 1 字でも
+# 意味を持つ（薬・本）ので、先読みは 1 文字から許す（ひらがな 1 字は後段で落ちる）。
+_OBJECT_MODIFIER_RE = re.compile(
+    r"^[^、。]*?(?:った|って|いた|えた|べた|した|める|ける|れて|せて|くて|なって|"
+    r"なまま|まま|ながら|ずに)(?=.{1,12}$)"
+)
 # 授受表現の直後に客体が来る形（「作ってくれたオムライス」→「オムライス」）。
 # 「を」を伴わないため _OBJECT_RE では取れない語をここで拾う。
 # 対象は漢字・カタカナ語だけに限る: ひらがなを許すと助詞との境界が判定できず
@@ -152,6 +171,10 @@ _TIME_PREFIX_RE = re.compile(
 # 助詞や語尾の切れ端にすぎないので落とす。
 _KANJI_RE = re.compile(r"[一-鿿々-〇]")
 _KATAKANA_RE = re.compile(r"[ァ-ヴー]")
+# 1 文字だけ残ったときに客体として通さない漢字（動詞の語幹）。
+# 「見に行った」の「見」のような連用形の切れ端を落とすためで、「薬」「本」「花」のように
+# 実体を指す 1 字はここに入れない（「歌」は「歌を歌った」の客体として正しいので除く）。
+_VERB_STEM_KANJI = set("見行来買作食飲話会出入帰寝起立座取持置使書読聞言思知撮登")
 # 客体として意味を持たない語。助詞・形式名詞・代名詞は、素朴な「を」の直前を取る規則の
 # 副作用で拾ってしまう（実データで「の」「より」「気」「まま」等が大量に混ざった）。
 # 台帳に入れても「何があったか」を思い出す手がかりにならず、列挙の邪魔になるだけなので捨てる。
@@ -167,6 +190,9 @@ _OBJECT_STOPWORDS = {
     "話", "言葉", "声", "挨拶", "あいさつ", "返事", "気持ち", "思い", "様子", "笑顔",
     "顔", "目", "手", "頭", "体", "心", "お礼", "感謝", "心配", "質問", "答え", "名前",
     "会話", "やり取り", "冗談", "説明", "報告", "反応", "態度", "表情",
+    # 出来事の中身を指さない抽象語（実測で `行く: 結果` `行く: 途中` が並んだ）。
+    "結果", "状況", "状態", "場合", "理由", "意味", "途中", "予定", "用事", "都合",
+    "全部", "一緒", "普通", "無理", "大丈夫",
 }
 # 抽出の切り出しに失敗して先頭に助詞の残骸が付くことがある
 # （「〜から俺の顔を見た」→「ら俺の顔」、「〜のの中止」→「の中止」）。
@@ -250,12 +276,14 @@ _HYPOTHETICAL_RE = re.compile(r"もし|仮に|もしも|だったら|なら(?:�
 _HABIT_RE = re.compile(r"いつも|毎日|毎朝|毎晩|毎回|毎週|毎月|よく|たまに|時々|ときどき|普段")
 
 # --- 出来事の時刻（occurred）--------------------------------------------------
-# 過去を指す時間表現。回想（「1年前に行った」）で、出来事の時期を ts と別に持つために使う。
-# 「今日」「さっき」「今」は ts と同じなので含めない（occurred を増やす意味がない）。
-_PAST_TIME_EXPR_RE = re.compile(
-    r"\d+\s*(?:日|週間|週|ヶ月|か月|カ月|ケ月|箇月|年)\s*(?:ほど|くらい|ぐらい)?前|"
-    r"(?:去年|昨年|今年|おととし|一昨年)(?:の)?(?:春|夏|秋|冬)?|"
-    r"先月|先々月|先週|昨日|きのう|一昨日|おととい|"
+# 出来事の時期を指す表現。回想（「1年前に行った」）と予定（「明日行く」「8月5日に」）の
+# どちらにも付くので両方拾う。「今日」「さっき」「今」は ts と同じなので含めない
+# （occurred を増やす意味がない）。
+_EVENT_TIME_EXPR_RE = re.compile(
+    r"\d+\s*(?:日|週間|週|ヶ月|か月|カ月|ケ月|箇月|年)\s*(?:ほど|くらい|ぐらい)?(?:前|後|先)|"
+    r"(?:去年|昨年|今年|来年|おととし|一昨年)(?:の)?(?:春|夏|秋|冬)?|"
+    r"先月|先々月|先週|来月|来週|再来週|再来月|昨日|きのう|一昨日|おととい|明日|あした|"
+    r"明後日|あさって|"
     r"\d{4}\s*年(?:\s*\d{1,2}\s*月)?|\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?|"
     r"(?:春|夏|秋|冬)休み|(?:小学|中学|高校|大学)(?:生|校)?の(?:とき|時|頃|ころ)|"
     r"子供の(?:とき|時|頃|ころ)|出会った(?:とき|時|頃|ころ)|昔"
@@ -264,7 +292,9 @@ _PAST_TIME_EXPR_RE = re.compile(
 # 「昨日カレーを作った」の客体は「カレー」であって「昨日カレー」ではない。
 # 安全側（それ自体が名詞の一部になりにくい語）は助詞が無くても剥がす。
 _SAFE_TIME_WORD = (
-    r"\d+\s*(?:日|週間|週|ヶ月|か月|カ月|ケ月|箇月|年)\s*(?:ほど|くらい|ぐらい)?前|"
+    r"[\d数]+\s*(?:日|週間|週|ヶ月|か月|カ月|ケ月|箇月|年)\s*(?:ほど|くらい|ぐらい)?"
+    r"(?:前|後|先|ぶり)|"
+    r"翌日|翌朝|翌晩|翌週|翌月|翌年|後日|当日|先日|その日|その後|その夜|その晩|"
     r"昨日|きのう|今日|きょう|明日|あした|明後日|あさって|一昨日|おととい|"
     r"去年|昨年|今年|来年|おととし|一昨年|先月|今月|来月|先々月|先週|今週|来週|"
     r"さっき|今度|そのうち|いつか|これから|将来|こないだ|この前|あのとき|あの時|あの日|"
@@ -290,6 +320,10 @@ _YEAR_RE = re.compile(r"(\d{4})\s*年")
 _MONTH_RE = re.compile(r"(?:(\d{4})\s*年)?\s*(\d{1,2})\s*月")
 _DAY_RE = re.compile(r"(\d{1,2})\s*月\s*(\d{1,2})\s*日")
 _AGO_RE = re.compile(r"(\d+)\s*(日|週間|週|ヶ月|か月|カ月|ケ月|箇月|年)\s*(?:ほど|くらい|ぐらい)?前")
+# 「3日後」「2週間先」。予定の時期はこの形で語られる。
+_LATER_RE = re.compile(
+    r"(\d+)\s*(日|週間|週|ヶ月|か月|カ月|ケ月|箇月|年)\s*(?:ほど|くらい|ぐらい)?(?:後|先)"
+)
 _SEASONS = (("春", 3, 5), ("夏", 6, 8), ("秋", 9, 11), ("冬", 12, 2))
 # 季節を 1 点に代表させる月（occurred は幅ではなく代表点で持つ。幅は time_hint が伝える）。
 _SEASON_MONTH = {"春": 4, "夏": 7, "秋": 10, "冬": 1}
@@ -321,7 +355,7 @@ def base_date(ts: object) -> date | None:
         return None
 
 
-def resolve_event_time(hint: str, base: date | None) -> str:
+def resolve_event_time(hint: str, base: date | None, *, future: bool = False) -> str:
     """時間表現を「出来事の時期」の ISO 前方一致文字列へ解決する。
 
     粒度は文字列の長さで表す（``'2025'`` / ``'2025-07'`` / ``'2025-07-24'``）。DB では
@@ -330,6 +364,12 @@ def resolve_event_time(hint: str, base: date | None) -> str:
     基準日（その話をした日）と同じ時期を指すだけの表現（「今年」「今月」）は、
     ts と重複するだけなので空文字を返す。解決できない表現（「昔」「中学の頃」）も空文字で、
     その場合は ``time_hint`` に原文の表現だけが残る。
+
+    ``future=True``（予定・願望の時期）は、年の書かれていない「8月5日」「秋」を**未来側**へ
+    寄せる。回想と予定で同じ表現が逆を向くためで、ここを分けないと来週の予定が去年の
+    出来事になる（実測: ``plan 受ける: 抜糸`` が 2026-07-29 の発話で ``2025-08-05``、
+    「秋に紅葉したら」が ``2025-10`` になった）。「昨日」「来週」のように向きが語自体で
+    決まる表現は ``future`` に関係なくそのまま解決する。
     """
     body = str(hint or "").strip()
     if not body or base is None:
@@ -341,20 +381,29 @@ def resolve_event_time(hint: str, base: date | None) -> str:
         year_offset = -2
     elif re.search(r"今年", body):
         year_offset = 0
-    # 「去年の夏」「今年の春」→ 代表月まで
+    elif re.search(r"来年", body):
+        year_offset = 1
+    # 「去年の夏」「今年の春」「来年の春」→ 代表月まで
     for name, _start, _end in _SEASONS:
         if name in body:
             year = base.year + (year_offset if year_offset is not None else 0)
             month = _SEASON_MONTH[name]
-            if year_offset is None and (year, month) > (base.year, base.month):
-                year -= 1  # 年の指定が無くまだ来ていない季節は前年
+            if year_offset is None:
+                # 年が書かれていないときは、予定なら次に来るその季節、回想なら直近の過去。
+                if future and (year, month) < (base.year, base.month):
+                    year += 1
+                elif not future and (year, month) > (base.year, base.month):
+                    year -= 1
             return f"{year:04d}-{month:02d}"
     day_match = _DAY_RE.search(body)
     if day_match:
         month, day = int(day_match.group(1)), int(day_match.group(2))
         year = base.year + (year_offset if year_offset is not None else 0)
-        if year_offset is None and (month, day) > (base.month, base.day):
-            year -= 1
+        if year_offset is None:
+            if future and (month, day) < (base.month, base.day):
+                year += 1
+            elif not future and (month, day) > (base.month, base.day):
+                year -= 1
         try:
             return date(year, month, day).isoformat()
         except ValueError:
@@ -367,8 +416,11 @@ def resolve_event_time(hint: str, base: date | None) -> str:
                 year = int(month_match.group(1))
             else:
                 year = base.year + (year_offset if year_offset is not None else 0)
-                if year_offset is None and month > base.month:
-                    year -= 1
+                if year_offset is None:
+                    if future and month < base.month:
+                        year += 1
+                    elif not future and month > base.month:
+                        year -= 1
             if (year, month) == (base.year, base.month):
                 return ""
             return f"{year:04d}-{month:02d}"
@@ -376,6 +428,32 @@ def resolve_event_time(hint: str, base: date | None) -> str:
     if year_match:
         year = int(year_match.group(1))
         return "" if year == base.year else f"{year:04d}"
+    later_match = _LATER_RE.search(body)
+    if later_match:
+        amount = int(later_match.group(1))
+        unit = later_match.group(2)
+        if unit == "日":
+            return (base + timedelta(days=amount)).isoformat()
+        if unit in {"週間", "週"}:
+            return (base + timedelta(days=amount * 7)).isoformat()
+        if unit == "年":
+            return f"{base.year + amount:04d}"
+        year, month = _shift_month(base, amount)
+        return f"{year:04d}-{month:02d}"
+    if re.search(r"明後日|あさって", body):
+        return (base + timedelta(days=2)).isoformat()
+    if re.search(r"明日|あした", body):
+        return (base + timedelta(days=1)).isoformat()
+    if re.search(r"再来週", body):
+        return (base + timedelta(days=14)).isoformat()
+    if re.search(r"来週", body):
+        return (base + timedelta(days=7)).isoformat()
+    if re.search(r"再来月", body):
+        year, month = _shift_month(base, 2)
+        return f"{year:04d}-{month:02d}"
+    if re.search(r"来月", body):
+        year, month = _shift_month(base, 1)
+        return f"{year:04d}-{month:02d}"
     ago_match = _AGO_RE.search(body)
     if ago_match:
         amount = int(ago_match.group(1))
@@ -610,14 +688,46 @@ def _modality_at(text: str, position: int) -> str:
 
 
 def _event_hint_at(text: str, position: int) -> str:
-    """その動詞に係る過去の時間表現を返す（同じ文の中で動詞に最も近いもの）。
+    """その動詞に係る時間表現を返す（同じ文の中で動詞に最も近いもの）。
 
-    「1年前に多摩川の花火大会に行った」の「1年前」を取り、出来事の時期として持つ。
-    ts（その話をした日）とは別物なので、取れた表現はそのまま保存して提示にも出す。
+    「1年前に多摩川の花火大会に行った」の「1年前」、「明日は肉じゃがを作る」の「明日」を
+    取り、出来事（または予定）の時期として持つ。ts（その話をした日）とは別物なので、
+    取れた表現はそのまま保存して提示にも出す。
     """
     head = text[_sentence_start(text, position) : position]
-    found = list(_PAST_TIME_EXPR_RE.finditer(head))
+    found = list(_EVENT_TIME_EXPR_RE.finditer(head))
     return found[-1].group(0).strip() if found else ""
+
+
+# 主体の候補が名前ではなく節の断片になっていないかを見る。日本語の「が」は主格だけでなく
+# 動詞の一部にもなるため（「立ち上がって」）、素朴に「が」の直前を取ると節が主体になる
+# （実測: 主体が `翌朝になって何とか立ち上` になった）。ひらがなの助詞・活用を含む候補は
+# 名前ではないので捨てる（カタカナ・漢字の名前は影響を受けない）。
+_NAME_REJECT_RE = re.compile(
+    r"[てでにをはもへ]|った|なっ|ない|する|して|から|けど|まま|ながら|ため"
+)
+
+
+def _looks_like_name(text: str) -> bool:
+    """主体の候補が人名として通るか（節の断片・時間表現・動詞なら False）。
+
+    表記が混ざる候補も落とす。人名はカタカナ・漢字・ひらがなのどれかで揃うのが普通で、
+    「盛り上」「立ち上」のように漢字とひらがなが交互に来るのは複合動詞の断片である
+    （実測でこの形が主体として台帳に入った）。「田中さん」のような形は落ちるが、
+    誤った主体を残すより安全側に振る。
+    """
+    body = str(text or "").strip()
+    if not (2 <= len(body) <= 8) or body in _GENERIC_NAMES:
+        return False
+    if _NAME_REJECT_RE.search(body) or _ANY_VERB_RE.search(body):
+        return False
+    if _TIME_ONLY_RE.match(body):
+        return False
+    return bool(
+        re.fullmatch(r"[ァ-ヴー]+", body)
+        or re.fullmatch(r"[一-鿿々]+", body)
+        or re.fullmatch(r"[ぁ-ん]+", body)
+    )
 
 
 def _clean_object(text: str) -> str:
@@ -635,8 +745,15 @@ def _clean_object(text: str) -> str:
         if trimmed == body:
             break
         body = trimmed
+    body = _OBJECT_SUBJECT_PREFIX_RE.sub("", body, count=1).strip()
     body = _OBJECT_TRIM_RE.sub("", body).strip()
-    body = _OBJECT_MODIFIER_RE.sub("", body).strip()
+    # 連用の節は重なることがあるので繰り返し剥がす
+    # （「倒れて不調なままネパールの病院」→「不調なままネパールの病院」→「ネパールの病院」）。
+    for _ in range(3):
+        trimmed = _OBJECT_MODIFIER_RE.sub("", body, count=1).strip()
+        if trimmed == body:
+            break
+        body = trimmed
     body = body.strip("、。・…「」『』\"'`（）() 　")
     # 「のや観た景色」のように助詞の残骸が 2 つ重なることがあるので繰り返し剥がす
     # （剥がし過ぎを防ぐため 2 回まで）。
@@ -653,6 +770,10 @@ def _clean_object(text: str) -> str:
         return ""
     # ひらがな 1 文字は助詞・語尾の切れ端でしかない（漢字 1 字は「薬」「本」等で有効）。
     if len(body) == 1 and not _KANJI_RE.match(body) and not _KATAKANA_RE.match(body):
+        return ""
+    # 漢字 1 字でも、動詞の語幹なら客体ではない（「後日結果を見に行った」で客体が
+    # 『見』になった）。「薬」「本」のような実体を指す 1 字だけを通す。
+    if len(body) == 1 and body in _VERB_STEM_KANJI:
         return ""
     return body
 
@@ -758,13 +879,22 @@ def _giving_hint(text: str, position: int) -> str:
 
     「作ってあげた」「買ってくれた」のように、授受表現はその行為の直後に付く。
     離れた位置の授受表現は別の行為に係っているので見ない。
+
+    間に格助詞（を・に・へ・が・は）が挟まっていたら、その授受表現は別の述語のもの
+    （実測: 「病院に行って薬をもらった」で、行く行為が「ルリが行った」になった）。
+    「買ってきてくれた」のような助動詞の連鎖は助詞を挟まないので、こちらは通る。
     """
     tail = text[position : position + 10]
-    if _GIVE_RE.search(tail):
-        return "give"
-    if _RECEIVE_RE.search(tail):
-        return "receive"
-    return ""
+    give = _GIVE_RE.search(tail)
+    receive = _RECEIVE_RE.search(tail)
+    match = min(
+        (found for found in (give, receive) if found), key=lambda m: m.start(), default=None
+    )
+    if match is None:
+        return ""
+    if re.search(r"[をにへがは]", tail[: match.start()]):
+        return ""  # 間に別の格があるので、この行為に係る授受ではない
+    return "give" if match is give else "receive"
 
 
 def _direction_from_giving(text: str, role: str) -> str:
@@ -834,7 +964,9 @@ def extract_rule_based(
         match = _SUBJECT_RE.search(text)
         if match:
             candidate = _TIME_PREFIX_RE.sub("", match.group(1)).strip()
-            if candidate and candidate not in _GENERIC_NAMES:
+            # 名前として通らない候補（節の断片・時間表現）は主体にしない。主体不明のまま
+            # 残す方が、誤った主体を台帳に入れて「誰がした事か」を汚すより安全。
+            if _looks_like_name(candidate):
                 named_subject = candidate
         # 向きは行為ごとに決める。文全体で1つに決めてしまうと、別の行為に係る
         # 授受表現の向きを持ち込む（実測: 「食べてくれるから…パンツを買いに行く」で
@@ -865,7 +997,10 @@ def extract_rule_based(
                     "recipient": recipient,
                     "direction": direction,
                     "modality": modality,
-                    "occurred": resolve_event_time(time_hint, base),
+                    # 予定・願望の時期は未来側へ寄せる（「8月5日にやる」は来年ではなく今年）。
+                    "occurred": resolve_event_time(
+                        time_hint, base, future=modality in {"plan", "wish"}
+                    ),
                     "time_hint": time_hint,
                     # ルールの確信度: その行為に係る授受表現で向きが取れた行を高くする。
                     "confidence": 0.85 if direction != "unknown" else 0.4,
@@ -928,6 +1063,26 @@ def _dedupe(facts: list[dict]) -> list[dict]:
         ):
             merged[key] = fact
     return list(merged.values())
+
+
+def covers_action(facts: list[dict], verb: str, object_text: str) -> bool:
+    """``facts`` の中に、同じ行為（動詞が同じで客体が包含関係）があるか。
+
+    ルール抽出の客体は「を」の直前を取る素朴な規則なので、修飾ごと長く切り出しやすい
+    （実測: LLM の『麻辣麻婆豆腐』に対しルールは『からさの花椒をたっぷりかけた麻辣麻婆豆腐』）。
+    完全一致だけで重複を見ると両方が台帳に残り、列挙で同じ料理が 2 行に増える。
+    """
+    verb_key = str(verb or "").strip()
+    obj = str(object_text or "").strip()
+    if not verb_key or not obj:
+        return False
+    for fact in facts:
+        if str(fact.get("verb") or "").strip() != verb_key:
+            continue
+        other = str(fact.get("object") or "").strip()
+        if other and (other == obj or other in obj or obj in other):
+            return True
+    return False
 
 
 def needs_llm(facts: list[dict]) -> bool:
@@ -1147,7 +1302,9 @@ def parse_llm_facts(
                 "recipient": recipient,
                 "direction": direction,
                 "modality": modality,
-                "occurred": resolve_event_time(time_hint, base),
+                "occurred": resolve_event_time(
+                    time_hint, base, future=modality in {"plan", "wish"}
+                ),
                 "time_hint": time_hint,
                 "confidence": max(0.0, min(1.0, confidence)),
                 "extractor": "llm",
@@ -1180,6 +1337,7 @@ def infer_query_filters(
             "verb": "",
             "direction": "",
             "subject": "",
+            "self_subject": "",
             "modality": "",
         }
     verbs = _find_verbs(text)
@@ -1206,11 +1364,20 @@ def infer_query_filters(
         if re.search(pattern, text):
             category = name
             break
+    resolved = direction if direction != "unknown" else ""
+    # その向きの行為者の名前。台帳を引くとき、この人自身の行為（direction='self'）も
+    # 一緒に拾うために使う（「俺が行った場所」は相手への行為ではないので向きで拾えない）。
+    self_subject = ""
+    if resolved == "user->char":
+        self_subject = str(user_name or "").strip()
+    elif resolved == "char->user":
+        self_subject = str(char_name or "").strip()
     return {
         "category": category,
         "verb": verb,
-        "direction": direction if direction != "unknown" else "",
+        "direction": resolved,
         "subject": "",
+        "self_subject": self_subject if self_subject not in _GENERIC_NAMES else "",
         "modality": _question_modality(text),
     }
 
@@ -1295,14 +1462,10 @@ def extract(
     # LLM が同じ行為（動詞・客体）を返している分もルール側は落とす。相の判断が食い違うと
     # （ルール done / LLM plan）両方が台帳に残り、予定が「した事」として列挙に戻ってしまう。
     # 文全体を読める LLM の判断を採る。
-    covered = {
-        (str(fact.get("verb") or ""), str(fact.get("object") or ""))
-        for fact in llm_facts
-    }
     strong_rule = [
         fact
         for fact in facts
         if str(fact.get("direction") or "unknown") != "unknown"
-        and (str(fact.get("verb") or ""), str(fact.get("object") or "")) not in covered
+        and not covers_action(llm_facts, fact.get("verb"), fact.get("object"))
     ]
     return _resolve_conflicts(_dedupe(llm_facts + strong_rule))

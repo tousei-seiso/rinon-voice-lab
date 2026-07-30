@@ -74,7 +74,12 @@ focused on higher-quality Japanese character speech and day-to-day usability.
     the single largest source of junk objects), contentless objects (particles, formal
     nouns, pronouns, and words like greeting / feeling / face), and it downgrades an
     action's direction to unknown when a third party is involved, so filtering for "what I
-    did for you" never pulls in acts aimed at someone else. Measured over 771 turns, ~87%
+    did for you" never pulls in acts aimed at someone else. It also rejects subjects that
+    are clause fragments rather than names (が marks a subject but also lives inside verbs
+    like 立ち上がって), strips continuative clauses and time words off objects, ignores
+    benefactives separated by another case particle, and drops rule-derived rows on turns
+    the LLM already read. Asking "what did *I* do" also pulls in that person's own actions
+    (`direction='self'`), which a direction match alone cannot reach. Measured over 771 turns, ~87%
     of turns need the LLM pass, so build the ledger with LM Studio running rather than
     `--rule-only`.
     Alongside direction, every fact carries its **modality** and its **event time**, because
@@ -84,8 +89,10 @@ focused on higher-quality Japanese character speech and day-to-day usability.
     the day it was *mentioned*. So `modality` (`done` / `plan` / `wish` / `negated` /
     `unknown`) is decided from the tail of that specific verb — non-past benefactives
     (〜てあげる) are offers, not completions — and `occurred` holds the event's own time
-    resolved from expressions like 1年前 / 去年の夏 against the turn's timestamp
-    (`ts` is only the day it was talked about). Enumeration defaults to `done` (plus
+    resolved from expressions like 1年前 / 去年の夏 / 明日 against the turn's timestamp
+    (`ts` is only the day it was talked about). An expression with no year (8月5日, 秋)
+    resolves *backwards* for a recollection but *forwards* for a plan — otherwise next
+    week's plan lands a year in the past. Enumeration defaults to `done` (plus
     `unknown`, so a missed call never drops a real fact), plans are shown in their own
     section rather than discarded, and period filters match on either time so a
     reminiscence is not lost. `tools/check_fact_modality.py` pins these judgements down
@@ -98,7 +105,9 @@ focused on higher-quality Japanese character speech and day-to-day usability.
   span of what is on record so "no record before this" is not mistaken for "it never
   happened". Period expressions resolve to `since`/`until` filters.
   Tools: `tools/build_fact_ledger.py` (bulk ledger build; `--rule-only` needs no LLM,
-  resumes where it stopped, `--list --modality plan` reviews what was filed as a plan),
+  resumes where it stopped; `--list --modality plan` reviews what was filed as a plan,
+  `--list --object <word>` looks a specific item up, and `--fix-occurred` recomputes event
+  times from the stored `time_hint` without any LLM call),
   `tools/check_fact_modality.py` (regression check for the tense / event-time rules, no LLM
   or DB needed), `tools/diagnose_temporal.py` (inspect which channel a
   temporal/enumeration ask falls through, no LLM needed), `tools/audit_memory.py`

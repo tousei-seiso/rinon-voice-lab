@@ -3174,6 +3174,9 @@ def recall_for_turn(
                 category=filters.get("category", ""),
                 verb=filters.get("verb", ""),
                 direction=filters.get("direction", ""),
+                # その人自身の行為（direction='self'）も一緒に拾う。「俺が行った場所」は
+                # 相手への行為ではないので、向きの一致だけでは丸ごと漏れる。
+                self_subject=filters.get("self_subject", ""),
                 # 相の絞り込み（既定 'done'）。これが無いと「今度作ってあげるね」と
                 # 言っただけの料理が「作った料理」として列挙に混ざる。
                 modality=filters.get("modality", ""),
@@ -3198,6 +3201,7 @@ def recall_for_turn(
                 category=filters.get("category", ""),
                 verb=filters.get("verb", ""),
                 direction=filters.get("direction", ""),
+                self_subject=filters.get("self_subject", ""),
                 modality="plan",
                 slot=slot,
                 mode=mode,

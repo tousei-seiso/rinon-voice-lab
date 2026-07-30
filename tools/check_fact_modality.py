@@ -41,7 +41,11 @@ CHAR = "ルリ"
 CASES: tuple[tuple[str, tuple[str, str, str, str]], ...] = (
     # --- 未来の予定を「した事」にしない（今回の主症状）---
     ("次はうどんなカルボナーラを作ってあげるね", ("作る", "うどんなカルボナーラ", "plan", "")),
-    ("明日は肉じゃがを作ってあげる", ("作る", "肉じゃが", "plan", "")),
+    ("明日は肉じゃがを作ってあげる", ("作る", "肉じゃが", "plan", "2026-07-31")),
+    # 予定の時期は未来側へ寄せる。回想と同じ規則で解くと来週の予定が去年になる
+    # （実測: 2026-07-29 の「8月5日に抜糸」が 2025-08-05 と記録された）。
+    ("8月5日に映画館に行こうと思ってる", ("行く", "映画館", "plan", "2026-08-05")),
+    ("来月ハンバーグを作ってあげるね", ("作る", "ハンバーグ", "plan", "2026-08")),
     ("今度カルボナーラを作ってあげるって約束したよね", ("作る", "カルボナーラ", "plan", "")),
     ("そのうち映画館に行こうと思ってる", ("行く", "映画館", "plan", "")),
     ("今度カルボナーラを作ろうね", ("作る", "カルボナーラ", "plan", "")),
@@ -56,6 +60,8 @@ CASES: tuple[tuple[str, tuple[str, str, str, str]], ...] = (
     ("去年の夏に江ノ島へ行ったよね", ("行く", "江ノ島", "done", "2025-07")),
     ("3ヶ月前に鎌倉のカフェに行ったのが楽しかった", ("行く", "鎌倉のカフェ", "done", "2026-04")),
     ("2024年3月に水族館に行ったね", ("行く", "水族館", "done", "2024-03")),
+    # 年の無い「3月」は、回想なら直近の過去（基準日 2026-07-30 なので今年の3月）。
+    ("3月に水族館に行ったね", ("行く", "水族館", "done", "2026-03")),
     ("昨日カレーを作ってあげたよ", ("作る", "カレー", "done", "2026-07-29")),
     # --- 普通の過去（時期は話した日と同じなので occurred は空）---
     ("肉じゃがを作ってあげた", ("作る", "肉じゃが", "done", "")),
@@ -66,6 +72,33 @@ CASES: tuple[tuple[str, tuple[str, str, str, str]], ...] = (
     # 動詞パターン自体が「た」を含む形（語尾に完了の印が残らない）。
     ("肉じゃがを煮たよ", ("作る", "肉じゃが", "done", "")),
     ("温泉宿に泊めたね", ("泊まる", "温泉宿", "done", "")),
+    # --- 節の断片を客体にしない（実データの切り出し失敗）---
+    ("倒れて不調なままネパールの病院に行った", ("行く", "ネパールの病院", "done", "")),
+    ("薬局に行って薬を買った", ("買う", "薬", "done", "")),
+    ("そのまま空港に行った", ("行く", "空港", "done", "")),
+)
+
+# 抽出**されてはいけない** (発話, (動詞, 客体))。実データで台帳に入っていたゴミ。
+NEGATIVE_CASES: tuple[tuple[str, tuple[str, str]], ...] = (
+    # 「立ち上がって」を『登る』として拾っていた（客体は時間表現の「翌朝」）。
+    ("翌朝になって何とか立ち上がって薬局に行った", ("登る", "翌朝")),
+    ("薬局に行って薬を買った", ("買う", "行って薬")),
+    ("倒れて不調なままネパールの病院に行った", ("行く", "倒れて不調なままネパールの病院")),
+    # 連用形の切れ端（1 字の動詞語幹）と、中身の無い抽象語。
+    ("後日結果を見に行ったよ", ("行く", "見")),
+    ("後日結果を見に行ったよ", ("行く", "後日結果")),
+)
+
+# 主体の判定 (発話, 動詞, 客体, 期待する主体)。'' は「主体不明のままが正しい」。
+SUBJECT_CASES: tuple[tuple[str, str, str, str], ...] = (
+    # 「が」は主格だけでなく動詞の一部にもなる。節の断片を主体にしない。
+    ("翌朝になって何とか立ち上がって薬局に行った", "行く", "薬局", ""),
+    ("盛り上がって歌を歌ったね", "歌う", "歌", ""),
+    # 離れた「もらった」は別の述語のもの。向きを付けない。
+    ("病院に行って薬をもらった", "行く", "病院", ""),
+    # 授受表現があるなら向きから主体が決まる。
+    ("ナデシコが肉じゃがを作ってくれた", "作る", "肉じゃが", "ルリ"),
+    ("讃岐うどんを作ってあげたよ", "作る", "讃岐うどん", "オサム"),
 )
 
 # 質問文から推定する相（既定は done。予定を訊いていると読めるときだけ plan）。
@@ -124,6 +157,31 @@ def main() -> int:
             print(f"    {' / '.join(problems)} — {_describe(hit)}")
         elif args.all:
             print(f"✓ {text}\n    {_describe(hit)}")
+    for text, (verb, obj) in NEGATIVE_CASES:
+        facts = fx.extract_rule_based(text, "", user_name=USER, char_name=CHAR, ts=TS)
+        hit = next((f for f in facts if f["verb"] == verb and f["object"] == obj), None)
+        if hit is not None:
+            failures += 1
+            print(f"✗ {text}")
+            print(f"    入ってはいけない事実が抽出された: {_describe(hit)}")
+        elif args.all:
+            print(f"✓ {text}\n    {verb}:{obj} は抽出されない")
+    for text, verb, obj, expected_subject in SUBJECT_CASES:
+        facts = fx.extract_rule_based(text, "", user_name=USER, char_name=CHAR, ts=TS)
+        hit = next((f for f in facts if f["verb"] == verb and f["object"] == obj), None)
+        if hit is None:
+            failures += 1
+            print(f"✗ {text}\n    {verb}:{obj} が抽出されなかった（主体を確認できない）")
+            continue
+        if hit["subject"] != expected_subject:
+            failures += 1
+            print(f"✗ {text}")
+            print(
+                f"    主体 {hit['subject'] or '(不明)'} ≠ {expected_subject or '(不明)'}"
+                f" — {_describe(hit)}"
+            )
+        elif args.all:
+            print(f"✓ {text}\n    主体={hit['subject'] or '(不明)'} {verb}:{obj}")
     for question, expected in QUESTION_CASES:
         actual = fx.infer_query_filters(question, user_name=USER, char_name=CHAR)
         if actual["modality"] != expected:
@@ -131,7 +189,7 @@ def main() -> int:
             print(f"✗ 質問「{question}」→ 相={actual['modality']} ≠ {expected}")
         elif args.all:
             print(f"✓ 質問「{question}」→ 相={actual['modality']}")
-    total = len(CASES) + len(QUESTION_CASES)
+    total = len(CASES) + len(NEGATIVE_CASES) + len(SUBJECT_CASES) + len(QUESTION_CASES)
     print(f"\n== {total - failures}/{total} 一致 ==")
     if failures:
         print(

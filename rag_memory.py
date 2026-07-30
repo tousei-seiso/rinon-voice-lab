@@ -1290,6 +1290,7 @@ def query_facts(
     verb: str = "",
     object_like: str = "",
     direction: str = "",
+    self_subject: str = "",
     modality: str = "",
     slot: str | None = None,
     mode: str | None = None,
@@ -1306,6 +1307,10 @@ def query_facts(
     ``direction='user->char'``、「君が俺に作ってくれた料理」は ``'char->user'``。
     ``include_unknown=True``（既定）なら方向が判定できなかった行も併せて返す
     （取りこぼしを作らないため。呼び出し側は ``direction`` を見て提示を分ける）。
+
+    ``self_subject`` にその向きの行為者の名前を渡すと、その人自身の行為
+    （``direction='self'``）も併せて返す。「俺が行った場所」は相手への行為ではないので、
+    向きの一致だけでは拾えない。
 
     ``include_uncategorized=True``（既定）は category が空の行も返す。カテゴリは
     語彙辞書による推定なので、固有名詞（「星の王子さま」）は本だと判定できず空になる。
@@ -1353,12 +1358,23 @@ def query_facts(
         conditions.append("object LIKE ? ESCAPE '\\'")
         params.append(_like_pattern(obj))
     direction_key = str(direction or "").strip()
+    self_name = str(self_subject or "").strip()
     if direction_key:
-        if include_unknown:
+        if include_unknown and self_name:
+            # 「俺がした事」には、その人自身の行為（direction='self'）も含める。
+            # self は相手への行為ではないので向きの一致では拾えず、これが無いと
+            # 自分の行動が丸ごと漏れる（実測: 台帳 474 件のうち 165 件が self で、
+            # 「俺が行った場所」の絞り込みから全部落ちていた）。
+            conditions.append(
+                "(direction IN (?, 'unknown') OR (direction = 'self' AND subject = ?))"
+            )
+            params.extend([direction_key, self_name])
+        elif include_unknown:
             conditions.append("direction IN (?, 'unknown')")
+            params.append(direction_key)
         else:
             conditions.append("direction = ?")
-        params.append(direction_key)
+            params.append(direction_key)
     modality_key = str(modality or "").strip()
     # 相の列が無い古い台帳（このコードで一度も書き込んでいない DB）。読み取り専用で
     # 開いているので後付けはできない。すべて「した事」として扱い、従来の挙動に落とす。
@@ -1430,6 +1446,31 @@ def query_facts(
     if limit and limit > 0:
         return results[: int(limit)]
     return results
+
+
+def update_fact_occurred(char_id: str, updates: list[tuple[int, str]]) -> int:
+    """事実の出来事時刻（occurred）だけを id 指定で書き換える。書き換えた行数を返す。
+
+    ``time_hint``（本人の言い方）は保存済みなので、時期の解決規則を直したときは
+    LLM を呼び直さずにここで再計算できる（実測: 未来の予定「8月5日」を過去向きに
+    解決していた分の修復に使った。全件 LLM 再抽出なら数十分かかる）。
+    """
+    if not LEDGER_ENABLED or not updates:
+        return 0
+    try:
+        conn = _connect(char_id, create=True)
+        try:
+            before = conn.total_changes
+            conn.executemany(
+                "UPDATE facts SET occurred = ? WHERE id = ?",
+                [(str(value or ""), int(row_id)) for row_id, value in updates],
+            )
+            conn.commit()
+            return conn.total_changes - before
+        finally:
+            conn.close()
+    except Exception:
+        return 0
 
 
 def facts_stats(char_id: str) -> dict:

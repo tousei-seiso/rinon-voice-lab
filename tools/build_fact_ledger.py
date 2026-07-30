@@ -25,6 +25,9 @@
   python tools/build_fact_ledger.py --redo-rule --dry-run   # 何が入るか先に見る
   # 「同じ出来事に食い違う向き」が残っている分を畳む
   python tools/build_fact_ledger.py --fix-conflicts
+  # 出来事の時期（occurred）だけを time_hint から再計算して直す
+  python tools/build_fact_ledger.py --fix-occurred --dry-run
+  python tools/build_fact_ledger.py --fix-occurred
 
 抽出の規則を直したあと、**一部だけ**作り直す（全件やり直すと LLM 抽出で数十分かかる）:
   # 7月以降の往復だけをやり直す
@@ -42,6 +45,7 @@
   python tools/build_fact_ledger.py --list --char ruri --verb 作る      # 動詞で絞る
   python tools/build_fact_ledger.py --list --char ruri --category 料理  # カテゴリで絞る
   python tools/build_fact_ledger.py --list --modality plan              # 予定として記録された分だけ
+  python tools/build_fact_ledger.py --list --object カルボナーラ        # あの品が台帳にあるか（部分一致）
 
 途中で止めても、次回は「まだ抽出していない往復」から再開する
 （facts.source_id の有無で判定するため、何度実行しても重複しない）。
@@ -329,6 +333,11 @@ def redo_rule_facts(
     係り受け・カテゴリ辞書・客体フィルタといった正規表現の規則を直したときに使う。
     LLM 由来の事実は文全体を読んで判断しているため規則変更の影響を受けないので、
     そのまま残す。全往復を LLM に投げ直すと数時間かかるが、これは数秒で終わる。
+
+    LLM が答えを出せている往復では、ルール側の弱い事実（向きが決まらなかった行）は
+    保存しない。``fact_extract.extract`` と同じ方針で、これが無いと
+    「作る: 私たち」「作る: 証拠」のような切り出し失敗が LLM 由来の正しい行と並んで
+    列挙に混ざる（実測でこの形が残っていた）。
     """
     names = _char_name_map()
     fallback_user = user_name or _default_user_name()
@@ -366,13 +375,33 @@ def redo_rule_facts(
             print("  (dry-run: 削除も保存もしていません)")
             continue
         removed = rag.delete_facts_by_extractor(char_id, "rule", since=since, until=until)
-        added = 0
+        # LLM 由来の事実が既にある往復を、その事実ごと把握しておく。
+        llm_covered: dict[int, list] = {}
+        for fact in rag.query_facts(char_id):
+            if str(fact.get("extractor") or "") != "llm":
+                continue
+            llm_covered.setdefault(int(fact["source_id"]), []).append(fact)
+        added = skipped = 0
         for turn in turns:
             facts = fx.extract_rule_based(
                 turn["user_text"], turn["reply_text"], user_name=fallback_user,
                 char_name=who, mode=turn["mode"], speaker=turn["speaker"],
                 ts=turn["ts"],
             )
+            covered = llm_covered.get(int(turn["id"]))
+            if covered:
+                # LLM が読めている往復では、向きの決まらない弱い事実と、LLM が同じ行為を
+                # 返している事実は入れない（文全体を読める LLM の判断を採る）。
+                kept = [
+                    fact
+                    for fact in facts
+                    if str(fact.get("direction") or "unknown") != "unknown"
+                    and not fx.covers_action(
+                        covered, fact.get("verb"), fact.get("object")
+                    )
+                ]
+                skipped += len(facts) - len(kept)
+                facts = kept
             if facts:
                 added += rag.save_facts(
                     char_id, facts, source_id=turn["id"], ts=turn["ts"],
@@ -384,6 +413,7 @@ def redo_rule_facts(
         after = rag.facts_stats(char_id)
         print(
             f"  → ルール由来を {removed} 件削除 / {added} 件を作り直し "
+            f"/ LLM が読めている分の弱い事実 {skipped} 件は入れず "
             f"/ 食い違う向きを {conflicts} 件整理 "
             f"（台帳 {before['count']} → {after['count']} 事実 / "
             f"相別 {after['modalities']}。LLM 呼び出しなし）"
@@ -402,6 +432,49 @@ def fix_conflicts(char_ids: list[str]) -> None:
         )
 
 
+def fix_occurred(char_ids: list[str], *, dry_run: bool = False) -> None:
+    """出来事時刻（occurred）を time_hint から再計算して直す（**LLM 呼び出しゼロ**）。
+
+    時期の解決規則を直したときに使う。原文の言い方（time_hint）は台帳に残っているので、
+    往復を読み直さずに数秒で直せる（全件 LLM 再抽出なら数十分かかる）。
+    実例: 未来の予定「8月5日にやる」を回想と同じ規則で解いてしまい、2026-07-29 の発話が
+    2025-08-05（去年）になっていた分の修復。
+    """
+    for char_id in char_ids:
+        facts = rag.query_facts(char_id)
+        updates: list[tuple[int, str]] = []
+        for fact in facts:
+            hint = str(fact.get("time_hint") or "").strip()
+            if not hint:
+                continue  # 原文の表現が無い行は再計算のしようがない
+            future = str(fact.get("modality") or "") in {"plan", "wish"}
+            fixed = fx.resolve_event_time(
+                hint, fx.base_date(fact.get("ts")), future=future
+            )
+            if fixed != str(fact.get("occurred") or ""):
+                updates.append((int(fact["id"]), fixed))
+        print(
+            f"\n[{char_id}] 出来事時刻の再計算: 対象 {len(facts)} 事実 / "
+            f"変化する行 {len(updates)} 件"
+        )
+        for row_id, fixed in updates[:20]:
+            fact = next(f for f in facts if int(f["id"]) == row_id)
+            print(
+                f"  {rag.format_stamp(fact['ts']) or '(日時不明)':17} {fact['modality']:8} "
+                f"{fact['verb']}: {fact['object']}"
+                f" 出来事={fact['occurred'] or '(空)'} → {fixed or '(空)'}"
+                f"（{fact['time_hint']}）"
+            )
+        if len(updates) > 20:
+            print(f"  …ほか {len(updates) - 20} 件")
+        if dry_run:
+            print("  (dry-run: 書き込んでいません)")
+            continue
+        if updates:
+            changed = rag.update_fact_occurred(char_id, updates)
+            print(f"  → {changed} 件を更新しました（LLM 呼び出しなし）")
+
+
 def list_ledger(
     char_ids: list[str],
     *,
@@ -409,11 +482,13 @@ def list_ledger(
     verb: str = "",
     category: str = "",
     modality: str = "",
+    object_like: str = "",
 ) -> None:
     """台帳の中身を一覧表示する（抽出はしない読み取り専用）。
 
     構築の途中でも呼べる（読み取り専用で開くので、実行中の抽出を邪魔しない）。
-    件数が多いので既定は先頭 limit 件。動詞やカテゴリで絞り込める。
+    件数が多いので既定は先頭 limit 件。動詞・カテゴリ・相・客体で絞り込める。
+    ``object_like`` は部分一致なので、「あの品は台帳に入っているのか」を直接引ける。
     """
     for char_id in char_ids:
         stats = rag.facts_stats(char_id)
@@ -424,12 +499,35 @@ def list_ledger(
         if not stats["count"]:
             print("  (空) tools/build_fact_ledger.py で構築してください。")
             continue
-        facts = rag.query_facts(
-            char_id, verb=verb, category=category, modality=modality, limit=limit
+        # 件数の確認と表示を分ける。絞り込みつきで limit 件だけ見て「無い」と判断すると
+        # 打ち切られただけの行を見落とす（実測: plan 108 件のうち先頭 40 件しか出ず、
+        # 探していた品が「入っていない」と誤読した）。
+        matched = rag.query_facts(
+            char_id,
+            verb=verb,
+            category=category,
+            modality=modality,
+            object_like=object_like,
         )
-        if not facts:
-            print("  該当なし（--verb / --category / --modality の指定を確認してください）")
+        facts = matched[:limit] if limit and limit > 0 else matched
+        if not matched:
+            print(
+                "  該当なし（--verb / --category / --modality / --object の指定を"
+                "確認してください）"
+            )
             continue
+        if verb or category or modality or object_like:
+            label = " / ".join(
+                part
+                for part in (
+                    f"動詞={verb}" if verb else "",
+                    f"カテゴリ={category}" if category else "",
+                    f"相={modality}" if modality else "",
+                    f"客体〜{object_like}" if object_like else "",
+                )
+                if part
+            )
+            print(f"  絞り込み（{label}）: {len(matched)} 件 → 先頭 {len(facts)} 件を表示")
         # 抽出元と主客を追えるよう、日時つき・古い順で 1 行 1 事実を出す。
         for fact in facts:
             stamp = rag.format_stamp(fact["ts"], seconds=True) or "(日時不明)"
@@ -443,8 +541,8 @@ def list_ledger(
                 f"{fact['verb']}: {fact['object']} [{fact['category'] or '-'}]{when} "
                 f"by={fact['extractor']} src={fact['source_id']}"
             )
-        if stats["count"] > len(facts):
-            print(f"  …ほか {stats['count'] - len(facts)} 件（--list-limit で増やせます）")
+        if len(matched) > len(facts):
+            print(f"  …ほか {len(matched) - len(facts)} 件（--list-limit で増やせます）")
 
 
 def main() -> None:
@@ -474,6 +572,9 @@ def main() -> None:
         default="",
         help="--list の絞り込み（done=した事 / plan=予定・願望 / negated=しなかった事）",
     )
+    parser.add_argument(
+        "--object", default="", help="--list の絞り込み（客体の部分一致。例: カルボナーラ）"
+    )
     parser.add_argument("--since", default="", help="この日付以降の往復だけを対象にする（YYYY-MM-DD）")
     parser.add_argument("--until", default="", help="この日付までの往復だけを対象にする（YYYY-MM-DD）")
     parser.add_argument(
@@ -497,6 +598,11 @@ def main() -> None:
         action="store_true",
         help="台帳に残った食い違う向きを畳む（LLM 呼び出しなし・即座）",
     )
+    parser.add_argument(
+        "--fix-occurred",
+        action="store_true",
+        help="出来事時刻を time_hint から再計算して直す（LLM 呼び出しなし・数秒）",
+    )
     args = parser.parse_args()
 
     char_ids = _target_char_ids(args.char)
@@ -511,10 +617,14 @@ def main() -> None:
             verb=args.verb,
             category=args.category,
             modality=args.modality,
+            object_like=args.object,
         )
         return
     if args.fix_conflicts:
         fix_conflicts(char_ids)
+        return
+    if args.fix_occurred:
+        fix_occurred(char_ids, dry_run=args.dry_run)
         return
     if args.redo_rule:
         # LLM を使わないので LM Studio は不要。数秒で終わる。

@@ -115,6 +115,7 @@ def diagnose(
         category=filters["category"],
         verb=filters["verb"],
         direction=filters["direction"],
+        self_subject=filters["self_subject"],
         modality=filters["modality"],
         slot=slot,
         mode=mode,
