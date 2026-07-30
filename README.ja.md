@@ -328,6 +328,14 @@ Irodori-TTS の依存関係は次のどちらかで入れてください。
 | `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | LM Studio の OpenAI互換API | ✅ | ✅ |
 | `LM_STUDIO_MODEL` | `gemma-4-12b-it` | 優先モデル名 | ✅ | ✅ |
 | `LM_STUDIO_CONTEXT_LIMIT` | `8200` | 表示上のコンテキスト上限 | ✅ | ✅ |
+| `LM_COMPACT_CONTEXT_LIMIT` | `4200` | プロンプトへ載せる会話履歴の実上限（文字数）。画面の context 上限はこの値でクランプされる | ✅ | ✅ |
+| `LM_RECENT_MESSAGE_COUNT` | `12` | 要約に畳まず原文のまま載せる直近の発言数 | ✅ | ✅ |
+| `LM_CONTEXT_LENGTH` | `0` | モデルの文脈長（トークン）を手動指定。`0` なら LM Studio の `/api/v0/models` から自動取得 | — | ✅ |
+| `LM_OUTPUT_RESERVE_TOKENS` | `1280` | 思考＋本文のために必ず空けておくトークン数。空返答が出るなら増やす | — | ✅ |
+| `LM_CONTEXT_PROBE_TTL` | `60` | 自動取得した文脈長のキャッシュ秒数 | — | ✅ |
+| `LM_MEMORY_DIGEST` | `1` | 記憶ブロックが枠を超えたとき、別呼び出しで要点メモへ圧縮する（`0` なら行単位の間引きだけ） | — | ✅ |
+| `LM_MEMORY_DIGEST_MAXTOK` | `700` | 要点メモ 1 回ぶんの生成上限 | — | ✅ |
+| `LM_MEMORY_DIGEST_CHUNKS` | `4` | 記憶が文脈に収まらないときの分割要約の最大チャンク数 | — | ✅ |
 | `IRODORI_TORCH_EXTRA` | `cu128` | Irodori-TTS インストール時の torch extra | ✅ | ✅ |
 | `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS のモデル実行デバイス。`auto`, `cuda`, `mps`, `cpu`, `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_PRECISION` | `auto` | モデル精度。`auto`, `fp32`, `bf16` | ✅ | ✅ |

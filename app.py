@@ -113,6 +113,39 @@ LM_SEGMENT_RESPONSE_FORMAT = {
 LM_COMPACT_CONTEXT_LIMIT = int(os.environ.get("LM_COMPACT_CONTEXT_LIMIT", "4200"))
 LM_RECENT_MESSAGE_COUNT = int(os.environ.get("LM_RECENT_MESSAGE_COUNT", "12"))
 LM_SUMMARY_CHAR_LIMIT = int(os.environ.get("LM_SUMMARY_CHAR_LIMIT", "1400"))
+
+# --- 出力枠の確保（プロンプト予算） -------------------------------------------
+# 空返答の真因は max_tokens ではなく「ロード済みモデルの文脈長」である。プロンプトが
+# 文脈をほぼ埋めていると、残り枠を思考(reasoning)が食い切って本文が 0 トークンになる。
+# 実測（gemma-4-12b / n_ctx 8192）: prompt 7980tok で max_tokens=-1（無制限）でも
+# finish_reason=length・content 空・reasoning_content だけ 800 字が返った。max_tokens を
+# 8192 にした quality_guard でも完全に同じ結果で、律速は常に文脈長側だった。
+# そこで毎ターン「思考＋本文ぶんの枠」を先に確保し、はみ出す分は記憶ブロック側を削る。
+# 文脈長の手動指定（0 なら LM Studio へ問い合わせて自動取得）。/api/v0 を持たない
+# 他の OpenAI 互換サーバではここで教える。
+LM_CONTEXT_LENGTH = int(os.environ.get("LM_CONTEXT_LENGTH", "0"))
+# 思考＋本文のために必ず空けておくトークン数。実測で gemma-4 の思考は 380tok 前後、
+# 返答本文（long）が 400tok 弱なので、既定 1280 はおよそ 2 倍の余裕。
+LM_OUTPUT_RESERVE_TOKENS = int(os.environ.get("LM_OUTPUT_RESERVE_TOKENS", "1280"))
+# 自動取得した文脈長のキャッシュ秒数（モデル入れ替え・再ロードへ追従するため短く持つ）。
+LM_CONTEXT_PROBE_TTL = float(os.environ.get("LM_CONTEXT_PROBE_TTL", "60"))
+_lm_context_cache: dict[str, tuple[float, int]] = {}
+# 記憶ブロックが枠に収まらないとき、LLM で「要点メモ」へ圧縮するか
+# （0 なら LLM を挟まず、行単位の間引きだけで収める）。
+LM_MEMORY_DIGEST = os.environ.get("LM_MEMORY_DIGEST", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+# 要点メモ 1 回ぶんの生成上限トークン。
+LM_MEMORY_DIGEST_MAXTOK = int(os.environ.get("LM_MEMORY_DIGEST_MAXTOK", "700"))
+# 記憶が文脈に収まらないときの分割要約（map-reduce）の最大チャンク数。
+# ここで打ち切った分はプロンプトへ載らないので、件数をログへ残す。
+LM_MEMORY_DIGEST_CHUNKS = max(1, int(os.environ.get("LM_MEMORY_DIGEST_CHUNKS", "4")))
+# 予算オーバーで記録を間引いたことを LLM へ伝える印（黙って消すと「無かった事」にされる）。
+_MEMORY_OMITTED_MARK = "…（文脈に収まらない記録は省略）…"
 WEB_SEARCH_TIMEOUT = int(os.environ.get("WEB_SEARCH_TIMEOUT", "12"))
 
 # --- TTS 読み仮名化（英字→カナ）設定 ---
@@ -2597,6 +2630,135 @@ def format_web_results(query: str, results: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def estimate_tokens(text: str) -> int:
+    """日本語混在テキストのトークン数をざっくり見積もる（安全側＝多めに寄せる）。
+
+    正確なトークナイザは OpenAI 互換 API 経由では引けないので概算にする。係数は
+    gemma-4 の prompt_tokens 実測から取った（tools/ ではなく手元計測）:
+      ・純日本語の散文        4000字 → 2616tok（0.65 tok/字）
+      ・年表風（日付＋番号）  6479字 → 4695tok
+      ・台帳風（日付＋番号）  4679字 → 3855tok（0.82 tok/字）
+      ・英語混在              2800字 → 1417tok
+    数字は 1 文字ずつ独立したトークンになりやすく、記憶ブロックは日付と番号だらけ
+    なので、数字を文字数と同じだけ数えるのが要点（ここを甘く見ると想定より実トークン
+    が膨らみ、文脈超過の 400 で弾かれる）。予算を外すとそのまま空返答になるため、
+    どの実測サンプルでも est ≧ actual になる係数を選んでいる。
+    """
+    body = str(text or "")
+    if not body:
+        return 0
+    digits = 0
+    other_ascii = 0
+    non_ascii = 0
+    for ch in body:
+        if ch.isdigit():
+            digits += 1
+        elif ord(ch) < 128:
+            other_ascii += 1
+        else:
+            non_ascii += 1
+    return int(digits * 1.05 + other_ascii * 0.5 + non_ascii * 0.85) + 1
+
+
+def estimate_messages_tokens(messages: list[dict[str, str]]) -> int:
+    """messages 配列ぶんの概算トークン。役割・区切りのテンプレート分を 1 通 8tok 見る。"""
+    return sum(estimate_tokens(str(item.get("content") or "")) + 8 for item in messages)
+
+
+def _model_id_matches(requested: str, listed: str) -> bool:
+    """モデル名の書き方の違い（リポジトリ付き・量子化サフィックス・.gguf）を吸収して比べる。
+
+    例: `lmstudio-community/gemma-4-12B-it-GGUF/gemma-4-12b-it-Q6_K.gguf` と
+    `gemma-4-12b-it@q6_k` を同一とみなす。
+    """
+
+    def norm(value: str) -> str:
+        text = str(value or "").strip().lower().rsplit("/", 1)[-1]
+        if text.endswith(".gguf"):
+            text = text[: -len(".gguf")]
+        text = text.split("@", 1)[0]
+        return re.sub(r"[^a-z0-9]", "", text)
+
+    left, right = norm(requested), norm(listed)
+    if not left or not right:
+        return False
+    return left == right or left.startswith(right) or right.startswith(left)
+
+
+def lm_loaded_context_length(model: str | None = None) -> int:
+    """いまロードされているモデルの文脈長（トークン）を返す。分からなければ 0。
+
+    LM Studio の REST API（``/api/v0/models``）だけが ``loaded_context_length`` を返す
+    （OpenAI 互換の ``/v1`` には無い）。ここが分かって初めて「思考＋本文ぶんを残す」
+    予算計算ができる。取得できないときは 0 を返し、呼び出し側は予算制御を行わず
+    従来動作のままにする（RAG と同じく「無くても動く」層に留める）。
+    """
+    if LM_CONTEXT_LENGTH > 0:
+        return LM_CONTEXT_LENGTH
+    key = str(model or DEFAULT_MODEL)
+    now = time.time()
+    cached = _lm_context_cache.get(key)
+    if cached and now - cached[0] < LM_CONTEXT_PROBE_TTL:
+        return cached[1]
+    value = 0
+    try:
+        base = (
+            LM_STUDIO_URL[: -len("/v1")] if LM_STUDIO_URL.endswith("/v1") else LM_STUDIO_URL
+        )
+        with urllib.request.urlopen(f"{base}/api/v0/models", timeout=5) as res:
+            entries = json.loads(res.read().decode("utf-8")).get("data") or []
+        loaded = [
+            item
+            for item in entries
+            if str(item.get("state") or "") == "loaded"
+            and int(item.get("loaded_context_length") or 0) > 0
+        ]
+        for item in loaded:
+            if _model_id_matches(key, str(item.get("id") or "")):
+                value = int(item["loaded_context_length"])
+                break
+        # 名前が一致しなくても（リポジトリ+ファイル名指定など）ロード済みが分かれば
+        # そちらが使われる。複数ロード時は最小値を採って安全側へ。
+        if not value and loaded:
+            value = min(int(item["loaded_context_length"]) for item in loaded)
+    except Exception as exc:
+        print(f"[ctx] loaded context probe failed: {type(exc).__name__}: {exc}")
+        value = 0
+    _lm_context_cache[key] = (now, value)
+    if value:
+        print(f"[ctx] loaded context length = {value} tok (model={key})")
+    return value
+
+
+class LMContextOverflowError(RuntimeError):
+    """プロンプト自体が文脈長を超えて LM Studio に 400 で弾かれたときの例外。
+
+    構造化出力の非対応 400 と区別するために独立した型にしている（混ぜると
+    ``_lm_structured_output_unsupported`` を誤って立ててしまう）。
+    """
+
+
+def _read_http_error(err: urllib.error.HTTPError) -> str:
+    with contextlib.suppress(Exception):
+        return err.read().decode("utf-8", "replace")
+    return ""
+
+
+def _looks_like_context_overflow(detail: str) -> bool:
+    text = str(detail or "").lower()
+    return any(
+        mark in text
+        for mark in ("exceed_context_size", "context size", "context length", "n_ctx")
+    )
+
+
+def _choice_content(data: dict) -> str:
+    try:
+        return str(data["choices"][0]["message"].get("content") or "")
+    except Exception:
+        return ""
+
+
 def _use_structured_output(segmented_mode: bool) -> bool:
     """このリクエストで response_format(json_schema) を付けるか判定する。
 
@@ -2616,6 +2778,8 @@ def _post_lmstudio_chat(payload: dict, use_structured: bool) -> dict:
     ``use_structured`` が True のときだけ response_format(json_schema) を付ける。
     サーバ/モデルが response_format を受け付けず HTTP 4xx を返したら、response_format を
     外して 1 度だけ再送し、以後 auto では付けないようプロセス内に記録する（3層フォールバックの2層目）。
+    プロンプトが文脈長を超えた 400 は response_format とは無関係なので
+    LMContextOverflowError として区別する（混ぜると構造化出力が以後ずっと外れてしまう）。
     """
     global _lm_structured_output_unsupported
 
@@ -2626,8 +2790,15 @@ def _post_lmstudio_chat(payload: dict, use_structured: bool) -> dict:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=LM_STUDIO_TIMEOUT) as res:
-            return json.loads(res.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=LM_STUDIO_TIMEOUT) as res:
+                return json.loads(res.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            detail = _read_http_error(err)
+            print(f"[lm] http {err.code}: {compact_text(detail, 300)}")
+            if err.code == 400 and _looks_like_context_overflow(detail):
+                raise LMContextOverflowError(compact_text(detail, 300)) from err
+            raise
 
     if not use_structured:
         return _send(payload)
@@ -3452,7 +3623,230 @@ def _request_lmstudio_content(
         body["max_tokens"] = LM_QUALITY_GUARD_MAX_TOKENS
     else:  # "original"
         body["max_tokens"] = base_max_tokens
-    return _post_lmstudio_chat(body, _use_structured_output(segmented_mode))
+    data = _post_lmstudio_chat(body, _use_structured_output(segmented_mode))
+    if _choice_content(data).strip():
+        return data
+    # ここから空返答の救済。典型は「文脈の残り枠を思考が食い切った」ケースで、
+    # max_tokens をいくら緩めても直らない（残り枠は文脈長で決まる）。
+    _log_empty_reply(data, mode)
+    # 1) 思考を止めて撮り直す。残り枠が数百トークンでも本文なら出せる
+    #    （実測: 同じプロンプトで reasoning 209tok→0tok、本文 0字→53字）。
+    with contextlib.suppress(Exception):
+        retry = _request_lmstudio_content(
+            payload, segmented_mode, auto_emoji, base_max_tokens, "prefill"
+        )
+        if _choice_content(retry).strip():
+            print("[lm] empty content -> prefill retry succeeded")
+            return retry
+    # 2) 最後の保険。打ち切られた思考の中に本文が書かれていることがあるので拾う。
+    salvaged = _salvage_from_reasoning(data, segmented_mode or auto_emoji)
+    if salvaged:
+        print("[lm] empty content -> salvaged text from reasoning_content")
+        data["choices"][0]["message"]["content"] = salvaged
+    return data
+
+
+def _log_empty_reply(data: dict, mode: str) -> None:
+    """空返答の切り分け材料（打ち切り理由・実トークン数）をサーバログへ残す。"""
+    try:
+        choice = data["choices"][0]
+    except Exception:
+        choice = {}
+    usage = data.get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
+    print(
+        "[lm] empty assistant content: "
+        f"mode={mode} finish={choice.get('finish_reason')} "
+        f"prompt={usage.get('prompt_tokens')} completion={usage.get('completion_tokens')} "
+        f"reasoning={details.get('reasoning_tokens')} "
+        f"reasoning_chars={len(str((choice.get('message') or {}).get('reasoning_content') or ''))}"
+    )
+
+
+def _salvage_from_reasoning(data: dict, expect_json: bool) -> str:
+    """打ち切られた思考（reasoning_content）から、読み上げ可能な本文だけを拾う。
+
+    思考には「ユーザーは挨拶している」等のメタな独白が混ざるので、そのまま TTS へ
+    渡すと事故になる。拾うのは (1) JSON の ``"text"`` フィールド、(2) ``</think>``
+    より後ろの本文だけに限り、確信が持てなければ何も返さない。
+    """
+    try:
+        reasoning = str(data["choices"][0]["message"].get("reasoning_content") or "")
+    except Exception:
+        return ""
+    if not reasoning.strip():
+        return ""
+    if expect_json:
+        parts: list[str] = []
+        for match in re.finditer(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)"', reasoning):
+            with contextlib.suppress(Exception):
+                value = str(json.loads(f'"{match.group(1)}"')).strip()
+                if value:
+                    parts.append(value)
+        if parts:
+            return " ".join(parts)
+    if "</think>" in reasoning:
+        return reasoning.rsplit("</think>", 1)[-1].strip()
+    return ""
+
+
+def _trim_block_middle(block: str, budget_tokens: int) -> str:
+    """記憶ブロックを行単位で「中央から」間引き、予算内へ収める。
+
+    先頭と末尾を残すのは、年表が古い順に並んでおり『一番最初』は先頭・『最近』は
+    末尾にあるためで、どちら側を落としても request_lmstudio が与える読み方の約束
+    （先頭が最古／末尾が最新）が崩れる。省略したことは印を残して伝える。
+    """
+    lines = str(block or "").splitlines()
+    if budget_tokens <= 0 or not lines:
+        return ""
+    used = estimate_tokens(_MEMORY_OMITTED_MARK)
+    head: list[str] = []
+    tail: list[str] = []
+    low, high = 0, len(lines) - 1
+    take_head = True
+    while low <= high:
+        index = low if take_head else high
+        cost = estimate_tokens(lines[index]) + 1
+        if used + cost > budget_tokens:
+            break
+        if take_head:
+            head.append(lines[index])
+            low += 1
+        else:
+            tail.append(lines[index])
+            high -= 1
+        used += cost
+        take_head = not take_head
+    if low > high:
+        return "\n".join(head + list(reversed(tail)))
+    return "\n".join(head + [_MEMORY_OMITTED_MARK] + list(reversed(tail)))
+
+
+def _split_block_for_digest(block: str, room_tokens: int) -> list[str]:
+    """記憶ブロックを、1 回の要約リクエストに収まる大きさへ行単位で切り分ける。"""
+    chunks: list[str] = []
+    current: list[str] = []
+    used = 0
+    for line in str(block or "").splitlines():
+        cost = estimate_tokens(line) + 1
+        if current and used + cost > room_tokens:
+            chunks.append("\n".join(current))
+            current, used = [], 0
+        current.append(line)
+        used += cost
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def digest_memory_block(
+    memory_block: str,
+    *,
+    question: str,
+    budget_tokens: int,
+    context_length: int,
+    model: str | None,
+    enum_mode: bool,
+) -> str:
+    """想起テキストを別呼び出しで「要点メモ」へ圧縮する（本体プロンプトの枠を空ける）。
+
+    生の想起テキスト（年表＋台帳＋読み方指示で数千字）を本体会話へ丸ごと渡すと、
+    思考ぶんの枠が残らず空返答になる。そこで**枠に収まらないときだけ**記憶を読む
+    LLM 呼び出しを 1 回挟み、本体には要点だけを渡す。記憶自体が 1 リクエストに
+    収まらない場合は分割して要約し、連結する（map-reduce）。
+
+    列挙質問では「圧縮」が網羅性を壊す（要約は主なものだけに絞る力が働く）ので、
+    件数は減らさず 1 件 1 行へ短縮させる。失敗・空なら "" を返し、呼び出し側は
+    機械的な間引きへフォールバックする。
+    """
+    block = str(memory_block or "").strip()
+    if not block or budget_tokens <= 0 or context_length <= 0:
+        return ""
+    enum_rule = (
+        "・ユーザーは列挙・網羅を求めている。**項目を絶対に減らさず**、"
+        "1 件 1 行で全部書き出すこと（各行は短くする）。\n"
+        if enum_mode
+        else "・質問に関係しない記録は落として構わない。\n"
+    )
+    system = (
+        "あなたは会話ログの要約器です。以下の過去ログ抜粋から、質問に答えるために"
+        "必要な事実だけを箇条書きで書き出してください。\n"
+        "・1 行 1 件、行頭は「- 」。各行 40 字以内。\n"
+        "・**誰が誰にしたのか（主体・向き）を必ず保つ**こと。入れ替えは重大な誤りです。\n"
+        "・日付・時期が書かれている記録は、その表記のまま行末に残す。\n"
+        "・まだしていない予定・約束・願望は行末に「（予定）」と付ける。\n"
+        "・抜粋に無いことは書かない（推測・補完をしない）。\n"
+        f"{enum_rule}"
+        "・前置き・見出し・説明・思考は出さず、箇条書きだけを返す。/no_think"
+    )
+    max_tokens = max(160, min(LM_MEMORY_DIGEST_MAXTOK, budget_tokens))
+    overhead = estimate_tokens(system) + estimate_tokens(question) + 64
+    # チャンクは概算のズレを一番受けやすい（弾かれると 1 リクエスト丸ごと無駄）ので、
+    # 残り枠の 85% までしか詰めない。
+    room = int((context_length - LM_OUTPUT_RESERVE_TOKENS - overhead - max_tokens) * 0.85)
+    chunks = _split_block_for_digest(block, room) if room > 400 else [block]
+    if len(chunks) > LM_MEMORY_DIGEST_CHUNKS:
+        print(
+            f"[digest] {len(chunks)} chunks -> first {LM_MEMORY_DIGEST_CHUNKS} only "
+            f"({len(chunks) - LM_MEMORY_DIGEST_CHUNKS} chunks dropped)"
+        )
+        chunks = chunks[:LM_MEMORY_DIGEST_CHUNKS]
+
+    def ask(source: str, depth: int = 0) -> str:
+        payload = {
+            "model": model or DEFAULT_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": f"質問:\n{question}\n\n過去ログ抜粋:\n{source}\n\n箇条書き:",
+                },
+            ],
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        # 要約側は思考させない（prefill）。ここで思考させると本体と同じ枠不足を招くうえ、
+        # 要点メモに思考の独白が混ざる。プリフィルは HTTP 400 時の従来仕様フォールバック付き。
+        try:
+            data = _request_lmstudio_content(payload, False, False, max_tokens, "prefill")
+        except LMContextOverflowError:
+            # 概算より実トークンが多くて弾かれた。黙って記録を捨てないよう、半分に
+            # 割って撮り直す（記憶ブロックは日付・番号の密度で実トークンが揺れる）。
+            lines = source.splitlines()
+            if depth >= 2 or len(lines) < 4:
+                print(f"[digest] chunk still too large at depth {depth} -> dropped")
+                return ""
+            middle = len(lines) // 2
+            print(f"[digest] chunk too large -> split in half (depth {depth + 1})")
+            halves = [
+                ask("\n".join(lines[:middle]), depth + 1),
+                ask("\n".join(lines[middle:]), depth + 1),
+            ]
+            return "\n".join(text for text in halves if text)
+        except Exception as exc:
+            print(f"[digest] failed: {type(exc).__name__}: {exc}")
+            return ""
+        text = _choice_content(data).strip()
+        # 箇条書き以外（前置き・思考の残り）が混ざったら、行頭「-」の行だけ拾う。
+        bullets = [line.strip() for line in text.splitlines() if line.strip().startswith(("-", "・"))]
+        return "\n".join(bullets) if bullets else text
+
+    parts = [text for text in (ask(chunk) for chunk in chunks) if text]
+    digest = "\n".join(parts).strip()
+    if not digest:
+        return ""
+    # 連結してもまだ枠に収まらないなら、要約の要約を 1 回だけ試す（reduce 段）。
+    if estimate_tokens(digest) > budget_tokens and len(parts) > 1:
+        reduced = ask(digest)
+        if reduced:
+            digest = reduced
+    print(
+        f"[digest] memory block {estimate_tokens(block)}tok -> "
+        f"{estimate_tokens(digest)}tok (budget={budget_tokens}, chunks={len(parts)})"
+    )
+    return digest
 
 
 def request_lmstudio(
@@ -3469,6 +3863,7 @@ def request_lmstudio(
     generation_mode: str = DEFAULT_LM_GENERATION_MODE,
     memory_block: str = "",
     memory_mode: str = "",
+    memory_enum: bool = False,
 ) -> tuple[str, str, str, int, list[dict[str, str]]]:
     if generation_mode not in LM_GENERATION_MODES:
         generation_mode = DEFAULT_LM_GENERATION_MODE
@@ -3496,11 +3891,14 @@ def request_lmstudio(
     )
     # RAG で取り出した過去ログの差し込み枠。関係ある記憶だけ自然に織り込ませ、
     # 無関係な古い記憶は無視させる指示をセットで与える（人格・文脈の統一性維持）。
-    memory_instruction = ""
-    if str(memory_block or "").strip():
+    # 実際にどれを使うかは、下のプロンプト予算（思考＋本文ぶんの確保）で決める。
+    def build_memory_instruction(block: str) -> str:
+        block = str(block or "").strip()
+        if not block:
+            return ""
         memory_instruction = (
             "\n\n【参考：過去の二人の会話の記憶】\n"
-            f"{str(memory_block).strip()}\n"
+            f"{block}\n"
             "これは実際にあった二人の過去の会話の記録で、事実として扱ってよい参考情報です。"
             "各行の「ユーザー:」はユーザーの発言、「返答:」はあなた側の発言です"
             "（どちらが何をしたのかを取り違えないでください）。"
@@ -3545,6 +3943,36 @@ def request_lmstudio(
                 "列挙を求められたら一覧の項目を漏れなく挙げ、求められていなければ一覧を読み上げず、"
                 "会話の流れに合う分だけ自然に触れてください。"
             )
+        return memory_instruction
+
+    def build_digest_instruction(digest: str) -> str:
+        """要点メモ（digest_memory_block の出力）用の短い読み方指示。
+
+        生の想起テキスト向けの長い指示（年表の並び順・台帳の読み方）はメモには当て
+        はまらないうえ 1400 字近くあって枠を食う。メモ用は主客と予定の扱いだけ伝える。
+        """
+        digest = str(digest or "").strip()
+        if not digest:
+            return ""
+        return (
+            "\n\n【参考：過去の二人の会話の記憶（要点メモ）】\n"
+            f"{digest}\n"
+            "これは実際にあった二人の過去の会話から、いまの話題に関係する部分だけを"
+            "書き出したメモで、事実として扱ってよい参考情報です。"
+            "各行が**誰のした事なのか**を必ずその通りに扱ってください"
+            "（あなたがした事とユーザーがした事を絶対に入れ替えないこと）。"
+            "行末に『（予定）』とあるものは、まだ実際にはしていない予定・約束・願望です"
+            "（した事として語らないでください）。"
+            "「記憶によると」等のメタ発言はせず、いつも通り自然に一人の発言として"
+            "返してください。関係がありそうなら自然に活かし、関係がなければ触れないこと。"
+            + (
+                "ユーザーは列挙・網羅を求めているので、メモの項目を漏れなく"
+                "（重複は1つにまとめて）挙げてください。"
+                if memory_enum
+                else ""
+            )
+        )
+
     # 感情の変化ごとにセグメント分割させる新モード。台詞禁止モード時は挙動維持のため
     # 従来の「返答全体で絵文字1つ」を使う。
     segmented_mode = auto_emoji and not no_dialogue
@@ -3587,47 +4015,108 @@ def request_lmstudio(
             f"{build_emoji_choice_prompt()}\n"
             '必ずJSONだけで返してください: {"text":"返答本文","emoji":"絵文字または空文字"}'
         )
+
+    def system_content(memory_part: str) -> str:
+        return (
+            "あなたは日本語で自然に返す会話相手です。\n"
+            f"いま話すキャラクターは「{speaker}」です。\n"
+            f"{character_prompt.strip()}\n"
+            f"{address_instruction}\n"
+            f"{no_dialogue_instruction}\n"
+            f"{two_only_instruction}"
+            f"{memory_part}\n"
+            f"{length_instruction}"
+            "思考過程は出さず、最終回答だけを出してください。/no_think"
+            f"{emoji_instruction}"
+        )
+
+    # --- プロンプト予算: 思考＋本文ぶんの枠を先に確保する ---
+    # ここを守らないと、プロンプトが文脈長をほぼ埋めて思考が残り枠を食い切り、
+    # 本文 0 トークン（空返答）になる。予算からはみ出すのは実測上ほぼ記憶ブロック
+    # （年表＋台帳で数千字）だけなので、削るのもそこに限る。
+    memory_block = str(memory_block or "").strip()
+    memory_instruction = build_memory_instruction(memory_block)
+    context_length = lm_loaded_context_length(model) if memory_block else 0
+    if memory_block and context_length > 0:
+        fixed_tokens = estimate_tokens(system_content("")) + estimate_messages_tokens(messages)
+        budget = context_length - LM_OUTPUT_RESERVE_TOKENS - fixed_tokens
+        need = estimate_tokens(memory_instruction)
+        if need > budget:
+            print(
+                f"[ctx] memory {need}tok > budget {budget}tok "
+                f"(ctx={context_length} fixed={fixed_tokens} reserve={LM_OUTPUT_RESERVE_TOKENS})"
+            )
+            digest = ""
+            if LM_MEMORY_DIGEST and budget > 240:
+                # 記憶を読む LLM 呼び出しを 1 回だけ挟み、本体には要点メモだけ渡す。
+                # 指示文ぶんを差し引いた残りが、メモに使える枠。
+                digest = digest_memory_block(
+                    memory_block,
+                    question=next(
+                        (
+                            str(item.get("content") or "")
+                            for item in reversed(messages)
+                            if item.get("role") == "user"
+                        ),
+                        "",
+                    ),
+                    budget_tokens=max(120, budget - estimate_tokens(build_digest_instruction("x"))),
+                    context_length=context_length,
+                    model=model,
+                    enum_mode=memory_enum,
+                )
+            # 要約が使えたらメモ＋短い指示、使えなければ生ブロック＋従来の指示で組む。
+            use_digest = bool(digest)
+            build = build_digest_instruction if use_digest else build_memory_instruction
+            memory_body = digest if use_digest else memory_block
+            memory_instruction = build(memory_body)
+            if estimate_tokens(memory_instruction) > budget:
+                # それでも溢れるときは行単位で間引いて必ず枠へ収める（指示文ぶんを除いた残り）。
+                room = budget - (
+                    estimate_tokens(memory_instruction) - estimate_tokens(memory_body)
+                )
+                memory_instruction = build(_trim_block_middle(memory_body, room))
+                print(f"[ctx] memory trimmed to {estimate_tokens(memory_instruction)}tok")
     payload = {
         "model": model or DEFAULT_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "あなたは日本語で短く自然に返す会話相手です。"
-                    "あなたは画面左のキャラクター、リノンとして話します。"
-                    f"{character_prompt.strip()}\n"
-                    f"{length_instruction}"
-                    "思考過程は出さず、最終回答だけを出してください。 /no_think"
-                    f"{emoji_instruction}"
-                ),
-            },
+            {"role": "system", "content": system_content(memory_instruction)},
             *messages,
         ],
         "temperature": 0.7,
         "max_tokens": max_tokens,
         "stream": False,
     }
-    payload["messages"][0]["content"] = (
-        "あなたは日本語で自然に返す会話相手です。\n"
-        f"いま話すキャラクターは「{speaker}」です。\n"
-        f"{character_prompt.strip()}\n"
-        f"{address_instruction}\n"
-        f"{no_dialogue_instruction}\n"
-        f"{two_only_instruction}"
-        f"{memory_instruction}\n"
-        f"{length_instruction}"
-        "思考過程は出さず、最終回答だけを出してください。/no_think"
-        f"{emoji_instruction}"
-    )
-    data = _request_lmstudio_content(payload, segmented_mode, auto_emoji, max_tokens, generation_mode)
+    try:
+        data = _request_lmstudio_content(
+            payload, segmented_mode, auto_emoji, max_tokens, generation_mode
+        )
+    except LMContextOverflowError as exc:
+        # 概算が外れてプロンプトが文脈長を超えた場合。記憶なしでも返答は返したいので、
+        # 記憶ブロックを落として 1 度だけ撮り直す（記憶付きの沈黙より記憶なしの返答）。
+        if not memory_instruction:
+            raise
+        print(f"[ctx] prompt exceeded context -> retry without memory block ({exc})")
+        payload["messages"][0]["content"] = system_content("")
+        data = _request_lmstudio_content(
+            payload, segmented_mode, auto_emoji, max_tokens, generation_mode
+        )
     choice_message = data["choices"][0]["message"]
     content = str(choice_message.get("content") or "").strip()
     if not content:
-        # プリフィルでも枠拡大でも本文が取れなかった稀なケース。空文字を TTS へ渡さず、
-        # 見えるエラーで知らせる。
+        # プリフィル再試行でも思考からの救済でも本文が取れなかったケース。空文字を
+        # TTS へ渡さず、原因の切り分けに使える数値を添えて見えるエラーにする。
+        usage = data.get("usage") or {}
+        details = usage.get("completion_tokens_details") or {}
         raise RuntimeError(
-            "LM Studio returned empty assistant content. Try a non-reasoning model, "
-            "or add /no_think to the prompt/model preset."
+            "LM Studio returned empty assistant content "
+            f"(finish={data['choices'][0].get('finish_reason')}, "
+            f"prompt={usage.get('prompt_tokens')}tok, "
+            f"completion={usage.get('completion_tokens')}tok, "
+            f"reasoning={details.get('reasoning_tokens')}tok, "
+            f"n_ctx={context_length or lm_loaded_context_length(model) or 'unknown'}). "
+            "思考が残り枠を食い切った可能性が高いです。LM Studio のロード設定で"
+            "Context Length を増やすか、LM_OUTPUT_RESERVE_TOKENS を上げてください。"
         )
     allowed_emojis = {item["emoji"] for item in load_emoji_items()}
     segments: list[dict[str, str]] = []
@@ -4920,6 +5409,9 @@ class Handler(BaseHTTPRequestHandler):
             # 失敗時・ヒット0件時は memory_block を空にして従来動作へフォールバックする。
             memory_block = ""
             memory_mode = ""
+            # 列挙・網羅の質問かどうか。要約で枠を空ける際に「件数を減らさない」よう
+            # 指示を変える必要があるので、request_lmstudio まで持っていく。
+            memory_enum = False
             if rag_memory is not None:
                 try:
                     # 生発話は会話的な雑音（挨拶・枕詞）が多く意味検索の精度が落ちるため、
@@ -4991,6 +5483,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     memory_block = recall_result["block"]
                     memory_mode = recall_result["mode"]
+                    memory_enum = bool(recall_intent.get("enum"))
                     # 想起が「どのチャネルから何件を」差し込んだかを可視化（想起漏れ・
                     # 誤想起の切り分け用）。実発話が曖昧（「作った料理」＝誰が作った？）だと
                     # 別の記憶を拾って回答がすり替わるため、件数と内訳を残す。
@@ -5010,6 +5503,7 @@ class Handler(BaseHTTPRequestHandler):
                     print(f"[rag] recall failed: {type(exc).__name__}: {exc}")
                     memory_block = ""
                     memory_mode = ""
+                    memory_enum = False
             reply, model_used, llm_emoji, chunk_limit, segments = request_lmstudio(
                 messages,
                 model,
@@ -5024,6 +5518,7 @@ class Handler(BaseHTTPRequestHandler):
                 generation_mode=generation_mode,
                 memory_block=memory_block,
                 memory_mode=memory_mode,
+                memory_enum=memory_enum,
             )
             # 合成部分（感情セグメント→TTS→結合）は /api/regenerate と共通の関数へ委譲する。
             render = render_reply_audio(
