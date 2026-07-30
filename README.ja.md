@@ -59,31 +59,71 @@ Rinon Voice Lab は、LM Studio のローカルLLMと Irodori-TTS をつない�
 - structured output（json_schema）に対応し、失敗時は安全にフォールバック
 - assistant プレフィルで reasoning を抑制し、空応答を回避
 - 生成モード設定を追加（prefill / original / quality_guard / unlimited）
-- 推論サーバの KV キャッシュを毎ターン解放し、VRAM を会話前の水準へ巻き戻す（下記）
+- ターン終わりに VRAM を掃除し、会話前の水準へ巻き戻す（下記）
 
-#### 推論サーバの VRAM を毎ターン巻き戻す
+#### ターン終わりに VRAM を巻き戻す
 
-LM Studio / llama-server はリクエストごとに「スロット」（＝1 本のコンテキスト）を使い、
-応答後もプロンプトの KV キャッシュを VRAM に載せたまま抱えます。さらに**同時リクエストが
-来ると並列用のスロットを追加確保し、空いても手放しません**。返答を返したあとに走る RAG 処理
-（検索クエリの書き換え・事実台帳の抽出）はバックグラウンドスレッドから飛ぶため、次の発言の
-本文生成と重なりやすく、実測で 10.8GB → 12.4GB へ増えたまま戻らない状態になりました。
+GPU を掴んでいるのは **2 プロセス**あります。どちらが抱えているかを取り違えると、効かない
+対策を足すことになります。そのため掃除のたびに内訳をログへ残します。
 
-対策は 3 段構えで、いずれも「サーバが非対応なら黙って諦める」層に留めています。
+**A) 推論サーバ（LM Studio / llama-server, 別プロセス）**
+リクエストごとに「スロット」（＝1 本のコンテキスト）を使い、応答後もプロンプトの KV
+キャッシュを載せたまま抱えます。さらに**同時リクエストが来ると並列用のスロットを追加確保し、
+空いても手放しません**。返答後に走る RAG 処理（検索クエリの書き換え・事実台帳の抽出）は
+バックグラウンドスレッドから飛ぶため、次の発言の本文生成と重なりやすいです。
+ただし llama.cpp は KV バッファをモデルロード時に `n_ctx` ぶん確保しきるため、
+**`erase` で戻るのは「どこまでキャッシュ済みか」の帳簿だけで、VRAM のバイト数は減りません**
+（実測: `erase` 成功後も 12.6GB のまま）。ここで効くのは「そもそも 2 本目のスロットを
+確保させない」直列化の方です。
+
+**B) Irodori-TTS（このプロセス内, `IRODORI_MODEL_DEVICE=auto` なら cuda）**
+torch のキャッシュアロケータは解放済みブロックをドライバへ返さず抱え続けます。文の長さごとに
+違うサイズのブロックが溜まるため、返答を合成するほど増えて戻りません。`empty_cache()` で
+明示的に返させます。**こちらは実際に VRAM が減ります。**
+
+対策は 4 段構えで、いずれも「非対応なら黙って諦める」層に留めています。
 
 1. **直列化**（`LM_SERIALIZE_REQUESTS=1`）… 補助生成が本文生成へ割り込まないようにし、
-   そもそも 2 本目のスロットを確保させない。居残り VRAM の主因はここ。
+   そもそも 2 本目のスロットを確保させない。サーバ側の居残りに効くのは実質これだけ。
 2. **キャッシュ無効化**（`LM_CACHE_PROMPT=aux`）… 補助生成のリクエストへ
    `cache_prompt=false` を付け、プロンプト KV を残させない。補助生成のプロンプトは毎回
    中身が違って再利用が効かないうえ、載ると返答本文が使いたい履歴の接頭辞を追い出します。
    サーバが未知フィールドを 400 で弾いたら自動で外して再送し、以後は付けません。
-3. **明示解放**（`LM_KV_CACHE_RELEASE=idle`）… リクエストが途切れて
-   `LM_KV_CACHE_RELEASE_DELAY` 秒静まったら、`POST /slots/{id}?action=erase` で全スロットの
-   KV キャッシュを捨てさせる。llama-server は `/slots` を有効にしておく必要があります
-   （この API を持たないサーバでは 1 度試して以後黙り、1 と 2 だけが効きます）。
+3. **サーバ側の明示解放**（`LM_KV_CACHE_RELEASE=idle`）… LM リクエストと TTS 合成が
+   途切れて `LM_KV_CACHE_RELEASE_DELAY` 秒静まったら、`POST /slots/{id}?action=erase` で
+   全スロットの KV キャッシュを捨てさせる。llama-server は `/slots` を有効にしておく必要が
+   あります（この API を持たないサーバでは 1 度試して以後黙ります）。上記のとおり
+   バイト数の巻き戻りは期待できません。
+4. **自プロセスの解放**（`VRAM_RELEASE_TORCH=1`）… 同じ掃除のタイミングで `gc.collect()` →
+   `torch.cuda.empty_cache()` を呼び、TTS が抱えた CUDA キャッシュをドライバへ返します。
+   合成の真っ最中は `Irodori_lock` が空いていないので触りません（これから使い回すブロックを
+   奪わないため）。TTS をリモートへ出す構成や CPU 実行では自動的に no-op になります。
 
-解放したターンの次の返答はプロンプトを再評価するぶんだけ待ちが増えます。速度優先なら
-`LM_KV_CACHE_RELEASE_DELAY` を伸ばす（連投中はキャッシュを温存）か `off` にしてください。
+##### 切り分け方（ログの読み方）
+
+`VRAM_MEMORY_LOG=1`（既定）で、掃除の前後に次の 1 行が出ます。
+
+```
+[vram] before release (idle): total=11868/12282MiB  self-torch reserved=2048MiB allocated=400MiB
+[vram] torch cache released: 1536MiB (reserved 2048 -> 512MiB)
+[lm] KV cache released: 1 slot(s) (idle)
+[vram] after  release (idle): total=10310/12282MiB  self-torch reserved=512MiB allocated=400MiB
+```
+
+- `self-torch reserved` が減って `total` も減った → 犯人は **TTS（このプロセス）**。これで解決。
+- `self-torch reserved` が小さいのに `total` が大きい → 犯人は **推論サーバ側**。`erase` では
+  戻らないので、サーバの起動設定（並列リクエスト数・文脈長・KV キャッシュ量子化など）で
+  削るか、モデルをアンロードするしかありません。
+
+Windows(WDDM) の nvidia-smi はプロセス別の使用量を報告しない（GeForce では
+`--query-compute-apps` が空で返る）ため、自プロセスぶんは torch から直接読んでいます。
+
+##### 速度とのトレードオフ
+
+サーバ側を解放したターンの次の返答は、プロンプトを再評価するぶんだけ待ちが増えます。
+速度優先なら `LM_KV_CACHE_RELEASE_DELAY` を伸ばす（連投中はキャッシュを温存）か
+`LM_KV_CACHE_RELEASE=off` にしてください。`VRAM_RELEASE_TORCH` 側は次の合成で確保し直す
+ぶんだけ（数十ミリ秒程度）増えます。
 
 ### 5. 分割音声の1本化
 - Irodori-TTS が分割生成した音声を1つの WAV に結合
@@ -366,6 +406,8 @@ Irodori-TTS の依存関係は次のどちらかで入れてください。
 | `LM_KV_CACHE_RELEASE` | `idle` | KV キャッシュの明示解放。`idle`＝リクエストが途切れたら / `each`＝毎回 / `off`＝しない | — | ✅ |
 | `LM_KV_CACHE_RELEASE_DELAY` | `2` | `idle` で解放するまでの待ち秒数。伸ばすと連投中はキャッシュを温存する | — | ✅ |
 | `LM_KV_CACHE_RELEASE_TIMEOUT` | `5` | 解放 API の待ち時間（秒） | — | ✅ |
+| `VRAM_RELEASE_TORCH` | `1` | 掃除時に自プロセス（Irodori-TTS）の torch CUDA キャッシュも `empty_cache()` で返す | — | ✅ |
+| `VRAM_MEMORY_LOG` | `1` | 掃除の前後に GPU 使用量の内訳（全体＋自プロセスの torch 保持量）をログへ出す | — | ✅ |
 | `IRODORI_TORCH_EXTRA` | `cu128` | Irodori-TTS インストール時の torch extra | ✅ | ✅ |
 | `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS のモデル実行デバイス。`auto`, `cuda`, `mps`, `cpu`, `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_PRECISION` | `auto` | モデル精度。`auto`, `fp32`, `bf16` | ✅ | ✅ |

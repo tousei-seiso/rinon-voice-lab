@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import gc
 import json
 import mimetypes
 import os
@@ -71,16 +72,25 @@ LM_STRUCTURED_OUTPUT = os.environ.get("LM_STRUCTURED_OUTPUT", "auto").strip().lo
 # 実行中にサーバが response_format を拒否したら True にし、auto では以後付けない（プロセス内メモ）。
 _lm_structured_output_unsupported = False
 
-# --- 推論サーバの KV キャッシュ解放（毎ターン VRAM を巻き戻す） -----------------
-# LM Studio / llama-server はリクエストごとに「スロット」（＝1 本のコンテキスト）を
-# 使い、応答を返した後もプロンプトの KV キャッシュを VRAM に載せたまま保持する。
-# さらに同時リクエストが来ると並列用のスロットを追加確保し、空いても解放しない。
-# 実測: 1 往復の会話は 10.8GB だが、返答後に走る RAG 処理（クエリ書き換え・事実抽出）
-# が本文生成と重なった直後から 12.4GB に増え、そのまま戻らなかった。
-# 対策は 3 段。いずれも「無くても動く」層に留め、サーバが非対応なら黙って諦める。
+# --- ターン終わりの VRAM 巻き戻し ---------------------------------------------
+# GPU を掴むのは 2 プロセスある。どちらが抱えているかを取り違えると効かない対策を
+# 足すことになるので、掃除のたびに nvidia-smi でプロセス別の内訳をログへ残す。
+#   A) 推論サーバ（LM Studio / llama-server, 別プロセス）
+#      リクエストごとに「スロット」（＝1 本のコンテキスト）を使い、応答後もプロンプトの
+#      KV キャッシュを載せたまま保持する。さらに同時リクエストが来ると並列用のスロットを
+#      追加確保し、空いても解放しない。ただし llama.cpp は KV バッファをモデルロード時に
+#      n_ctx ぶん確保しきるので、erase で戻るのは「どこまでキャッシュ済みか」の帳簿だけで、
+#      VRAM のバイト数は減らない（実測: erase 成功後も 12.6GB のまま）。
+#      効くのは「そもそも 2 本目のスロットを確保させない」直列化の方。
+#   B) Irodori-TTS（このプロセス内, IRODORI_MODEL_DEVICE=auto なら cuda）
+#      torch のキャッシュアロケータは解放済みブロックをドライバへ返さず抱え続ける。
+#      文の長さごとに違うサイズのブロックが溜まるため、返答を合成するほど増えて戻らない。
+#      empty_cache() で明示的に返させる。こちらは実際に VRAM が減る。
+# 対策は 4 段。いずれも「無くても動く」層に留め、非対応なら黙って諦める。
 #   1) 直列化   : 補助生成が本文生成へ割り込まないようにし、スロットを増やさせない。
 #   2) リクエスト: cache_prompt=false を付け、プロンプト KV を残させない。
 #   3) 明示解放 : 全リクエストが捌けた時点で /slots?action=erase を叩いて捨てさせる。
+#   4) 自プロセス: TTS が抱えた torch の CUDA キャッシュを empty_cache() で返す。
 # LM Studio へ送るリクエストを 1 本ずつに直列化する（VRAM 目的。速度目的ではない）。
 # 事実抽出はバックグラウンドスレッドから飛ぶため、切ると本文生成と重なり得る。
 LM_SERIALIZE_REQUESTS = os.environ.get("LM_SERIALIZE_REQUESTS", "1").strip().lower() not in {
@@ -116,6 +126,25 @@ LM_KV_CACHE_RELEASE_TIMEOUT = float(os.environ.get("LM_KV_CACHE_RELEASE_TIMEOUT"
 LM_KV_CACHE_RELEASE_DELAY = float(os.environ.get("LM_KV_CACHE_RELEASE_DELAY", "2"))
 # /slots を持たないサーバでは 1 度試して以後黙る（毎ターン失敗ログを出さないため）。
 _lm_kv_release_unsupported = False
+# 自プロセス（Irodori-TTS）が抱えた torch の CUDA キャッシュを掃除ごとに返すか。
+VRAM_RELEASE_TORCH = os.environ.get("VRAM_RELEASE_TORCH", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+# 掃除の前後で nvidia-smi を叩き、プロセス別の GPU 使用量をログへ残すか。
+# 「どちらのプロセスが抱えているか」はこれを見ないと切り分けられないため既定 ON。
+VRAM_MEMORY_LOG = os.environ.get("VRAM_MEMORY_LOG", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+    "",
+}
+# nvidia-smi が無い環境（AMD/Apple/CPU 実行）では 1 度試して以後黙る。
+_vram_probe_unsupported = False
 # リクエストの直列化と「いま何本走っているか」の計数。RLock は同一スレッドからの
 # 入れ子（空返答のリトライ等）で自分を待たないようにするため。
 _lm_request_lock = threading.RLock()
@@ -2875,6 +2904,103 @@ def _lm_erase_slot(slot_id: int) -> bool:
         return False
 
 
+def _torch_vram_usage() -> str:
+    """自プロセスの torch が抱えている VRAM を返す。
+
+    Windows(WDDM) の nvidia-smi はプロセス別の使用量を報告しない（GeForce では
+    ``--query-compute-apps`` が空で返る）ため、切り分けの決め手はこちら。
+    ``reserved`` が torch のキャッシュアロケータが握っている総量で、``allocated``
+    は実際に使っているぶん。差分がそのまま「返せるはずの居残り」になる。
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return "self-torch=not-loaded"
+    try:
+        if not torch.cuda.is_available():
+            return "self-torch=no-cuda"
+        reserved = int(torch.cuda.memory_reserved() / 1024 / 1024)
+        allocated = int(torch.cuda.memory_allocated() / 1024 / 1024)
+        return f"self-torch reserved={reserved}MiB allocated={allocated}MiB"
+    except Exception as exc:
+        return f"self-torch=unavailable({type(exc).__name__})"
+
+
+def gpu_memory_snapshot() -> str:
+    """GPU の使用量を「全体＋自プロセスの torch ぶん」で 1 行にまとめる。
+
+    誰が VRAM を抱えているかはこれを見ないと分からない。実測で「推論サーバの KV
+    キャッシュを erase しても全体は減らない」ことが分かっているので、
+    ``全体`` と ``self-torch reserved`` の両方を並べて次のように読む。
+      ・掃除で self-torch reserved が減り全体も減る → 犯人は TTS(このプロセス)
+      ・self-torch reserved が小さいのに全体が大きい → 犯人は推論サーバ側。
+        erase では戻らないので、サーバの並列数/文脈長など起動設定で削るしかない
+    nvidia-smi が無い環境（AMD/Apple/CPU 実行）では 1 度試して以後全体値を諦める。
+    """
+    global _vram_probe_unsupported
+    if not VRAM_MEMORY_LOG:
+        return ""
+    mine = _torch_vram_usage()
+    if _vram_probe_unsupported:
+        return mine
+    try:
+        proc = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=True,
+        )
+        line = proc.stdout.strip().splitlines()[0]
+        used_mb, total_mb = (int(float(v.strip())) for v in line.split(",")[:2])
+    except Exception as exc:
+        _vram_probe_unsupported = True
+        print(f"[vram] nvidia-smi probe unavailable: {type(exc).__name__}: {exc}")
+        return mine
+    return f"total={used_mb}/{total_mb}MiB  {mine}"
+
+
+def release_torch_cuda_cache() -> int:
+    """自プロセスの torch が抱えた CUDA キャッシュをドライバへ返す。返した MiB を返す。
+
+    Irodori-TTS はこのプロセス内の GPU で走る（IRODORI_MODEL_DEVICE=auto なら cuda）。
+    torch のキャッシュアロケータは解放済みブロックを再利用のため抱え続けるので、
+    合成した文の長さぶんだけ VRAM が増えて戻らない。empty_cache() で明示的に返す。
+    torch が未ロード／CUDA 無しなら何もしない（TTS をリモートに出す構成でも安全）。
+    合成の真っ最中に呼ぶと、これから使い回すブロックまで返してしまうので、
+    Irodori_lock が空いているときだけ実行する。
+    """
+    if not VRAM_RELEASE_TORCH:
+        return 0
+    torch = sys.modules.get("torch")
+    if torch is None:  # まだ TTS を一度も動かしていない（＝抱えていない）
+        return 0
+    if not Irodori_lock.acquire(blocking=False):
+        return 0
+    try:
+        if not torch.cuda.is_available():
+            return 0
+        before = int(torch.cuda.memory_reserved() / 1024 / 1024)
+        # 参照が切れただけのテンソルを先に回収させないと、empty_cache は何も返せない。
+        gc.collect()
+        torch.cuda.empty_cache()
+        with contextlib.suppress(Exception):
+            torch.cuda.ipc_collect()
+        after = int(torch.cuda.memory_reserved() / 1024 / 1024)
+        freed = max(0, before - after)
+        if freed:
+            print(f"[vram] torch cache released: {freed}MiB (reserved {before} -> {after}MiB)")
+        return freed
+    except Exception as exc:
+        print(f"[vram] torch cache release failed: {type(exc).__name__}: {exc}")
+        return 0
+    finally:
+        Irodori_lock.release()
+
+
 def release_lm_kv_cache(reason: str = "") -> bool:
     """推論サーバが抱えたプロンプト KV キャッシュを明示的に解放させる。
 
@@ -2901,7 +3027,30 @@ def release_lm_kv_cache(reason: str = "") -> bool:
     return True
 
 
-def _cancel_lm_kv_release() -> None:
+def release_vram(reason: str = "") -> None:
+    """ターン終わりの掃除。自プロセスの torch キャッシュと推論サーバの KV を解放する。
+
+    前後で nvidia-smi のプロセス別内訳をログへ出す。減らないときにどちらのプロセスが
+    抱えているかを、これ 1 行で切り分けられるようにするため（推論サーバ側の KV バッファは
+    n_ctx ぶん確保しきりなので erase では減らない＝「other が減らない」なら対策は
+    サーバの起動設定側にある、という読み方をする）。
+    """
+    before = gpu_memory_snapshot()
+    if before:
+        print(f"[vram] before release ({reason or 'idle'}): {before}")
+    release_torch_cuda_cache()
+    release_lm_kv_cache(reason)
+    after = gpu_memory_snapshot()
+    if after:
+        print(f"[vram] after  release ({reason or 'idle'}): {after}")
+
+
+def _vram_sweep_enabled() -> bool:
+    """ターン終わりの掃除を予約する意味があるか（両方 off なら予約しない）。"""
+    return LM_KV_CACHE_RELEASE == "idle" or VRAM_RELEASE_TORCH
+
+
+def _cancel_vram_release() -> None:
     """予約済みの遅延解放を取り消す（新しいリクエストが始まったとき）。"""
     global _lm_release_timer
     with _lm_release_lock:
@@ -2910,21 +3059,23 @@ def _cancel_lm_kv_release() -> None:
             _lm_release_timer = None
 
 
-def _schedule_lm_kv_release() -> None:
+def _schedule_vram_release() -> None:
     """LM_KV_CACHE_RELEASE_DELAY 秒後に 1 回だけ解放するよう予約し直す。"""
     global _lm_release_timer
     with _lm_release_lock:
         if _lm_release_timer is not None:
             _lm_release_timer.cancel()
-        timer = threading.Timer(max(0.0, LM_KV_CACHE_RELEASE_DELAY), _deferred_lm_kv_release)
+        timer = threading.Timer(max(0.0, LM_KV_CACHE_RELEASE_DELAY), _deferred_vram_release)
         timer.daemon = True
         _lm_release_timer = timer
         timer.start()
 
 
-def _deferred_lm_kv_release() -> None:
-    """静まったあとに 1 度だけ KV キャッシュを解放する（タイマースレッドから呼ばれる）。
+def _deferred_vram_release() -> None:
+    """静まったあとに 1 度だけ VRAM を掃除する（タイマースレッドから呼ばれる）。
 
+    予約は LM リクエストと TTS 合成の両方の終わりから張られる。どちらが最後の GPU 仕事
+    だったかに関係なく「静まってから 1 回」にしたいので、予約は 1 本だけ持ち回す。
     掃除中に次のリクエストが割り込むと「使用中スロット」を erase しようとして断られる
     ので、直列化ロックを取ってから叩く。取れなければ既に次が走っているということなので
     何もしない（そのリクエストの終了時に改めて予約される）。
@@ -2936,7 +3087,7 @@ def _deferred_lm_kv_release() -> None:
         with _lm_inflight_lock:
             if _lm_inflight > 0:
                 return
-        release_lm_kv_cache("idle")
+        release_vram("idle")
         return
     if not _lm_request_lock.acquire(timeout=0.2):
         return
@@ -2944,7 +3095,7 @@ def _deferred_lm_kv_release() -> None:
         with _lm_inflight_lock:
             if _lm_inflight > 0:
                 return
-        release_lm_kv_cache("idle")
+        release_vram("idle")
     finally:
         _lm_request_lock.release()
 
@@ -2960,7 +3111,7 @@ def _lm_request_slot():
     間には TTS 合成ぶんの空白があり、即時だと 1 ターンで何度も掃除してしまう）。
     """
     global _lm_inflight
-    _cancel_lm_kv_release()
+    _cancel_vram_release()
     if LM_SERIALIZE_REQUESTS:
         _lm_request_lock.acquire()
     with _lm_inflight_lock:
@@ -2973,12 +3124,12 @@ def _lm_request_slot():
             idle = _lm_inflight <= 0
         try:
             if LM_KV_CACHE_RELEASE == "each":
-                release_lm_kv_cache("each")
+                release_vram("each")
         finally:
             if LM_SERIALIZE_REQUESTS:
                 _lm_request_lock.release()
-        if LM_KV_CACHE_RELEASE == "idle" and idle:
-            _schedule_lm_kv_release()
+        if idle and _vram_sweep_enabled():
+            _schedule_vram_release()
 
 
 def _disable_prompt_cache(aux: bool) -> bool:
@@ -4495,6 +4646,9 @@ def synthesize_sentence(
     seed: object = "",
 ) -> dict:
     module = ensure_irodori_module()
+    # 合成が始まる前に掃除の予約を取り消す（合成中に発火しても Irodori_lock を取れず
+    # 空振りするだけだが、予約を消費して掃除が 1 回遅れるのを避ける）。
+    _cancel_vram_release()
     # TTS へ渡す本文のみ英字→カナ化（保存・表示は原文のまま、絵文字=発声効果は変換しない）。
     styled_text = apply_emoji_style(english_to_kana_for_tts(text), emoji_style)
     voice_caption = str(caption or "").strip() or IRODORI_CAPTION
@@ -4545,6 +4699,11 @@ def synthesize_sentence(
             elapsed = time.perf_counter() - start
     finally:
         os.chdir(old_cwd)
+        # TTS はこのプロセス内の GPU で走り、torch が解放済みブロックを抱え続ける。
+        # 合成のたびに掃除を予約し直し、返答の全チャンクを出し終えて静まってから
+        # 1 回だけ empty_cache() させる（チャンクごとに返すと次の確保で待たされる）。
+        if _vram_sweep_enabled():
+            _schedule_vram_release()
 
     detail = str(result[-2])
     match = re.search(r"saved\[1\]:\s*(.+)", detail)

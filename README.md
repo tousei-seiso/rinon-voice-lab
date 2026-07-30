@@ -297,6 +297,8 @@ Useful environment variables:
 | `LM_KV_CACHE_RELEASE` | `idle` | Explicit KV-cache release: `idle` (once traffic settles), `each` (every request), or `off` | — | ✅ |
 | `LM_KV_CACHE_RELEASE_DELAY` | `2` | Seconds to wait before an `idle` release; raise it to keep the cache warm across quick turns | — | ✅ |
 | `LM_KV_CACHE_RELEASE_TIMEOUT` | `5` | Timeout for the release API (seconds) | — | ✅ |
+| `VRAM_RELEASE_TORCH` | `1` | Also hand this process's torch CUDA cache (Irodori-TTS) back via `empty_cache()` | — | ✅ |
+| `VRAM_MEMORY_LOG` | `1` | Log the GPU breakdown (total plus this process's torch reservation) around each sweep | — | ✅ |
 | `IRODORI_TORCH_EXTRA` | `cu128` | Installer torch extra: `cu128`, `cpu`, `rocm`, or `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS model device: `auto`, `cuda`, `mps`, `cpu`, or `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_PRECISION` | `auto` | Model precision: `auto`, `fp32`, or `bf16` | ✅ | ✅ |
