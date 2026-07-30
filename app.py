@@ -3115,6 +3115,8 @@ def rewrite_recall_queries(
             auto_emoji=False,
             base_max_tokens=rewrite_maxtok,
             mode=rewrite_mode,
+            # 数行のクエリを出すだけなので、思考ONモードでも枠は rewrite_maxtok で頭打ちにする。
+            cap_to_base_max_tokens=True,
         )
         content = str(data["choices"][0]["message"].get("content") or "").strip()
     except Exception:
@@ -3488,6 +3490,8 @@ def make_fact_llm(model: str | None = None, generation_mode: str = "") -> object
             auto_emoji=False,
             base_max_tokens=_FACT_EXTRACT_MAXTOK,
             mode=mode,
+            # 短い JSON 配列を返すだけの抽出器なので、思考ONモードでも枠は貸さない。
+            cap_to_base_max_tokens=True,
         )
         return str(data["choices"][0]["message"].get("content") or "")
 
@@ -3577,7 +3581,12 @@ def _thinking_prefill(segmented_mode: bool, auto_emoji: bool) -> tuple[str, str]
 
 
 def _request_lmstudio_content(
-    payload: dict, segmented_mode: bool, auto_emoji: bool, base_max_tokens: int, mode: str
+    payload: dict,
+    segmented_mode: bool,
+    auto_emoji: bool,
+    base_max_tokens: int,
+    mode: str,
+    cap_to_base_max_tokens: bool = False,
 ) -> dict:
     """生成モードに応じて LM Studio へチャットし、本文入りの data を返す。
 
@@ -3588,6 +3597,14 @@ def _request_lmstudio_content(
       quality_guard : プリフィル無し＋大きな上限 LM_QUALITY_GUARD_MAX_TOKENS（暴走はここで打ち切り）。
       unlimited     : プリフィル無し＋max_tokens=-1（上限なし。思考を必ず完走させる）。
     どのモードでも choices[0].message.content に本文が入った data を返す。
+
+    cap_to_base_max_tokens: 返答本文ではない補助生成（検索クエリ・事実抽出など）で使う。
+      quality_guard / unlimited は「返答の思考を絶対に途中で切らない」ための枠なので、
+      短い JSON や 1 行クエリを出すだけの呼び出しに同じ枠を与えると、モデルが枠いっぱい
+      まで書き続ける。実測では max_tokens=256 指定の事実抽出が quality_guard の 8192 に
+      上書きされ、2300 トークン超を生成して後処理だけで数分 GPU を占有していた。True の
+      間は呼び出し側が申告した base_max_tokens を上限として守る（枠不足で本文が空に
+      なった場合は、下の救済がプリフィルで撮り直すので黙って失敗はしない）。
     """
     if mode == "prefill":
         prefill_content, reattach = _thinking_prefill(segmented_mode, auto_emoji)
@@ -3617,7 +3634,10 @@ def _request_lmstudio_content(
         return _post_lmstudio_chat(body, _use_structured_output(segmented_mode))
 
     body = dict(payload)
-    if mode == "unlimited":
+    if cap_to_base_max_tokens:
+        # 補助生成は申告どおりの上限で頭打ちにする（quality_guard/unlimited の枠を貸さない）。
+        body["max_tokens"] = base_max_tokens
+    elif mode == "unlimited":
         body["max_tokens"] = -1
     elif mode == "quality_guard":
         body["max_tokens"] = LM_QUALITY_GUARD_MAX_TOKENS
