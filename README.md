@@ -332,6 +332,32 @@ Useful environment variables:
 | `RAG_LEDGER_LIVE_LLM` | `1` | Use the LLM for live extraction (`0` = rule-only, free) | — | ✅ |
 | `RAG_FACT_EXTRACT_MAXTOK` | `256` | Token cap for the fact-extraction LLM | — | ✅ |
 
+### Sharing one GPU with the inference server
+
+When the inference server and this app share a card, watch the *desktop* side too. On
+Windows, `dwm` keeps composition surfaces in dedicated VRAM and never shrinks them: with
+HDR on, each surface is FP16 (8 bytes/px), so one 4K surface costs 66 MiB and every open
+window adds more. Measured on an RTX 4070 (12282 MiB, two 3840×2160 displays, HDR on,
+4 days signed in): `llama-server` 6725 MiB + `dwm` 5464 MiB — the card was already full.
+
+Once the two exceed the card, saturating the GPU with inference makes WDDM evict `dwm`'s
+surfaces to system memory, and redrawing them over PCIe stalls screen updates and the mouse
+pointer. The tell is that the server log still shows a healthy `tg = ... t/s`: inference is
+fine, the *display* is starving. `nvidia-smi` will not show this on GeForce cards because it
+reports no per-process usage there — read the WDDM counters instead:
+
+```powershell
+# report the per-process breakdown only
+pwsh -File tools/flush_gpu_memory.ps1 -MeasureOnly
+
+# restart dwm to hand its VRAM back, without signing out or rebooting (elevated shell)
+pwsh -File tools/flush_gpu_memory.ps1
+```
+
+`winlogon` restarts `dwm` immediately, so the session and every open window survive; the
+screen just goes black for a few seconds. To separate them for good, drive the displays from
+the integrated GPU so the discrete card is left entirely to inference.
+
 ## Character Data
 
 Characters live under `Character\<character-id>\`.
