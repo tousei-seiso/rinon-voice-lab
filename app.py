@@ -48,7 +48,126 @@ CHARACTER_ROOT = APP_ROOT / "Character"
 DEFAULT_IRODORI_ROOT = (APP_ROOT.parent / "Irodori-TTS").resolve()
 IRODORI_ROOT = Path(os.environ.get("IRODORI_ROOT", str(DEFAULT_IRODORI_ROOT))).resolve()
 LM_STUDIO_URL = os.environ.get("LM_STUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/")
-DEFAULT_MODEL = os.environ.get("LM_STUDIO_MODEL", "gemma-4-12b-it")
+
+# --- 呼び出すモデルの決定 -----------------------------------------------------
+# モデル名は環境変数 LM_STUDIO_MODEL から取る。ただし**モデルを差し替えると名前以外も
+# 変わる**。gemma-4-12b-it@q6_k → google/gemma-4-12b-qat の入れ替えでは、思考タグが
+# <think>〜</think> から <|channel>thought〜<channel|> へ変わり、名前を替えただけでは
+# 思考の独白がそのまま読み上げられた。そのため動作を確かめた系列だけをカタログで受け付け、
+# 対象外の名前は使わずに LM_STUDIO_DEFAULT_MODEL → LM_FALLBACK_MODEL の順へ落とす。
+#
+# 新しいモデルを対象にするときの手順（名前を足すだけで済むとは限らない）:
+#   1) その系列が思考をどう囲むかを実際の出力で確かめる。未知の書式なら
+#      LM_THINKING_FORMATS へ書式を 1 つ足す。
+#   2) LM_MODEL_CATALOG へ系列を 1 エントリ足す。判定に使う語（require / exclude）と、
+#      1) の書式名（thinking）を**必ず対で**書く。書式を書き忘れると起動時に落ちる。
+#   3) 動かして次を確かめる。いずれも系列ごとに挙動が変わる箇所:
+#      ・思考が本文へ混ざらないか（混ざれば [lm] stripped thinking markup が出る）
+#      ・_thinking_prefill のプリフィルで思考を抑止できるか（テンプレートが末尾
+#        assistant を受け付けないモデルでは 400 になり従来仕様へ落ちる）
+#      ・response_format=json_schema を受け付けるか（LM_STRUCTURED_OUTPUT=auto なら
+#        拒否を検出して自動で外す）
+#      ・プロンプト末尾の /no_think のような合図が効くか（効かない系列では無害な文字列）
+# 試すだけなら LM_STUDIO_ALLOWED_MODELS にカンマ区切りで並べればコードは触らずに通せる。
+# ただしその場合、思考タグはカタログに載っている書式でしか落とせない。
+#
+# 思考タグの書式。名前を付けてここへ集め、カタログの "thinking" から参照する。
+LM_THINKING_FORMATS: dict[str, tuple[str, str]] = {
+    # <think> … </think>
+    "xml_think": (r"<think>", r"</think>"),
+    # <|channel>thought … <channel|>（表記揺れ: <|channel|> / thinking / analysis / <|/channel|>）
+    "channel": (
+        r"<\|?channel\|?>[ \t]*(?:thought|thinking|analysis|reasoning)",
+        r"<\|?/?channel\|?>",
+    ),
+}
+# 系列の判定は「名前に含まれる語」で行う。LM Studio は同じモデルを
+#   gemma-4-12b-it / gemma-4-12b-it@q6_k /
+#   lmstudio-community/gemma-4-12B-it-GGUF/gemma-4-12b-it-Q6_K.gguf
+# のどの書き方でも受け取るため、末尾のファイル名だけを見ると取り違える。とくに QAT の
+# ファイル名は gemma-4-12B-it-QAT-Q4_0.gguf で "it" と "qat" の両方を含むので、
+# 限定の強いエントリ（QAT）を先に置き、上から順に最初に当たったものを採る。
+LM_MODEL_CATALOG: tuple[dict[str, object], ...] = (
+    {
+        # Google 公式 QAT
+        "label": "gemma-4-12b-qat",
+        "require": ("gemma", "4", "12b", "qat"),
+        "thinking": ("channel",),
+    },
+    {
+        # 従来の instruction-tuned
+        "label": "gemma-4-12b-it",
+        "require": ("gemma", "4", "12b", "it"),
+        "exclude": ("qat",),
+        "thinking": ("xml_think",),
+    },
+)
+# カタログに無い名前を一時的に通したいとき用（カンマ区切り。部分一致ではなく語の完全一致）。
+LM_EXTRA_ALLOWED_MODELS = tuple(
+    name.strip().lower()
+    for name in os.environ.get("LM_STUDIO_ALLOWED_MODELS", "").split(",")
+    if name.strip()
+)
+# 最後の安全弁。環境変数が両方とも未設定／空／対象外でもここへ落ちる。
+LM_FALLBACK_MODEL = "gemma-4-12b-it@q6_k"
+
+
+def match_model_catalog(name: object) -> dict[str, object] | None:
+    """モデル名がカタログのどの系列かを返す。対象外なら None。
+
+    大文字小文字・前後の空白・リポジトリ名・量子化サフィックス・``.gguf`` の違いは
+    「語が含まれるか」で見るので自然に吸収される。
+    """
+    text = str(name or "").strip().lower()
+    if not text:
+        return None
+    for entry in LM_MODEL_CATALOG:
+        exclude = entry.get("exclude") or ()
+        if any(word in text for word in exclude):
+            continue
+        if all(word in text for word in entry["require"]):
+            return entry
+    if text in LM_EXTRA_ALLOWED_MODELS:
+        return {"label": "LM_STUDIO_ALLOWED_MODELS", "require": ()}
+    return None
+
+
+def resolve_lm_model(requested: object = None) -> str:
+    """LM Studio へ送るモデル名を決める。
+
+    ``requested`` → ``LM_STUDIO_MODEL`` → ``LM_STUDIO_DEFAULT_MODEL`` → ``LM_FALLBACK_MODEL``
+    の順に見て、カタログに当たった最初の名前を**申告された表記のまま**返す
+    （書き方を勝手に正規化しない。GGUF のフルパス指定はそれ自体が有効な指定なので、
+    こちらで短い名前へ丸めると別のロード済みモデルを指してしまう恐れがある）。
+    対象外の名前は使わず次の候補へ進み、どれを採ってどれを捨てたかは 1 行ログに残す
+    （起動スクリプトを入れ替えたとき、意図した系列で話せているかがここで分かる）。
+    """
+    candidates = (
+        ("requested", requested),
+        ("LM_STUDIO_MODEL", os.environ.get("LM_STUDIO_MODEL")),
+        ("LM_STUDIO_DEFAULT_MODEL", os.environ.get("LM_STUDIO_DEFAULT_MODEL")),
+    )
+    rejected: list[str] = []
+    for source, value in candidates:
+        name = str(value or "").strip()
+        if not name:
+            continue
+        entry = match_model_catalog(name)
+        if entry:
+            skipped = f" (not supported: {' / '.join(rejected)})" if rejected else ""
+            print(f"[lm] model: {source}='{name}' -> {entry['label']}{skipped}")
+            return name
+        rejected.append(f"{source}='{name}'")
+    detail = f"not supported: {' / '.join(rejected)}" if rejected else "no env value"
+    print(f"[lm] model: {detail} -> fallback '{LM_FALLBACK_MODEL}'")
+    return LM_FALLBACK_MODEL
+
+
+# 既定モデル（起動時に 1 度だけ解決する）。リクエスト body でモデルを明示されたときは
+# 画面のプルダウンで選ばれたロード済みモデルを尊重し、そちらをそのまま送る（従来どおり）。
+# 画面選択もカタログで縛りたくなったら、各 payload の `model or DEFAULT_MODEL` を
+# `resolve_lm_model(model)` に替えるだけでよい。
+DEFAULT_MODEL = resolve_lm_model()
 # ローカルRAG長期記憶レイヤー（fastembed + sqlite3, 完全CPU/VRAM0）。
 # 依存(fastembed/numpy)が未導入でも import は成功し、機能は自動フォールバックされる。
 try:
@@ -1987,6 +2106,8 @@ def environment_diagnostics() -> dict:
         "lmStudioUrl": LM_STUDIO_URL,
         "lmStudioReady": bool(lm_models),
         "models": lm_models,
+        # 環境変数から解決した既定モデル（画面のプルダウンの初期選択に使う）。
+        "preferredModel": DEFAULT_MODEL,
         "remoteLuviaEnabled": remote_luvia_enabled(),
         "remoteLuviaUrl": LUVIA_REMOTE_TTS_URL,
         "remoteLuviaHost": LUVIA_REMOTE_TTS_HOST,
@@ -3974,6 +4095,84 @@ def extract_facts_for_turn(
         return 0
 
 
+# --- 思考(reasoning)タグの除去 -------------------------------------------------
+# 思考をどう囲むかはモデル系列ごとに違う。書式を知っているサーバなら思考は
+# reasoning_content 側へ分離されて content には出ないが、未知の書式だと content へ
+# そのまま混ざる。混ざったまま TTS へ渡すと「ユーザーは挨拶している」のような独白を
+# 読み上げてしまうので、本文として使う前にここで落とす。
+# 書式そのものは LM_MODEL_CATALOG の "thinking" が指す LM_THINKING_FORMATS に置いてある
+# （モデルを足す人が「名前だけ足せば済む」と誤解しないよう、モデルと書式を同じ場所に並べる）。
+
+
+def _build_thinking_patterns() -> tuple[str, str]:
+    """カタログに載っている全系列の思考タグを OR で束ねた (開始, 終了) を返す。
+
+    どのモデルが答えたかはリクエスト単位でしか分からない（画面のプルダウンでカタログ外の
+    モデルも選べる）ので、書式はモデルで切り替えず、既知の書式すべての和で判定する。
+    書式名の綴り違いはここで KeyError にして起動を止める。黙って素通りさせると
+    「思考が本文に混ざる」という追いにくい形で表に出るため、編集した直後に気付ける方を採る。
+    """
+    names: list[str] = []
+    for entry in LM_MODEL_CATALOG:
+        for name in entry.get("thinking") or ():
+            if name not in names:
+                names.append(name)
+    opens = "|".join(LM_THINKING_FORMATS[name][0] for name in names)
+    closes = "|".join(LM_THINKING_FORMATS[name][1] for name in names)
+    return f"(?:{opens})", f"(?:{closes})"
+
+
+_THINK_OPEN, _THINK_CLOSE = _build_thinking_patterns()
+_THINK_BLOCK_RE = re.compile(_THINK_OPEN + r".*?" + _THINK_CLOSE, re.DOTALL | re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(_THINK_OPEN, re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(_THINK_CLOSE, re.IGNORECASE)
+if fact_extract is not None:
+    # 事実抽出も同じ書式で思考を落とす。カタログを直せば両方に効くよう、ここで配る。
+    fact_extract.set_thinking_pattern(_THINK_BLOCK_RE)
+
+
+def strip_thinking_markup(text: str) -> str:
+    """思考タグとその中身を落として本文だけを返す。
+
+    タグが 1 つも無ければ入力をそのまま返す（従来の返答が 1 文字も変わらないことを保証する）。
+    ・開始〜終了が揃っている  → その区間を丸ごと捨てる
+    ・開始だけで終端が無い    → 思考が途中で切れた形。その位置以降は全部思考なので捨てる
+      （結果が空になるので、呼び出し側の「空返答の救済」がプリフィル撮り直しへ進む）
+    ・終端だけが残っている    → 開始タグをサーバが剥がした形。最後の終端より後ろを本文とする
+    """
+    raw = str(text or "")
+    if "<" not in raw:
+        return raw
+    cleaned = _THINK_BLOCK_RE.sub("", raw)
+    open_match = _THINK_OPEN_RE.search(cleaned)
+    if open_match:
+        cleaned = cleaned[: open_match.start()]
+    closes = list(_THINK_CLOSE_RE.finditer(cleaned))
+    if closes:
+        cleaned = cleaned[closes[-1].end() :]
+    if cleaned == raw:
+        return raw
+    return cleaned.strip()
+
+
+def _normalize_choice_content(data: dict) -> dict:
+    """レスポンスの本文から思考タグを落として書き戻す（無ければ何もしない）。
+
+    LM への全リクエストは _request_lmstudio_content を通るので、ここ 1 箇所で
+    返答本文・検索クエリ書き換え・記憶ダイジェスト・事実抽出のすべてを面で守れる。
+    """
+    try:
+        message = data["choices"][0]["message"]
+    except Exception:
+        return data
+    content = str(message.get("content") or "")
+    stripped = strip_thinking_markup(content)
+    if stripped != content:
+        message["content"] = stripped
+        print(f"[lm] stripped thinking markup: {len(content)} -> {len(stripped)} chars")
+    return data
+
+
 def _thinking_prefill(segmented_mode: bool, auto_emoji: bool) -> tuple[str, str]:
     """思考(reasoning)を抑止するためのアシスタント・プリフィルを返す。
 
@@ -4033,7 +4232,11 @@ def _request_lmstudio_content(
             prefilled["messages"] = list(payload["messages"]) + [
                 {"role": "assistant", "content": prefill_content}
             ]
-            data = _post_lmstudio_chat(prefilled, use_structured=False, aux=is_aux)
+            # 思考タグは reattach の前に落とす（本文の前に思考が挟まったまま
+            # `{"segments":[{"text":"` を前置きすると JSON が壊れる）。
+            data = _normalize_choice_content(
+                _post_lmstudio_chat(prefilled, use_structured=False, aux=is_aux)
+            )
             msg = data["choices"][0]["message"]
             content = str(msg.get("content") or "")
             if content.strip():
@@ -4050,7 +4253,9 @@ def _request_lmstudio_content(
             pass
         body = dict(payload)
         body["max_tokens"] = base_max_tokens
-        return _post_lmstudio_chat(body, _use_structured_output(segmented_mode), aux=is_aux)
+        return _normalize_choice_content(
+            _post_lmstudio_chat(body, _use_structured_output(segmented_mode), aux=is_aux)
+        )
 
     body = dict(payload)
     if cap_to_base_max_tokens:
@@ -4062,7 +4267,9 @@ def _request_lmstudio_content(
         body["max_tokens"] = LM_QUALITY_GUARD_MAX_TOKENS
     else:  # "original"
         body["max_tokens"] = base_max_tokens
-    data = _post_lmstudio_chat(body, _use_structured_output(segmented_mode), aux=is_aux)
+    data = _normalize_choice_content(
+        _post_lmstudio_chat(body, _use_structured_output(segmented_mode), aux=is_aux)
+    )
     if _choice_content(data).strip():
         return data
     # ここから空返答の救済。典型は「文脈の残り枠を思考が食い切った」ケースで、
@@ -4106,8 +4313,8 @@ def _salvage_from_reasoning(data: dict, expect_json: bool) -> str:
     """打ち切られた思考（reasoning_content）から、読み上げ可能な本文だけを拾う。
 
     思考には「ユーザーは挨拶している」等のメタな独白が混ざるので、そのまま TTS へ
-    渡すと事故になる。拾うのは (1) JSON の ``"text"`` フィールド、(2) ``</think>``
-    より後ろの本文だけに限り、確信が持てなければ何も返さない。
+    渡すと事故になる。拾うのは (1) JSON の ``"text"`` フィールド、(2) 思考の終了タグ
+    （``</think>`` / ``<channel|>``）より後ろの本文だけに限り、確信が持てなければ何も返さない。
     """
     try:
         reasoning = str(data["choices"][0]["message"].get("reasoning_content") or "")
@@ -4124,8 +4331,9 @@ def _salvage_from_reasoning(data: dict, expect_json: bool) -> str:
                     parts.append(value)
         if parts:
             return " ".join(parts)
-    if "</think>" in reasoning:
-        return reasoning.rsplit("</think>", 1)[-1].strip()
+    closes = list(_THINK_CLOSE_RE.finditer(reasoning))
+    if closes:
+        return reasoning[closes[-1].end() :].strip()
     return ""
 
 
@@ -5495,6 +5703,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "lmStudioUrl": LM_STUDIO_URL,
                     "models": diagnostics["models"],
+                    "preferredModel": diagnostics["preferredModel"],
                     "contextLimit": DEFAULT_CONTEXT_LIMIT,
                     "irodoriRoot": str(IRODORI_ROOT),
                     "irodoriReady": diagnostics["irodoriRootExists"] and diagnostics["irodoriPythonExists"],

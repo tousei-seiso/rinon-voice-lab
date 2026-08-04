@@ -214,7 +214,7 @@ slower than on an NVIDIA GPU.
 
 1. Clone or download this repository.
 2. Start LM Studio and enable the OpenAI-compatible local server.
-3. Load a chat model, for example `gemma-4-12b-it`.
+3. Load a chat model, for example `gemma-4-12b-it` or `google/gemma-4-12b-qat`.
 4. Double-click `start_chat_uv.bat`.
 5. Open `http://127.0.0.1:7862/`.
 
@@ -290,7 +290,9 @@ Useful environment variables:
 | --- | --- | --- | :-: | :-: |
 | `IRODORI_ROOT` | `..\Irodori-TTS` next to this app | Irodori-TTS checkout and virtual environment | ✅ | ✅ |
 | `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | LM Studio OpenAI-compatible endpoint | ✅ | ✅ |
-| `LM_STUDIO_MODEL` | `gemma-4-12b-it` | Preferred model name | ✅ | ✅ |
+| `LM_STUDIO_MODEL` | `gemma-4-12b-it@q6_k` | Preferred model name. Names outside the supported families (`gemma-4-12b-it`, `google/gemma-4-12b-qat`) are ignored and fall back to `LM_STUDIO_DEFAULT_MODEL`, then to `gemma-4-12b-it@q6_k`. A full GGUF path works too | ✅ | ✅ |
+| `LM_STUDIO_DEFAULT_MODEL` | (unset) | Model used when `LM_STUDIO_MODEL` is unset or outside the supported families | — | ✅ |
+| `LM_STUDIO_ALLOWED_MODELS` | (unset) | Extra model names to accept, comma separated (exact match). Thinking tags are still only stripped for known formats, so to add a model permanently extend `LM_MODEL_CATALOG` in `app.py` together with its thinking-tag format in `LM_THINKING_FORMATS` | — | ✅ |
 | `LM_STUDIO_CONTEXT_LIMIT` | `8200` | Visible context budget | ✅ | ✅ |
 | `LM_SERIALIZE_REQUESTS` | `1` | Send one request at a time so the server never opens a second slot (`0` allows overlap) | — | ✅ |
 | `LM_CACHE_PROMPT` | `aux` | Where to send `cache_prompt=false`: `aux` (helper generations only), `all`, or `off` | — | ✅ |

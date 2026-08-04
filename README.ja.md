@@ -298,7 +298,7 @@ python tools/sync_memory.py --source history --propagate --extract --rule-only
 - Irodori-TTS 用の NVIDIA GPU 推奨
 - `uv`
 
-標準モデルは `gemma-4-12b-it` を想定しています。31Bモデルも使えますが、VRAM使用量が大きくなります。
+標準モデルは `gemma-4-12b-it` と Google 公式 QAT の `google/gemma-4-12b-qat` を想定しています（`LM_STUDIO_MODEL` で切り替え）。31Bモデルも使えますが、VRAM使用量が大きくなります。
 
 macOS では CUDA は使えません。Irodori-TTS は PyTorch の MPS が使える Apple Silicon Mac では `mps`、それ以外では `cpu` で動きます。MPS/CPU では Irodori-TTS の `bf16` は使えないため、`fp32` を使います。音声生成は NVIDIA GPU 環境より遅くなる可能性があります。
 
@@ -309,7 +309,7 @@ Rinon Voice Lab 本体は Python 標準ライブラリだけで動きます。�
 1. このリポジトリをクローン、またはZIPで展開します。
 2. LM Studio を起動します。
 3. LM Studio の Local Server を有効にします。
-4. `gemma-4-12b-it` などの会話モデルを読み込みます。
+4. `gemma-4-12b-it` または `google/gemma-4-12b-qat` などの会話モデルを読み込みます。
 5. `start_chat_uv.bat` をダブルクリックします。
 6. ブラウザで `http://127.0.0.1:7862/` を開きます。
 
@@ -391,7 +391,9 @@ Irodori-TTS の依存関係は次のどちらかで入れてください。
 | --- | --- | --- | :-: | :-: |
 | `IRODORI_ROOT` | アプリ隣の `..\Irodori-TTS` | Irodori-TTS の場所 | ✅ | ✅ |
 | `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | LM Studio の OpenAI互換API | ✅ | ✅ |
-| `LM_STUDIO_MODEL` | `gemma-4-12b-it` | 優先モデル名 | ✅ | ✅ |
+| `LM_STUDIO_MODEL` | `gemma-4-12b-it@q6_k` | 優先モデル名。対応系列（`gemma-4-12b-it` / `google/gemma-4-12b-qat`）以外を指定すると使われず、`LM_STUDIO_DEFAULT_MODEL` → `gemma-4-12b-it@q6_k` の順に落ちる。GGUF のフルパス指定も可 | ✅ | ✅ |
+| `LM_STUDIO_DEFAULT_MODEL` | （なし） | `LM_STUDIO_MODEL` が対応系列外・未設定のときに使うモデル名 | — | ✅ |
+| `LM_STUDIO_ALLOWED_MODELS` | （なし） | 対応系列に加えて一時的に許可するモデル名（カンマ区切り・完全一致）。ただし思考タグは既知の書式でしか落とせないため、恒久的に増やすときは `app.py` の `LM_MODEL_CATALOG` へ、そのモデルの思考タグの書式（`LM_THINKING_FORMATS`）と対で追記する | — | ✅ |
 | `LM_STUDIO_CONTEXT_LIMIT` | `8200` | 表示上のコンテキスト上限 | ✅ | ✅ |
 | `LM_COMPACT_CONTEXT_LIMIT` | `4200` | プロンプトへ載せる会話履歴の実上限（文字数）。画面の context 上限はこの値でクランプされる | ✅ | ✅ |
 | `LM_RECENT_MESSAGE_COUNT` | `12` | 要約に畳まず原文のまま載せる直近の発言数 | ✅ | ✅ |

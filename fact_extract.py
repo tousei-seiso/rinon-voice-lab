@@ -52,6 +52,28 @@ import json
 import re
 from datetime import date, timedelta
 
+# 思考タグ（LLM 出力の前に混ざる独白）。書式はモデル系列ごとに違う。
+#   <think> … </think>              従来の書式
+#   <|channel>thought … <channel|>  Google 公式 Gemma 4 QAT の書式
+# 対応モデルの一覧と書式の対応は app.py の LM_MODEL_CATALOG / LM_THINKING_FORMATS が正で、
+# app.py から使うときは起動時に set_thinking_pattern() で上書きされる。ここに持つ既定は、
+# 本モジュールを app.py 抜きで（tools/build_fact_ledger.py などから）使うときのため。
+THINK_BLOCK_RE = re.compile(
+    r"(?:<think>|<\|?channel\|?>[ \t]*(?:thought|thinking|analysis|reasoning))"
+    r".*?(?:</think>|<\|?/?channel\|?>)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def set_thinking_pattern(pattern: "re.Pattern[str]") -> None:
+    """思考タグの除去に使う正規表現を差し替える。
+
+    モデルを増やすときに書式の定義が 2 箇所へ散らないよう、app.py が自分のカタログから
+    組み立てた同じパターンをここへ配る。
+    """
+    global THINK_BLOCK_RE
+    THINK_BLOCK_RE = pattern
+
 # --- 語彙定義（拡張はここだけを触れば済むようにまとめる）----------------------
 # 行為の動詞。キーが台帳へ入る正規化後の verb、値は表層形のパターン。
 # 語尾は活用を吸収するため「語幹＋任意の送り」で書く。
@@ -1251,8 +1273,8 @@ def parse_llm_facts(
     text = str(content or "").strip()
     if not text:
         return []
-    # <think>…</think> や前置きを落とし、最初の [ … ] を取る。
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # 思考タグや前置きを落とし、最初の [ … ] を取る。
+    text = THINK_BLOCK_RE.sub("", text)
     text = re.sub(r"```(?:json)?|```", "", text)
     start = text.find("[")
     end = text.rfind("]")

@@ -1552,8 +1552,28 @@ async function refreshStatus() {
       option.textContent = model;
       modelSelect.appendChild(option);
     }
+    // サーバが環境変数（LM_STUDIO_MODEL）から解決した既定モデルを最優先で選ぶ。
+    // 環境変数は GGUF のフルパスで指定されることがあり、/models が返す ID とは
+    // 書き方が違うので、記号を落として「どちらかがどちらかを含む」で照合する。
+    const normalizeModelId = (value) =>
+      String(value || "")
+        .toLowerCase()
+        .replace(/\.gguf$/, "")
+        .replace(/[^a-z0-9]/g, "");
+    const preferredId = normalizeModelId(data.preferredModel);
+    const preferredOption = !preferredId
+      ? null
+      : [...modelSelect.options]
+          .filter((opt) => {
+            const id = normalizeModelId(opt.value);
+            return id.length >= 6 && (preferredId.includes(id) || id.includes(preferredId));
+          })
+          // QAT のファイル名は gemma-4-12b-it-QAT-Q4_0.gguf で it 側にも当たるため、
+          // 両方ロードされている場合は限定の強い（長い）ID を採る。
+          .sort((a, b) => normalizeModelId(b.value).length - normalizeModelId(a.value).length)[0];
     const preferred =
       [...modelSelect.options].find((opt) => opt.value === "__codex_queue__" && opt.dataset.preferred === "1") ||
+      preferredOption ||
       [...modelSelect.options].find((opt) => opt.value === "gemma-4-12b-it") ||
       [...modelSelect.options].find((opt) => opt.value === "gemma-4-31b-it") ||
       [...modelSelect.options].find((opt) => opt.value.toLowerCase().includes("gemma"));
