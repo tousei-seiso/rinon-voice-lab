@@ -81,7 +81,7 @@ torch のキャッシュアロケータは解放済みブロックをドライ�
 違うサイズのブロックが溜まるため、返答を合成するほど増えて戻りません。`empty_cache()` で
 明示的に返させます。**こちらは実際に VRAM が減ります。**
 
-対策は 4 段構えで、いずれも「非対応なら黙って諦める」層に留めています。
+対策は 5 段構えで、いずれも「非対応なら黙って諦める」層に留めています。
 
 1. **直列化**（`LM_SERIALIZE_REQUESTS=1`）… 補助生成が本文生成へ割り込まないようにし、
    そもそも 2 本目のスロットを確保させない。サーバ側の居残りに効くのは実質これだけ。
@@ -98,25 +98,72 @@ torch のキャッシュアロケータは解放済みブロックをドライ�
    `torch.cuda.empty_cache()` を呼び、TTS が抱えた CUDA キャッシュをドライバへ返します。
    合成の真っ最中は `Irodori_lock` が空いていないので触りません（これから使い回すブロックを
    奪わないため）。TTS をリモートへ出す構成や CPU 実行では自動的に no-op になります。
+5. **置き場所の切り替え**（`VRAM_TTS_MIN_FREE_MIB=3000`）… 1〜4 はどれも「溜まったぶんを
+   返す」対策なので、推論サーバがモデルロード時に確保しきったぶんには効きません。そこで
+   合成の直前に空き VRAM を測り、この値を割っていたらそのターンの TTS を **CPU へ逃がします**
+   （精度も `bf16` 固定を捨ててデバイスなりに解決し直します）。合成は遅くなりますが、
+   溢れさせて GPU ごと詰まらせる（後述）よりは確実にましです。`0` で無効。適正値は
+   下記ログの `peak=` に余白を足して決めてください。
 
 ##### 切り分け方（ログの読み方）
 
 `VRAM_MEMORY_LOG=1`（既定）で、掃除の前後に次の 1 行が出ます。
 
 ```
-[vram] before release (idle): total=11868/12282MiB  self-torch reserved=2048MiB allocated=400MiB
+[vram] before release (idle): total=11868/12282MiB  self-torch reserved=2048MiB allocated=400MiB peak=2048MiB
 [vram] torch cache released: 1536MiB (reserved 2048 -> 512MiB)
 [lm] KV cache released: 1 slot(s) (idle)
-[vram] after  release (idle): total=10310/12282MiB  self-torch reserved=512MiB allocated=400MiB
+[vram] after  release (idle): total=10310/12282MiB  self-torch reserved=512MiB allocated=400MiB peak=2048MiB
 ```
 
 - `self-torch reserved` が減って `total` も減った → 犯人は **TTS（このプロセス）**。これで解決。
 - `self-torch reserved` が小さいのに `total` が大きい → 犯人は **推論サーバ側**。`erase` では
   戻らないので、サーバの起動設定（並列リクエスト数・文脈長・KV キャッシュ量子化など）で
   削るか、モデルをアンロードするしかありません。
+- `peak` は起動からの `reserved` 最大値で、`empty_cache()` で返したあとも残ります。
+  これが「TTS が GPU で要る量」なので、`VRAM_TTS_MIN_FREE_MIB` はこの値に余白を足して
+  決めます。安全弁が働いたターンには次の 1 行が出ます。
+
+```
+[vram] low headroom before request: free=2680MiB < 3000MiB (TTS would fall back to cpu)
+[vram] TTS falls back to cpu: free=2680MiB < 3000MiB -- ...
+[vram] TTS back on cuda: free=4620MiB >= 3000MiB
+
+```
 
 Windows(WDDM) の nvidia-smi はプロセス別の使用量を報告しない（GeForce では
 `--query-compute-apps` が空で返る）ため、自プロセスぶんは torch から直接読んでいます。
+
+##### 軽い量子化へ替えたら悪化する場合
+
+モデルを小さくすると llama.cpp は空いた VRAM を全層オフロード・並列スロット・プロンプト
+キャッシュで使い切るため、**モデルが軽くなってもサーバの占有はむしろ増えます**。
+実測（RTX 4070 / 12282MiB, `--ctx-size 8192 --parallel 2 --batch-size 2048`）:
+
+| モデル | ファイル | サーバ占有 | プロンプト評価 | 生成 |
+| --- | --- | --- | --- | --- |
+| `gemma-4-12b-it-Q6_K` | 9.11GB | 一部の層は CPU に残る | 227 tok/s | 14 tok/s |
+| `gemma-4-12B-it-QAT-Q4_0` | 6.50GB | 9436〜11498MiB（全層 GPU） | 1398 tok/s | 19 tok/s |
+
+QAT 版は速い代わりに VRAM の余白が消えるので、そこへ TTS を載せると溢れます。溢れたぶんは
+NVIDIA ドライバがシステムメモリへ退避させるため、**確保自体は成功するのに** GPU 演算が
+PCIe 律速になり、プロンプト評価が **1398 → 5.4 tok/s**（4159 トークンの評価に 765 秒）まで
+落ちました。同じ GPU でデスクトップを描いているので、画面更新もマウスカーソルも止まります。
+アプリ側はどれだけ待っても返ってこないため `LM_STUDIO_TIMEOUT` まで粘って落ちます。
+
+サーバ側（LM Studio なら Load 設定）で削る順:
+
+1. **Max Concurrent Predictions を 1 に**… `--parallel 2` はスロットを 2 本確保します。
+   アプリは直列化していますが、llama.cpp は直列でも LRU でスロットを交互に選ぶため
+   両方に KV が居残ります（サーバログの
+   `making room for prompt cache entry, removing oldest entry (size = 1693.788 MiB)`）。
+2. **GPU オフロード層数を下げる**… 1〜2GB 単位で空きを作れます。
+3. **評価バッチサイズを 2048 → 512**… prefill の計算バッファが縮みます。
+4. **Vision(mmproj) を切る**… テキストだけ使うなら `--mmproj` のぶんは丸ごと無駄です。
+
+あわせて NVIDIA コントロールパネルの「CUDA - システムメモリ フォールバック ポリシー」を
+**「フォールバックなしを優先」** にしておくと、溢れたときにフリーズではなく CUDA OOM で
+即座に失敗します（デスクトップが固まらず、原因もその場で分かります）。
 
 ##### 速度とのトレードオフ
 
@@ -410,6 +457,8 @@ Irodori-TTS の依存関係は次のどちらかで入れてください。
 | `LM_KV_CACHE_RELEASE_TIMEOUT` | `5` | 解放 API の待ち時間（秒） | — | ✅ |
 | `VRAM_RELEASE_TORCH` | `1` | 掃除時に自プロセス（Irodori-TTS）の torch CUDA キャッシュも `empty_cache()` で返す | — | ✅ |
 | `VRAM_MEMORY_LOG` | `1` | 掃除の前後に GPU 使用量の内訳（全体＋自プロセスの torch 保持量）をログへ出す | — | ✅ |
+| `VRAM_TTS_MIN_FREE_MIB` | `3000` | 空き VRAM がこれを割ったら TTS をそのターンだけ CPU へ逃がす（`0` で無効）。適正値は `[vram]` ログの `peak=` ＋余白 | — | ✅ |
+| `VRAM_FREE_PROBE_TTL` | `3` | 空き VRAM を測り直す間隔（秒）。合成チャンクごとに `nvidia-smi` を起こさないための間隔 | — | ✅ |
 | `IRODORI_TORCH_EXTRA` | `cu128` | Irodori-TTS インストール時の torch extra | ✅ | ✅ |
 | `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS のモデル実行デバイス。`auto`, `cuda`, `mps`, `cpu`, `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_PRECISION` | `auto` | モデル精度。`auto`, `fp32`, `bf16` | ✅ | ✅ |

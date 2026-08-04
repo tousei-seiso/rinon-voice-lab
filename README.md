@@ -301,6 +301,8 @@ Useful environment variables:
 | `LM_KV_CACHE_RELEASE_TIMEOUT` | `5` | Timeout for the release API (seconds) | — | ✅ |
 | `VRAM_RELEASE_TORCH` | `1` | Also hand this process's torch CUDA cache (Irodori-TTS) back via `empty_cache()` | — | ✅ |
 | `VRAM_MEMORY_LOG` | `1` | Log the GPU breakdown (total plus this process's torch reservation) around each sweep | — | ✅ |
+| `VRAM_TTS_MIN_FREE_MIB` | `3000` | Move TTS to the CPU for a turn when free VRAM drops below this (`0` disables the guard). Size it from the `peak=` figure in the `[vram]` log | — | ✅ |
+| `VRAM_FREE_PROBE_TTL` | `3` | Seconds between free-VRAM probes, so `nvidia-smi` is not spawned per synthesis chunk | — | ✅ |
 | `IRODORI_TORCH_EXTRA` | `cu128` | Installer torch extra: `cu128`, `cpu`, `rocm`, or `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_DEVICE` | `auto` | Irodori-TTS model device: `auto`, `cuda`, `mps`, `cpu`, or `xpu` | ✅ | ✅ |
 | `IRODORI_MODEL_PRECISION` | `auto` | Model precision: `auto`, `fp32`, or `bf16` | ✅ | ✅ |

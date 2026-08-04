@@ -222,11 +222,12 @@ _lm_structured_output_unsupported = False
 #      torch のキャッシュアロケータは解放済みブロックをドライバへ返さず抱え続ける。
 #      文の長さごとに違うサイズのブロックが溜まるため、返答を合成するほど増えて戻らない。
 #      empty_cache() で明示的に返させる。こちらは実際に VRAM が減る。
-# 対策は 4 段。いずれも「無くても動く」層に留め、非対応なら黙って諦める。
+# 対策は 5 段。いずれも「無くても動く」層に留め、非対応なら黙って諦める。
 #   1) 直列化   : 補助生成が本文生成へ割り込まないようにし、スロットを増やさせない。
 #   2) リクエスト: cache_prompt=false を付け、プロンプト KV を残させない。
 #   3) 明示解放 : 全リクエストが捌けた時点で /slots?action=erase を叩いて捨てさせる。
 #   4) 自プロセス: TTS が抱えた torch の CUDA キャッシュを empty_cache() で返す。
+#   5) 置き場所  : それでも空きが尽きていたら TTS を CPU へ逃がす（下の安全弁を参照）。
 # LM Studio へ送るリクエストを 1 本ずつに直列化する（VRAM 目的。速度目的ではない）。
 # 事実抽出はバックグラウンドスレッドから飛ぶため、切ると本文生成と重なり得る。
 LM_SERIALIZE_REQUESTS = os.environ.get("LM_SERIALIZE_REQUESTS", "1").strip().lower() not in {
@@ -281,6 +282,24 @@ VRAM_MEMORY_LOG = os.environ.get("VRAM_MEMORY_LOG", "1").strip().lower() not in 
 }
 # nvidia-smi が無い環境（AMD/Apple/CPU 実行）では 1 度試して以後黙る。
 _vram_probe_unsupported = False
+# --- TTS の置き場所を空き VRAM で決める安全弁（対策 5） ------------------------
+# 1〜4 は「溜まったぶんを返す」対策で、推論サーバがモデルロード時に確保しきったぶんには
+# 効かない。軽い量子化へ替えると llama.cpp は空いた VRAM を全層オフロード・並列スロット・
+# プロンプトキャッシュで使い切るため、こちらの取り分が消える（実測: Q6_K 9.1GB →
+# QAT Q4_0 6.5GB とモデルは小さくなったのに、サーバの占有は 9.4〜11.5GB / 12.2GB へ増えた）。
+# 溢れたぶんは NVIDIA ドライバがシステムメモリへ退避させるので、torch の確保自体は成功
+# するのに GPU 演算が PCIe 越しになり、サーバのプロンプト評価が 1400 → 5 tok/s まで落ちる
+# （実測: 4159 トークンの評価に 765 秒）。同じ GPU で画面を描いているデスクトップごと
+# 止まってマウスも動かなくなるため、「合成が遅くなる」側へ倒す。
+# TTS を GPU で走らせるのに最低限空いていてほしい VRAM（MiB）。0 でこの安全弁を切る。
+# 適正値は [vram] ログの `peak=`（TTS が確保したピーク）へ余白を足して決める。
+VRAM_TTS_MIN_FREE_MIB = int(os.environ.get("VRAM_TTS_MIN_FREE_MIB", "3000"))
+# 空き容量を測り直す間隔（秒）。1 ターンの合成チャンクごとに nvidia-smi を起こさないため。
+VRAM_FREE_PROBE_TTL = float(os.environ.get("VRAM_FREE_PROBE_TTL", "3"))
+# 直近の nvidia-smi 結果 (測った時刻, 使用中 MiB, 総容量 MiB)。
+_vram_memory_cache: tuple[float, int, int] | None = None
+# 直前の判定（"gpu"/"cpu"）。変わったときだけログへ出す（合成チャンクごとに騒がない）。
+_vram_guard_state = ""
 # リクエストの直列化と「いま何本走っているか」の計数。RLock は同一スレッドからの
 # 入れ子（空返答のリトライ等）で自分を待たないようにするため。
 _lm_request_lock = threading.RLock()
@@ -2025,6 +2044,13 @@ def irodori_precision_for_device(device: str, requested: str) -> str:
 
 
 def irodori_runtime_settings() -> dict[str, str]:
+    """TTS の実行デバイスと精度を決める。
+
+    cuda に落ち着いた場合でも、推論サーバが VRAM を使い切っていれば
+    ``tts_device_within_vram_budget`` が cpu へ差し替える（GPU の取り合いで
+    デスクトップごと固まるのを避けるため）。差し替わったときは精度も明示指定を捨てて
+    デバイスなりに解決し直す（cuda 前提の bf16 を CPU へ持ち込まないため）。
+    """
     model_device = IRODORI_MODEL_DEVICE
     codec_device = IRODORI_CODEC_DEVICE
     if is_auto_runtime_value(model_device) or is_auto_runtime_value(codec_device):
@@ -2033,11 +2059,19 @@ def irodori_runtime_settings() -> dict[str, str]:
             model_device = default_device
         if is_auto_runtime_value(codec_device):
             codec_device = default_device
+    model_precision = IRODORI_MODEL_PRECISION
+    codec_precision = IRODORI_CODEC_PRECISION
+    guarded_model = tts_device_within_vram_budget(model_device)
+    if guarded_model != model_device:
+        model_device, model_precision = guarded_model, DEFAULT_IRODORI_RUNTIME
+    guarded_codec = tts_device_within_vram_budget(codec_device)
+    if guarded_codec != codec_device:
+        codec_device, codec_precision = guarded_codec, DEFAULT_IRODORI_RUNTIME
     return {
         "modelDevice": str(model_device).strip().lower(),
-        "modelPrecision": irodori_precision_for_device(model_device, IRODORI_MODEL_PRECISION),
+        "modelPrecision": irodori_precision_for_device(model_device, model_precision),
         "codecDevice": str(codec_device).strip().lower(),
-        "codecPrecision": irodori_precision_for_device(codec_device, IRODORI_CODEC_PRECISION),
+        "codecPrecision": irodori_precision_for_device(codec_device, codec_precision),
     }
 
 
@@ -3060,28 +3094,29 @@ def _torch_vram_usage() -> str:
             return "self-torch=no-cuda"
         reserved = int(torch.cuda.memory_reserved() / 1024 / 1024)
         allocated = int(torch.cuda.memory_allocated() / 1024 / 1024)
-        return f"self-torch reserved={reserved}MiB allocated={allocated}MiB"
+        # ``peak`` は起動からの reserved 最大値。empty_cache() で戻したあとも残るので、
+        # 「TTS が GPU でどれだけ要るか」＝ VRAM_TTS_MIN_FREE_MIB の根拠として読む。
+        peak = int(torch.cuda.max_memory_reserved() / 1024 / 1024)
+        return f"self-torch reserved={reserved}MiB allocated={allocated}MiB peak={peak}MiB"
     except Exception as exc:
         return f"self-torch=unavailable({type(exc).__name__})"
 
 
-def gpu_memory_snapshot() -> str:
-    """GPU の使用量を「全体＋自プロセスの torch ぶん」で 1 行にまとめる。
+def _nvidia_smi_memory(*, fresh: bool = False) -> tuple[int, int] | None:
+    """GPU 全体の (使用中, 総容量) を MiB で返す。測れなければ None。
 
-    誰が VRAM を抱えているかはこれを見ないと分からない。実測で「推論サーバの KV
-    キャッシュを erase しても全体は減らない」ことが分かっているので、
-    ``全体`` と ``self-torch reserved`` の両方を並べて次のように読む。
-      ・掃除で self-torch reserved が減り全体も減る → 犯人は TTS(このプロセス)
-      ・self-torch reserved が小さいのに全体が大きい → 犯人は推論サーバ側。
-        erase では戻らないので、サーバの並列数/文脈長など起動設定で削るしかない
-    nvidia-smi が無い環境（AMD/Apple/CPU 実行）では 1 度試して以後全体値を諦める。
+    nvidia-smi の起動は毎回 50〜100ms かかるので、``VRAM_FREE_PROBE_TTL`` 秒だけ結果を
+    持ち回す（1 ターンの合成チャンクごとに起こさないため）。掃除の前後で差を見たい
+    ``gpu_memory_snapshot`` は ``fresh=True`` で必ず測り直す。
+    nvidia-smi が無い環境（AMD/Apple/CPU 実行）では 1 度試して以後諦める。
     """
-    global _vram_probe_unsupported
-    if not VRAM_MEMORY_LOG:
-        return ""
-    mine = _torch_vram_usage()
+    global _vram_probe_unsupported, _vram_memory_cache
     if _vram_probe_unsupported:
-        return mine
+        return None
+    now = time.time()
+    cached = _vram_memory_cache
+    if not fresh and cached and now - cached[0] < VRAM_FREE_PROBE_TTL:
+        return cached[1], cached[2]
     try:
         proc = subprocess.run(
             [
@@ -3099,7 +3134,98 @@ def gpu_memory_snapshot() -> str:
     except Exception as exc:
         _vram_probe_unsupported = True
         print(f"[vram] nvidia-smi probe unavailable: {type(exc).__name__}: {exc}")
+        return None
+    _vram_memory_cache = (now, used_mb, total_mb)
+    return used_mb, total_mb
+
+
+def gpu_free_mib() -> int:
+    """空いている VRAM(MiB)。測れないときは -1（＝不明なので判断材料にしない）。"""
+    memory = _nvidia_smi_memory()
+    if memory is None:
+        return -1
+    used_mb, total_mb = memory
+    return max(0, total_mb - used_mb)
+
+
+def tts_device_within_vram_budget(device: str) -> str:
+    """TTS の置き場所を、空き VRAM を見て必要なら ``cpu`` へ落として返す。
+
+    推論サーバ（別プロセス）が VRAM をどれだけ握るかはアプリからは制御できない。
+    空きが ``VRAM_TTS_MIN_FREE_MIB`` を割った状態で TTS を GPU に載せると、溢れたぶんが
+    システムメモリへ退避して GPU 全体が PCIe 律速になり、返答の生成が桁で遅くなるうえ
+    デスクトップの描画まで止まる。CPU 合成は遅いが、固まらないぶんだけ確実にましなので
+    そちらへ倒す。cuda 以外・測れないとき・安全弁を切ったときは何もしない（従来動作）。
+    """
+    global _vram_guard_state
+    if VRAM_TTS_MIN_FREE_MIB <= 0:
+        return device
+    if str(device).split(":", 1)[0].lower() != "cuda":
+        return device
+    free_mb = gpu_free_mib()
+    if free_mb < 0:
+        return device
+    if free_mb >= VRAM_TTS_MIN_FREE_MIB:
+        if _vram_guard_state == "cpu":
+            print(
+                f"[vram] TTS back on {device}: free={free_mb}MiB "
+                f">= {VRAM_TTS_MIN_FREE_MIB}MiB"
+            )
+        _vram_guard_state = "gpu"
+        return device
+    if _vram_guard_state != "cpu":
+        print(
+            f"[vram] TTS falls back to cpu: free={free_mb}MiB < {VRAM_TTS_MIN_FREE_MIB}MiB "
+            "-- the inference server is holding the GPU, so synthesis would drag the whole "
+            "desktop down. Trim the server side (GPU offload / concurrent predictions / "
+            "eval batch size / vision projector), or set VRAM_TTS_MIN_FREE_MIB=0 to disable "
+            "this guard."
+        )
+    _vram_guard_state = "cpu"
+    return "cpu"
+
+
+def warn_if_vram_tight() -> None:
+    """LM へ投げる前に空き VRAM を点検し、TTS のぶんを割っていたら 1 度知らせる。
+
+    ここで止めることはしない（LM の生成自体はサーバ側の VRAM で走るため）。TTS を
+    使わないターンでも「サーバが GPU を使い切っている」ことに気づけるようにするための
+    見張り。実際の退避判断は ``tts_device_within_vram_budget`` が合成の直前に行う。
+    判定は合成側と同じ状態へ書き戻し、両者あわせて「変わったときだけ 1 行」にする
+    （音声を使わないターンだと状態が動かず、毎リクエスト同じ警告が出てしまうため）。
+    """
+    global _vram_guard_state
+    if VRAM_TTS_MIN_FREE_MIB <= 0 or _vram_guard_state == "cpu":
+        return
+    free_mb = gpu_free_mib()
+    if free_mb < 0 or free_mb >= VRAM_TTS_MIN_FREE_MIB:
+        return
+    print(
+        f"[vram] low headroom before request: free={free_mb}MiB "
+        f"< {VRAM_TTS_MIN_FREE_MIB}MiB (TTS would fall back to cpu)"
+    )
+    _vram_guard_state = "cpu"
+
+
+def gpu_memory_snapshot() -> str:
+    """GPU の使用量を「全体＋自プロセスの torch ぶん」で 1 行にまとめる。
+
+    誰が VRAM を抱えているかはこれを見ないと分からない。実測で「推論サーバの KV
+    キャッシュを erase しても全体は減らない」ことが分かっているので、
+    ``全体`` と ``self-torch reserved`` の両方を並べて次のように読む。
+      ・掃除で self-torch reserved が減り全体も減る → 犯人は TTS(このプロセス)
+      ・self-torch reserved が小さいのに全体が大きい → 犯人は推論サーバ側。
+        erase では戻らないので、サーバの並列数/文脈長など起動設定で削るしかない
+    nvidia-smi が無い環境（AMD/Apple/CPU 実行）では 1 度試して以後全体値を諦める。
+    """
+    if not VRAM_MEMORY_LOG:
+        return ""
+    mine = _torch_vram_usage()
+    # 掃除の前後で差を見るのが目的なので、キャッシュ済みの値では意味がない。
+    memory = _nvidia_smi_memory(fresh=True)
+    if memory is None:
         return mine
+    used_mb, total_mb = memory
     return f"total={used_mb}/{total_mb}MiB  {mine}"
 
 
@@ -3254,6 +3380,9 @@ def _lm_request_slot():
     _cancel_vram_release()
     if LM_SERIALIZE_REQUESTS:
         _lm_request_lock.acquire()
+    # 直列化ロックを取ってから見張る（前のリクエストや合成の真っ最中に測った値では
+    # 「このリクエストが使える空き」にならない）。
+    warn_if_vram_tight()
     with _lm_inflight_lock:
         _lm_inflight += 1
     try:
