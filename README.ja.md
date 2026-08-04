@@ -191,12 +191,20 @@ HDR を有効にすると dwm のコンポジションが FP16（8 バイト/px�
 サインアウトや再起動をせずに返させるには、dwm を落として作り直させます。
 
 ```powershell
-# 内訳を測るだけ（何も止めない）
+# 内訳を測るだけ（何も止めない。管理者権限は不要）
 pwsh -File tools/flush_gpu_memory.ps1 -MeasureOnly
 
-# dwm を再起動して VRAM を返させる（管理者権限のシェルで実行）
+# dwm を再起動して VRAM を返させる（UAC で昇格して実行。結果は昇格した窓に出る）
+pwsh -File tools/flush_gpu_memory.ps1 -Elevate
+
+# すでに管理者権限のシェルなら -Elevate は不要
 pwsh -File tools/flush_gpu_memory.ps1
 ```
+
+`dwm.exe` は SYSTEM 権限で動いているため、再起動には管理者権限が必要です。`-Elevate` を
+付けると、いま使っているホスト（pwsh 7 / powershell 5.1 のどちらか）のまま UAC で昇格して
+開き直します。昇格した窓は別プロセスなので結果はそちらに出ます（`-NoExit` で残します）。
+`-Force` を付けると確認プロンプトを省くので、起動前の定型作業として回せます。
 
 winlogon が dwm を見張っているので即座に起動し直し、セッションと開いているウィンドウは
 そのまま残ります（数秒だけ画面が暗転します）。前後の内訳と差分を表示するので、どれだけ

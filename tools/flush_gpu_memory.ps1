@@ -7,7 +7,9 @@ param(
   # 一覧に載せる下限(MiB)。小さなプロセスを省いて読みやすくする。
   [int] $MinimumMiB = 100,
   # dwm が戻ってくるまで待つ上限(秒)。
-  [int] $RestartTimeoutSeconds = 20
+  [int] $RestartTimeoutSeconds = 20,
+  # 管理者権限が無いとき、UAC で昇格して同じ内容を開き直す（シェルを開き直す手間を省く）。
+  [switch] $Elevate
 )
 
 # dwm(Desktop Window Manager) が抱える VRAM はログオンしたままだと積み上がり、自力では
@@ -126,9 +128,36 @@ if ($MeasureOnly) {
 
 # --- 2) 落とせる状態か確かめる ------------------------------------------------
 if (-not (Test-Administrator)) {
+  if ($Elevate) {
+    # いま動いているホスト（pwsh 7 / powershell 5.1 のどちらか）のまま昇格して開き直す。
+    # 昇格した窓は別プロセスなので、こちらのコンソールには結果が出てこない。読めるように
+    # -NoExit で窓を残す。渡された引数だけを引き継ぐ（既定値の取り違えを避けるため
+    # $PSBoundParameters を見る。-Elevate 自身は昇格後に不要なので渡さない）。
+    $shellPath = (Get-Process -Id $PID).Path
+    $arguments = @('-NoExit', '-NoProfile', '-File', ('"' + $PSCommandPath + '"'))
+    foreach ($name in @('Force', 'MinimumMiB', 'RestartTimeoutSeconds')) {
+      if (-not $PSBoundParameters.ContainsKey($name)) { continue }
+      $value = $PSBoundParameters[$name]
+      if ($value -is [switch]) {
+        if ($value.IsPresent) { $arguments += "-$name" }
+      } else {
+        $arguments += @("-$name", $value)
+      }
+    }
+    Write-Host ''
+    Write-Host 'Relaunching through UAC; the result appears in the elevated window.'
+    try {
+      Start-Process -FilePath $shellPath -Verb RunAs -ArgumentList $arguments
+    } catch {
+      # UAC のダイアログで「いいえ」を押した場合もここに来る。
+      Write-Host "Elevation was declined or failed: $($_.Exception.Message)"
+      exit 1
+    }
+    return
+  }
   Write-Host ''
   Write-Host 'This needs an elevated shell (dwm.exe runs as SYSTEM).'
-  Write-Host 'Reopen PowerShell with "Run as administrator", or pass -MeasureOnly to just look.'
+  Write-Host 'Pass -Elevate to relaunch through UAC, or reopen PowerShell as administrator.'
   exit 1
 }
 

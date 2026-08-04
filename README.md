@@ -347,12 +347,17 @@ fine, the *display* is starving. `nvidia-smi` will not show this on GeForce card
 reports no per-process usage there — read the WDDM counters instead:
 
 ```powershell
-# report the per-process breakdown only
+# report the per-process breakdown only (no elevation needed)
 pwsh -File tools/flush_gpu_memory.ps1 -MeasureOnly
 
-# restart dwm to hand its VRAM back, without signing out or rebooting (elevated shell)
-pwsh -File tools/flush_gpu_memory.ps1
+# restart dwm to hand its VRAM back, without signing out or rebooting
+pwsh -File tools/flush_gpu_memory.ps1 -Elevate
 ```
+
+`dwm.exe` runs as SYSTEM, so restarting it needs elevation. `-Elevate` relaunches the same
+host (pwsh 7 or powershell 5.1, whichever is running) through UAC and reports there; drop the
+flag when the shell is already elevated, and add `-Force` to skip the prompt so it can be a
+routine step before launching.
 
 `winlogon` restarts `dwm` immediately, so the session and every open window survive; the
 screen just goes black for a few seconds. To separate them for good, drive the displays from
