@@ -112,6 +112,19 @@ LM_EXTRA_ALLOWED_MODELS = tuple(
 LM_FALLBACK_MODEL = "gemma-4-12b-it@q6_k"
 
 
+def _model_key(value: object) -> str:
+    """モデル名を突き合わせ用のキーへ潰す（小文字化・``.gguf`` 除去・記号除去）。
+
+    リポジトリ名や量子化サフィックスは**残す**。``gemma-4-12b-it@q6_k`` と
+    ``…/gemma-4-12b-it-Q4_K_M.gguf`` を別物として区別したいため
+    （末尾のファイル名だけを見て同一視する _model_id_matches とは目的が違う）。
+    """
+    text = str(value or "").strip().lower()
+    if text.endswith(".gguf"):
+        text = text[: -len(".gguf")]
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
 def match_model_catalog(name: object) -> dict[str, object] | None:
     """モデル名がカタログのどの系列かを返す。対象外なら None。
 
@@ -132,7 +145,7 @@ def match_model_catalog(name: object) -> dict[str, object] | None:
     return None
 
 
-def resolve_lm_model(requested: object = None) -> str:
+def resolve_lm_model(requested: object = None, log: bool = True) -> str:
     """LM Studio へ送るモデル名を決める。
 
     ``requested`` → ``LM_STUDIO_MODEL`` → ``LM_STUDIO_DEFAULT_MODEL`` → ``LM_FALLBACK_MODEL``
@@ -141,6 +154,9 @@ def resolve_lm_model(requested: object = None) -> str:
     こちらで短い名前へ丸めると別のロード済みモデルを指してしまう恐れがある）。
     対象外の名前は使わず次の候補へ進み、どれを採ってどれを捨てたかは 1 行ログに残す
     （起動スクリプトを入れ替えたとき、意図した系列で話せているかがここで分かる）。
+
+    ``log`` はリクエストごとの呼び出し用。False なら「採用した」ログは省き、対象外を
+    捨てたときだけ残す（毎ターン同じ行が並ぶのを避けつつ、取りこぼしは見えるようにする）。
     """
     candidates = (
         ("requested", requested),
@@ -154,8 +170,9 @@ def resolve_lm_model(requested: object = None) -> str:
             continue
         entry = match_model_catalog(name)
         if entry:
-            skipped = f" (not supported: {' / '.join(rejected)})" if rejected else ""
-            print(f"[lm] model: {source}='{name}' -> {entry['label']}{skipped}")
+            if log or rejected:
+                skipped = f" (not supported: {' / '.join(rejected)})" if rejected else ""
+                print(f"[lm] model: {source}='{name}' -> {entry['label']}{skipped}")
             return name
         rejected.append(f"{source}='{name}'")
     detail = f"not supported: {' / '.join(rejected)}" if rejected else "no env value"
@@ -2106,8 +2123,10 @@ def environment_diagnostics() -> dict:
         "lmStudioUrl": LM_STUDIO_URL,
         "lmStudioReady": bool(lm_models),
         "models": lm_models,
-        # 環境変数から解決した既定モデル（画面のプルダウンの初期選択に使う）。
-        "preferredModel": DEFAULT_MODEL,
+        # 環境変数から解決した既定モデル。プルダウンに並ぶ ID の表記へ寄せて返す。
+        "preferredModel": preferred_model_option(lm_models),
+        # プルダウンで選ばせてよいモデル（対象外は表示だけして選べなくする）。
+        "supportedModels": [name for name in lm_models if model_is_supported(name)],
         "remoteLuviaEnabled": remote_luvia_enabled(),
         "remoteLuviaUrl": LUVIA_REMOTE_TTS_URL,
         "remoteLuviaHost": LUVIA_REMOTE_TTS_HOST,
@@ -5683,6 +5702,34 @@ def get_models() -> list[str]:
         return []
 
 
+def model_is_supported(model_id: object) -> bool:
+    """画面のプルダウンで選ばせてよいモデルか（カタログに載っている系列か）を返す。"""
+    return match_model_catalog(model_id) is not None
+
+
+def preferred_model_option(models: list[str] | None = None) -> str:
+    """環境変数で決まったモデルに対応する「``/models`` が返す ID」を返す。
+
+    ``LM_STUDIO_MODEL`` には GGUF のフルパスが入ることがあり、プルダウンに並ぶ ID
+    （LM Studio が返す短い名前）とは書き方が違う。記号を落として突き合わせ、同じものを
+    指していると分かればプルダウン側の ID を返す。見つからなければ環境変数の文字列を
+    そのまま返す（それ自体が LM Studio に通る有効な指定なので、勝手に別 ID へ寄せない）。
+    """
+    listed = models if models is not None else get_models()
+    target = _model_key(DEFAULT_MODEL)
+    best = ""
+    for model_id in listed:
+        key = _model_key(model_id)
+        # 6 文字未満の ID は偶然の部分一致が起きやすいので相手にしない。
+        if len(key) < 6 or not (target in key or key in target):
+            continue
+        # 12b-it と 12b-qat が両方ロードされていると、QAT のファイル名（…-it-QAT-…）が
+        # it 側の ID にも当たる。より限定の強い（長い）ID を採る。
+        if len(key) > len(_model_key(best)):
+            best = model_id
+    return best or DEFAULT_MODEL
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "IrodoriLMStudioChat/0.1"
 
@@ -5704,6 +5751,7 @@ class Handler(BaseHTTPRequestHandler):
                     "lmStudioUrl": LM_STUDIO_URL,
                     "models": diagnostics["models"],
                     "preferredModel": diagnostics["preferredModel"],
+                    "supportedModels": diagnostics["supportedModels"],
                     "contextLimit": DEFAULT_CONTEXT_LIMIT,
                     "irodoriRoot": str(IRODORI_ROOT),
                     "irodoriReady": diagnostics["irodoriRootExists"] and diagnostics["irodoriPythonExists"],
@@ -5775,7 +5823,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/session":
             try:
-                self.send_json(200, load_session_profile())
+                profile = load_session_profile()
+                # 使うモデルは常に環境変数（＝起動スクリプト）が決める。保存された選択を
+                # そのまま返すと、画面が /api/status で選んだモデルを後から上書きしてしまい、
+                # スクリプトを差し替えても前回のモデルが呼ばれ続ける。保存されたファイル自体
+                # には触れないので、将来ここを保存値優先へ戻すこともできる。
+                profile["settings"] = {
+                    **profile["settings"],
+                    "model": preferred_model_option(),
+                }
+                self.send_json(200, profile)
             except Exception as exc:
                 self.send_json(500, {"error": str(exc)})
             return
@@ -6016,6 +6073,10 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            # 会話中に画面のプルダウンで替えたモデルはここから有効になる。ただし対象外の
+            # 名前（古い保存値・旧クライアント）はそのまま呼ばず、環境変数側の既定へ落とす。
+            # Codex queue は LM への呼び出しではないので、上の分岐を抜けた後で判定する。
+            model = resolve_lm_model(model, log=False)
             two_player_mode = bool(body.get("twoPlayerMode", False))
             two_only_mode = bool(body.get("twoOnlyMode", False)) and two_player_mode
             use_second_speaker = speaker_slot == "second"
